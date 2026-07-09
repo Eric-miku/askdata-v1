@@ -1,0 +1,81 @@
+body {
+  margin: 0;
+  background: #f6f7f9;
+  color: #1f2328;
+  font-family:
+    Inter,
+    "Segoe UI",
+    "Microsoft YaHei",
+    Arial,
+    sans-serif;
+}
+
+.app-shell {
+  width: min(1180px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 28px 0 40px;
+}
+
+.app-shell__header {
+  margin-bottom: 20px;
+}
+
+.query-result {
+  display: grid;
+  gap: 20px;
+}
+
+.query-result__section {
+  padding: 20px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+}
+
+.query-result__section h4 {
+  margin-top: 0;
+}
+
+.query-result__alert {
+  margin-bottom: 4px;
+}
+
+.query-result__answer {
+  margin-bottom: 0;
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+.query-result__sql {
+  margin: 0;
+  padding: 14px 16px;
+  overflow-x: auto;
+  background: #111827;
+  border-radius: 6px;
+  color: #f9fafb;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.query-result__trace {
+  width: 100%;
+}
+
+.result-table .ant-table-cell {
+  max-width: 280px;
+}
+
+.result-table__json-cell {
+  white-space: nowrap;
+}
+
+@media (max-width: 720px) {
+  .app-shell {
+    width: min(100% - 20px, 1180px);
+    padding-top: 16px;
+  }
+
+  .query-result__section {
+    padding: 14px;
+  }
+}
