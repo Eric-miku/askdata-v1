@@ -1,0 +1,14 @@
+[project]
+name = "xcgw-askdata"
+version = "0.1.2"
+description = "BIRD Mini-Dev preprocessing utilities for the intelligent data query platform."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+askdata = "askdata.cli:main"
+
+[build-system]
+requires = []
+build-backend = "build_backend"
+backend-path = ["."]

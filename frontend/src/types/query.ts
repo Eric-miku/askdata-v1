@@ -11,7 +11,7 @@ export interface QueryResponse {
   answer: string;
   sql?: string | null;
   columns?: string[] | null;
-  rows?: QueryCellValue[][] | null;
+  rows?: Record<string, QueryCellValue>[] | QueryCellValue[][] | null;
   chart?: unknown;
   trace: string[];
   error?: string | null;

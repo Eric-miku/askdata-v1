@@ -1,0 +1,143 @@
+"""
+validator.py
+基于 sqlglot 的 SQL 安全校验模块 (AST 级别危险操作拦截)
+
+职责:
+    1. 只允许 SELECT / WITH...SELECT / UNION 类型的只读查询通过
+    2. 拦截 DROP / DELETE / UPDATE / INSERT / ALTER / CREATE / TRUNCATE 等写操作
+    3. 拦截多语句注入 (例如 "SELECT 1; DROP TABLE users;")
+    4. 拦截 INTO OUTFILE / INTO DUMPFILE 等文件写出操作 (MySQL 特有攻击面)
+    5. 支持表名黑名单 (禁止访问系统表 / 敏感表)
+
+注意:
+    不同版本的 sqlglot 对部分语句(如 TRUNCATE、GRANT)的解析类型可能不同,
+    有些方言会退化解析为 exp.Command。因此额外将 exp.Command 也视为高风险,
+    一并拦截,以降低"新语法未被识别"导致绕过的风险。
+"""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+
+import sqlglot
+from sqlglot import exp
+
+
+class SQLRiskLevel(str, Enum):
+    SAFE = "safe"
+    BLOCKED = "blocked"
+
+
+@dataclass
+class ValidationResult:
+    is_valid: bool
+    risk_level: SQLRiskLevel
+    reason: str = ""
+    statement_count: int = 1
+    normalized_sql: str = ""
+
+
+# 明确禁止的写操作 / DDL 类型节点
+_DANGEROUS_TYPES = tuple(
+    t
+    for t in (
+        getattr(exp, "Drop", None),
+        getattr(exp, "Delete", None),
+        getattr(exp, "Update", None),
+        getattr(exp, "Insert", None),
+        getattr(exp, "Alter", None),
+        getattr(exp, "Create", None),
+        getattr(exp, "TruncateTable", None),
+        getattr(exp, "Grant", None),
+        getattr(exp, "Command", None),  # 兜底: 未被具体建模的管理类语句
+    )
+    if t is not None
+)
+
+# 允许通过的根节点类型 (只读查询)
+_ALLOWED_ROOT_TYPES = tuple(
+    t
+    for t in (
+        getattr(exp, "Select", None),
+        getattr(exp, "Union", None),
+        getattr(exp, "With", None),
+    )
+    if t is not None
+)
+
+
+class SQLValidator:
+    def __init__(
+        self,
+        dialect: str = "mysql",
+        max_statements: int = 1,
+        forbidden_tables: Optional[set] = None,
+    ):
+        """
+        :param dialect: sqlglot 解析方言, 需与实际数据库一致 (mysql/postgres/sqlite 等)
+        :param max_statements: 允许的最大语句数, 默认仅允许单条语句, 防止分号注入多条语句
+        :param forbidden_tables: 禁止访问的表名黑名单 (如系统表 / 敏感表), 大小写不敏感
+        """
+        self.dialect = dialect
+        self.max_statements = max_statements
+        self.forbidden_tables = {t.lower() for t in (forbidden_tables or set())}
+
+    def validate(self, sql: str) -> ValidationResult:
+        sql = (sql or "").strip()
+        if not sql:
+            return ValidationResult(False, SQLRiskLevel.BLOCKED, "SQL 语句为空")
+
+        try:
+            statements = [s for s in sqlglot.parse(sql, read=self.dialect) if s is not None]
+        except Exception as e:
+            return ValidationResult(False, SQLRiskLevel.BLOCKED, f"SQL 解析失败: {e}")
+
+        if not statements:
+            return ValidationResult(False, SQLRiskLevel.BLOCKED, "未解析出有效语句")
+
+        if len(statements) > self.max_statements:
+            return ValidationResult(
+                False,
+                SQLRiskLevel.BLOCKED,
+                f"检测到 {len(statements)} 条语句, 疑似多语句注入, 仅允许 {self.max_statements} 条",
+            )
+
+        root = statements[0]
+
+        # 1. 根节点类型检查: 必须是只读查询
+        if not isinstance(root, _ALLOWED_ROOT_TYPES):
+            return ValidationResult(
+                False,
+                SQLRiskLevel.BLOCKED,
+                f"不允许的语句类型: {type(root).__name__}, 仅允许 SELECT/WITH/UNION 查询",
+            )
+
+        # 2. 遍历整棵 AST, 拦截任何嵌套的危险节点
+        #    (例如子查询 / CTE 内部藏入写操作)
+        for node in root.walk():
+            if isinstance(node, _DANGEROUS_TYPES):
+                return ValidationResult(
+                    False,
+                    SQLRiskLevel.BLOCKED,
+                    f"检测到危险操作节点: {type(node).__name__}",
+                )
+            if isinstance(node, getattr(exp, "Into", ())):
+                return ValidationResult(
+                    False,
+                    SQLRiskLevel.BLOCKED,
+                    "检测到 INTO 子句 (可能用于文件写出), 已拦截",
+                )
+
+        # 3. 表名黑名单检查
+        if self.forbidden_tables:
+            tables_used = {t.name.lower() for t in root.find_all(exp.Table)}
+            hit = tables_used & self.forbidden_tables
+            if hit:
+                return ValidationResult(
+                    False,
+                    SQLRiskLevel.BLOCKED,
+                    f"禁止访问的表: {', '.join(sorted(hit))}",
+                )
+
+        normalized = root.sql(dialect=self.dialect)
+        return ValidationResult(True, SQLRiskLevel.SAFE, "", len(statements), normalized)

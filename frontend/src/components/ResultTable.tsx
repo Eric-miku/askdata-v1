@@ -5,7 +5,7 @@ import type { QueryCellValue } from "../types/query";
 
 interface ResultTableProps {
   columns?: string[] | null;
-  rows?: QueryCellValue[][] | null;
+  rows?: Record<string, QueryCellValue>[] | QueryCellValue[][] | null;
   loading?: boolean;
 }
 
@@ -71,7 +71,7 @@ function compareCellValue(a: QueryCellValue, b: QueryCellValue): number {
 
 function buildDataSource(
   columnNames: string[],
-  rows: QueryCellValue[][],
+  rows: Record<string, QueryCellValue>[] | QueryCellValue[][],
 ): TableRecord[] {
   return rows.map((row, rowIndex) => {
     const record: TableRecord = {
@@ -80,7 +80,7 @@ function buildDataSource(
     };
 
     columnNames.forEach((columnName, columnIndex) => {
-      record[columnName] = row[columnIndex];
+      record[columnName] = Array.isArray(row) ? row[columnIndex] : row[columnName];
     });
 
     return record;
