@@ -8,10 +8,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from askdata.eval.runner import EvalRunner
 
 
-class FakeLLM:
-    def Complete(self, prompt):
-        assert "Database: demo" in prompt
-        return "```sql\nSELECT COUNT(id) AS count FROM items\n```"
+class FakeAgentGraph:
+    def __init__(self, processed_dir=None):
+        self.processed_dir = processed_dir
+
+    def Run(self, question, database_id, session_context=None):
+        return {
+            "answer": "There are 2 items.",
+            "sql": "SELECT COUNT(id) AS count FROM items",
+            "columns": ["count"],
+            "rows": [{"count": 2}],
+            "trace": [{"step": "ExecuteSql", "status": "success", "message": "Returned 1 rows."}],
+            "error": None,
+        }
 
 
 def write_processed_dataset(root, database_path):
@@ -54,7 +63,7 @@ def test_eval_runner_is_self_contained_and_writes_report(tmp_path):
     processed = write_processed_dataset(tmp_path, database_path)
     out = tmp_path / "report.json"
 
-    report = EvalRunner(processed_dir=processed, llm_client=FakeLLM()).Run(limit=1, out=out)
+    report = EvalRunner(processed_dir=processed, agent_graph=FakeAgentGraph()).Run(limit=1, out=out)
 
     assert out.exists()
     assert report["summary"]["total"] == 1
