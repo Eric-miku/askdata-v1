@@ -11,19 +11,19 @@ API 路由定义 —— 所有 HTTP 接口的入口
 设计原则:
   - 每个接口都记录 Trace 日志
   - 异常统一由全局异常处理器捕获，返回一致的错误格式
-  - 核心 /api/query 接口暂时返回占位数据，待 AI 组和 DB 组实现后对接
+  - /api/query 调用 AgentGraph 工作流，执行 NL2SQL 全链路：
+    SemanticRetriever → LLM(ReAct/One-Shot) → SQLExecutor → ResultAnalyzer
 """
 
-import os
-import glob
 import sqlite3
-from typing import List, Optional
+from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from askdata.api.schemas import QueryRequest, QueryResponse
 from askdata.api.trace import TraceLogger
 from askdata.api.session_manager import session_manager
-from askdata.agent.graph import AgentGraph
+from askdata.agent.graph import AgentGraph, RunAgent
 from askdata.core.config import settings
 from askdata.core.paths import project_path
 
@@ -36,54 +36,59 @@ router = APIRouter()
 # 辅助函数
 # ============================================================
 
-def _get_bird_databases_dir() -> str:
+def _get_bird_databases_dir() -> Path:
     """获取 BIRD 数据库文件存放目录的绝对路径
 
     settings.BIRD_DATA_DIR 是相对于项目根的路径配置（如 "../data/bird"），
     这里需要解析为绝对路径。
 
     Returns:
-        databases 目录的绝对路径
+        databases 目录的 Path 对象
     """
-    return str(project_path(settings.BIRD_DATA_DIR) / "databases")
+    return project_path(settings.BIRD_DATA_DIR) / "databases"
 
 
-def _scan_databases() -> List[dict]:
+def _scan_databases() -> list[dict]:
     """扫描 data/bird/databases/ 下的所有 SQLite 数据库文件
 
     遍历目录，找到所有 .db 或 .sqlite 文件，返回数据库元信息列表。
 
     Returns:
-        数据库列表，每项包含 id, name, tables_count（目前为占位 0）
+        数据库列表，每项包含 id, name, tables_count
     """
     databases_dir = _get_bird_databases_dir()
     databases = []
 
     # 如果目录不存在，返回空列表
-    if not os.path.exists(databases_dir):
+    if not databases_dir.exists():
         return databases
 
-    # 查找所有 .db 文件
-    db_files = glob.glob(os.path.join(databases_dir, "**", "*.db"), recursive=True)
-    db_files += glob.glob(os.path.join(databases_dir, "**", "*.sqlite"), recursive=True)
+    # 查找所有 .db 和 .sqlite 文件
+    db_files = list(databases_dir.rglob("*.db")) + list(databases_dir.rglob("*.sqlite"))
 
     seen = set()
     for db_path in db_files:
         # 用文件名（不含扩展名）作为数据库 ID
-        db_id = os.path.splitext(os.path.basename(db_path))[0]
+        db_id = db_path.stem
         if db_id not in seen:
             seen.add(db_id)
+            # 实时读取该数据库的表数量
+            try:
+                tables = _read_sqlite_tables(str(db_path))
+                tables_count = len(tables)
+            except Exception:
+                tables_count = 0
             databases.append({
                 "id": db_id,
                 "name": db_id.replace("_", " ").title(),  # 将下划线转换为可读名称
-                "path": db_path,
-                "tables_count": 0,   # TODO: 后续接入 SQLAlchemy 后读取实际表数量
+                "path": str(db_path),
+                "tables_count": tables_count,  # 实时从 SQLite 读取
             })
 
     return databases
 
 
-def _read_sqlite_tables(db_path: str) -> List[dict]:
+def _read_sqlite_tables(db_path: str) -> list[dict]:
     """Read table and column metadata from a SQLite database."""
     connection = sqlite3.connect(db_path)
     try:
@@ -124,8 +129,8 @@ async def list_databases():
 
     返回示例:
         [
-            {"id": "california_schools", "name": "California Schools", "tables_count": 0},
-            {"id": "debit_card_specializing", "name": "Debit Card Specializing", "tables_count": 0}
+            {"id": "california_schools", "name": "California Schools", "tables_count": 8},
+            {"id": "debit_card_specializing", "name": "Debit Card Specializing", "tables_count": 5}
         ]
     """
     trace = TraceLogger()
@@ -161,10 +166,6 @@ async def get_tables(database_id: str):
                 }
             ]
         }
-
-    注意:
-        目前返回占位数据。待 db/executor.py 实现后，
-        将使用 SQLAlchemy 实时读取数据库表结构。
     """
     trace = TraceLogger()
     trace.log("查询表结构", f"database_id={database_id}")
@@ -260,11 +261,15 @@ async def execute_query(request: QueryRequest):
     """
     核心接口：自然语言查询转 SQL
 
-    这是系统的核心功能。用户传入自然语言问题，系统经历以下流程:
+    用户传入自然语言问题，系统经历以下流程:
     1. 创建 Trace 日志记录器
     2. 解析请求参数（question, database_id, session_id）
     3. 查找或创建会话（如果传了 session_id 则恢复历史）
-    4. 调用 Agent 工作流（等待 AI 组实现 agent/graph.py）
+    4. 调用 AgentGraph 工作流（graph.py）：
+       - SemanticRetriever 获取数据库 schema 上下文
+       - LLM 生成 SQL / ReAct 工具调用循环
+       - SQLExecutor 执行并验证 SQL
+       - ResultAnalyzer 生成中文解释
     5. 将结果存入会话历史
     6. 返回 QueryResponse（包含 SQL、数据、图表配置和中文解释）
 
@@ -275,10 +280,6 @@ async def execute_query(request: QueryRequest):
             "database_id": "california_schools",
             "session_id": "a1b2c3d4-..."  (可选)
         }
-
-    注意:
-        目前返回占位数据，方便前端先行开发。
-        待 AI 组实现 agent/graph.py 后，将替换为真实的 Agent 调用链。
     """
     trace = TraceLogger()
     trace.log("收到查询请求", f"question='{request.question}', database_id='{request.database_id}'")
@@ -286,18 +287,15 @@ async def execute_query(request: QueryRequest):
     # ---------- 会话管理 ----------
     session_id = request.session_id
     if session_id:
-        # 如果前端传了 session_id，查找是否存在
         session = await session_manager.get_session(session_id)
         if session is None:
             trace.log("会话未找到，创建新会话", f"session_id={session_id}")
             session_id = await session_manager.create_session(request.database_id)
         else:
-            # 如果会话关联的数据库不同，更新它
             if session["database_id"] != request.database_id:
                 await session_manager.update_database(session_id, request.database_id)
                 trace.log("更新会话数据库", f"new_database_id={request.database_id}")
     else:
-        # 没有 session_id，创建一个新会话
         session_id = await session_manager.create_session(request.database_id)
         trace.log("创建新会话", f"session_id={session_id}")
 
@@ -310,23 +308,30 @@ async def execute_query(request: QueryRequest):
             "last_sql": last_item.get("sql"),
         }
 
+    # ---------- 调用 Agent 工作流 ----------
     try:
-        result = await AgentGraph().ARun(
+        # 使用 AgentGraph 执行完整的 NL2SQL 工作流
+        # （LLM 语义检索 → SQL 生成/ReAct循环 → 执行 → 分析）
+        result = await RunAgent(
             question=request.question,
             database_id=request.database_id,
             session_context=session_context,
         )
+
+        # 合并 API 层 Trace + Agent 层 Trace
+        combined_trace = trace.get_logs() + result.get("trace", [])
+
         response = QueryResponse(
             answer=result["answer"],
             sql=result.get("sql"),
             columns=result.get("columns"),
             rows=result.get("rows"),
             chart=result.get("chart"),
-            trace=result.get("trace", []),
+            trace=combined_trace,
             error=result.get("error"),
         )
     except Exception as exc:
-        trace.log("查询失败", str(exc))
+        trace.log("查询失败", str(exc), status="error")
         response = QueryResponse(
             answer="查询失败，请稍后重试或换一种问法。",
             sql=None,
