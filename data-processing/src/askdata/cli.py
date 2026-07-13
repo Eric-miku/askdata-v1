@@ -159,6 +159,8 @@ def copy_sqlite_databases(paths: PreparedPaths) -> dict[str, Path]:
 
     copied: dict[str, Path] = {}
     for source_db in sorted(source_root.glob("*/*.sqlite")):
+        if is_artifact_path(source_db):
+            continue
         database_id = source_db.stem
         target_dir = paths.db_dir / database_id
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -169,6 +171,15 @@ def copy_sqlite_databases(paths: PreparedPaths) -> dict[str, Path]:
     if not copied:
         raise SystemExit(f"No SQLite databases found under {source_root}")
     return copied
+
+
+def is_artifact_path(path: Path) -> bool:
+    return any(
+        part == "__MACOSX"
+        or part == ".DS_Store"
+        or part.startswith("._")
+        for part in path.parts
+    )
 
 
 def build_and_write_schemas(
@@ -228,7 +239,7 @@ def build_schema(database_id: str, db_path: Path, metadata: dict[str, Any], ques
 
     return {
         "database_id": database_id,
-        "db_path": relpath(db_path),
+        "database_path": relpath(db_path),
         "table_count": len(tables),
         "column_count": sum(len(table["columns"]) for table in tables),
         "question_count": question_count,
@@ -517,7 +528,7 @@ def build_databases_index(
         rows.append(
             {
                 "database_id": database_id,
-                "db_path": relpath(copied_db_paths[database_id]),
+                "database_path": relpath(copied_db_paths[database_id]),
                 "schema_path": relpath(paths.schemas_dir / f"{database_id}.json"),
                 "schema_prompt_path": relpath(paths.schema_prompts_dir / f"{database_id}.md"),
                 "table_count": schema["table_count"],

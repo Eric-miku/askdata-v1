@@ -56,7 +56,7 @@
 ```json
 {
   "database_id": "sales_demo",
-  "db_path": "data/bird/databases/sales_demo/sales_demo.sqlite",
+  "database_path": "data/bird/databases/sales_demo/sales_demo.sqlite",
   "tables": [
     {
       "table_name": "orders",
