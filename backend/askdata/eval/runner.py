@@ -7,6 +7,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+from tqdm import tqdm
+
 from askdata.core.config import settings
 from askdata.core.llm import LLMClient
 from askdata.core.paths import project_path
@@ -33,7 +35,7 @@ class EvalRunner:
             questions = questions[:limit]
 
         index = BirdSchemaIndex().Build(databases)
-        cases = [self._EvaluateQuestion(question, index) for question in questions]
+        cases = [self._EvaluateQuestion(question, index) for question in tqdm(questions, desc="eval", unit="q")]
         finished_at = datetime.now(UTC)
         report = {
             "summary": self._BuildSummary(cases, started_at, finished_at),
