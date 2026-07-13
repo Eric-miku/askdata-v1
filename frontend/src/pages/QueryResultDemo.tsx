@@ -18,9 +18,13 @@ database,
 
 setDatabase,
 
+setQuestion,
+
 loading,
 
-result
+result,
+
+executeQuery
 
 }=useQueryStore();
 
@@ -62,6 +66,9 @@ loading={loading}
 onSubmit={(question)=>{
 
 console.log(question);
+
+executeQuery();
+
 
 }}
 
