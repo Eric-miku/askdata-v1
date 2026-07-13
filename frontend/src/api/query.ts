@@ -3,11 +3,8 @@ import type { QueryResponse } from "../types/query";
 
 
 interface QueryRequest {
-
-  database:string;
-
+  database_id:string;
   question:string;
-
 }
 
 
