@@ -24,6 +24,39 @@ describe("ResultTable pagination", () => {
     expect(styles).toMatch(
       /\.result-table \.ant-pagination-item-active\s*{[^}]*background:\s*transparent[^}]*border:\s*0/,
     );
+    expect(styles).toMatch(
+      /\.result-table \.ant-pagination-item-active\s*{[^}]*display:\s*inline-flex[^}]*align-items:\s*center[^}]*justify-content:\s*center/,
+    );
+  });
+
+  it("keeps the page-size control typographic, borderless, and searchable-icon free", async () => {
+    const user = userEvent.setup();
+    const rows = Array.from({ length: 15 }, (_, index) => ({ id: index + 1 }));
+    const { container } = render(<ResultTable columns={["id"]} rows={rows} />);
+
+    const selector = container.querySelector<HTMLElement>(".ant-select-selector");
+    expect(selector).not.toBeNull();
+    await user.click(selector!);
+
+    expect(
+      container.querySelector(".result-table__page-size-chevron"),
+    ).toBeInTheDocument();
+    expect(container.querySelector(".anticon-search")).not.toBeInTheDocument();
+    expect(styles).toMatch(
+      /\.result-table \.ant-pagination-options \.ant-select-selection-item\s*{[^}]*font-family:\s*inherit[^}]*font-weight:\s*400/,
+    );
+    expect(styles).toMatch(
+      /\.result-table \.ant-pagination-options \.ant-select-selector\s*{[^}]*border:\s*0\s*!important[^}]*box-shadow:\s*none\s*!important/,
+    );
+    expect(styles).toMatch(
+      /\.result-table \.ant-select-open \.result-table__page-size-chevron\s*{[^}]*transform:\s*rotate\(180deg\)/,
+    );
+    expect(styles).toMatch(
+      /\.result-table__page-size-dropdown\s*{[^}]*font-family:\s*inherit/,
+    );
+    expect(styles).toMatch(
+      /\.result-table__page-size-dropdown \.ant-select-item-option-active:not\(\.ant-select-item-option-disabled\)\s*{[^}]*background:\s*var\(--surface-raised\)/,
+    );
   });
 
   it("keeps the table bottom border inside complete rounded corners", () => {
