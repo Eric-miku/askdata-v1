@@ -2,20 +2,20 @@
 
 Natural-language-to-SQL platform. Users ask questions in plain Chinese or English; the system generates SQL, executes against a database, and returns charts with explanations.
 
-**Stack**: Python 3.10+ / FastAPI / LangGraph / SQLAlchemy / React + Ant Design + ECharts / Qwen3.5
+**Stack**: Python 3.13 / FastAPI / LangGraph / SQLAlchemy / React + Ant Design + ECharts / OpenAI-compatible LLM
 
 ## Quick Start
 
 ```bash
-# Backend
-cd backend && uv pip install -e .
+# Backend (run from the repository root)
+bash scripts/setup-dev-env.sh
 uv run askdata serve          # start API at :8000
 
 # Frontend
 cd frontend && npm install && npm run dev   # start at :5173
 
 # Evaluation
-uv run askdata evaluate-bird --limit 100 --out reports/eval.json
+uv run askdata eval-bird --limit 100 --seed 42 --out reports/eval.json
 ```
 
 ## Project Structure
@@ -50,7 +50,8 @@ askdata-v1/
     eval/              # BIRD benchmark evaluation
       metrics.py       #   BirdResultComparer (4-tier matching) + ExactMatch
       runner.py        #   EvalRunner — self-contained BIRD evaluation
-    cli.py             # CLI entry: evaluate-bird
+    data/bird_io.py    # Native data-processing contract + legacy fallback
+    cli.py             # CLI entry: eval-bird, databases, chat, serve
   frontend/            # React + TypeScript + Vite
     src/
       api/query.ts     #   Backend API client
@@ -58,8 +59,9 @@ askdata-v1/
       pages/           #   QueryResultDemo
       store/           #   Zustand state
       types/query.ts   #   TypeScript types
-  tests/               # 24 pytest tests across all modules
-  5-1-data-preprocessing-deliverable/  # BIRD data prep pipeline
+  tests/               # Backend unit and integration tests
+  data-processing/     # Team-owned BIRD data prep pipeline
+  benchmarks/          # Versioned question manifests (no database files)
   data/bird/           # SQLite databases + processed schema (gitignored)
 ```
 
@@ -96,37 +98,59 @@ BIRD_INSTRUCTIONS_DIR=data/bird/instructions
 
 ## Data Setup
 
-BIRD Mini-Dev dataset is preprocessed by the `5-1-data-preprocessing-deliverable` pipeline. To re-run:
+BIRD Mini-Dev is prepared by the team-owned `data-processing` tool. From the repository root:
 
 ```bash
-cd 5-1-data-preprocessing-deliverable
-python src/askdata/cli.py prepare-bird
+./data-processing/askdata prepare-bird \
+  --raw-dir data/bird/raw/minidev \
+  --db-dir data/bird/databases \
+  --out-dir data/bird/processed \
+  --demo-db-limit 11 \
+  --demo-question-limit 500 \
+  --validate-sql \
+  --build-cache \
+  --force
 ```
 
-This generates `data/bird/processed/` with `databases.json`, `questions.jsonl`, and per-DB schema files.
+The application reads the native outputs directly: metadata in `databases.json`, structured schemas in `schemas/*.json`, and questions in `questions.jsonl`. Legacy inline camelCase schemas and `questions.json` remain read-only fallbacks.
 
-To convert for the eval runner (one-time):
+For the historical 100-question comparison with `deepseek-v4-pro`:
 
 ```bash
-python3 -c "
-import json
-# convert questions.jsonl → questions.json
-# merge schema files into databases.json
-"
+uv run askdata eval-bird \
+  --model-name deepseek-v4-pro \
+  --question-manifest benchmarks/bird-minidev-v4pro-seed42-100.json \
+  --out reports/bird-eval-v4pro-100.json
 ```
 
-The eval runner needs `databases.json` (with inline `tables` and `foreignKeys` arrays) and `questions.json` in `data/bird/processed/`.
+### macOS editable-install recovery
+
+If `uv run askdata` reports `ModuleNotFoundError` after the repository was moved from `intern agents` to `intern-agents`, inspect `.venv/lib/python*/site-packages/*.pth`. Under a synchronized `Documents` directory, macOS can repeatedly mark a dot-directory virtual environment as hidden and make Python skip editable-install `.pth` files. Run the bootstrap once:
+
+```bash
+bash scripts/setup-dev-env.sh
+uv run askdata --help
+```
+
+On macOS the script keeps uv's `.venv` path as a local symlink to the gitignored, non-dot `venv.nosync` directory. Other platforms run a normal `uv sync`. Normal development does not require `uv pip install -e .` before each command.
 
 ## Testing
 
 ```bash
-uv run python -m pytest tests/ -v    # 24 tests
+uv run pytest -q
+cd frontend && npm run build
 ```
+
+## More Documentation
+
+- [Backend instructions](backend/INSTRUCTIONS.md): architecture, BIRD data contract, evaluation rules, and known limitations.
+- [BIRD benchmark](benchmarks/README.md): fixed 100-question manifest and comparable accuracy results.
+- [Data processing](data-processing/README.md): team-owned BIRD preparation commands and output contract.
 
 ## Key Design Decisions
 
 - **PascalCase** for all NL2SQL-facing methods (`Build`, `Retrieve`, `Run`, `Compare`). Team `db/` modules use snake_case (`execute`, `validate`).
-- **ReAct loop** with max 6 iterations; LLM self-corrects on SQL errors.
+- **ReAct loop** with max 8 iterations; LLM self-corrects on SQL and answer-shape warnings.
 - **Column matching** in eval uses 4 tiers: strict (all columns match) → name (shared subset) → position (by index) → subset (try combinations).
 - **Skills** are markdown files auto-loaded at agent start — no code changes needed to add patterns.
 - **Business context** per database via `data/bird/instructions/<db>.md`.
