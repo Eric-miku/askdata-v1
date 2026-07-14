@@ -3,6 +3,9 @@ import type { ReactNode } from "react";
 import type { ColumnsType } from "antd/es/table";
 import type { QueryCellValue } from "../types/query";
 import { ChevronIcon } from "./Icons";
+import LongTextCell from "./LongTextCell";
+
+const LONG_TEXT_THRESHOLD = 160;
 
 interface ResultTableProps {
   columns?: string[] | null;
@@ -36,6 +39,10 @@ function formatCellValue(value: QueryCellValue): ReactNode {
         {JSON.stringify(value)}
       </Typography.Text>
     );
+  }
+
+  if (typeof value === "string" && value.length > LONG_TEXT_THRESHOLD) {
+    return <LongTextCell text={value} />;
   }
 
   return String(value);

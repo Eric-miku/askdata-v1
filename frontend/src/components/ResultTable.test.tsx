@@ -1,6 +1,6 @@
-import { render } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ResultTable } from "./ResultTable";
 import styles from "../styles.css?raw";
 
@@ -62,6 +62,40 @@ describe("ResultTable pagination", () => {
   it("keeps the table bottom border inside complete rounded corners", () => {
     expect(styles).toMatch(
       /\.result-table \.ant-table-container\s*{[^}]*overflow:\s*hidden[^}]*border-bottom:\s*1px solid var\(--border\)[^}]*border-radius:\s*10px/,
+    );
+  });
+});
+
+describe("ResultTable long text", () => {
+  it("wraps, expands, collapses, and copies long strings", async () => {
+    const user = userEvent.setup();
+    const longSql = `CREATE TABLE schools (${" column_name TEXT,".repeat(20)} id INTEGER)`;
+    const writeText = vi
+      .spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue(undefined);
+
+    render(<ResultTable columns={["sql"]} rows={[{ sql: longSql }]} />);
+
+    const content = screen.getByText(longSql);
+    expect(content).toHaveClass("long-text-cell__content", "is-collapsed");
+
+    await user.click(screen.getByRole("button", { name: "展开长文本" }));
+    expect(content).toHaveClass("is-expanded");
+
+    await user.click(screen.getByRole("button", { name: "复制长文本" }));
+    expect(writeText).toHaveBeenCalledWith(longSql);
+    expect(screen.getByRole("button", { name: "复制长文本" })).toHaveTextContent(
+      "已复制",
+    );
+
+    await user.click(screen.getByRole("button", { name: "收起长文本" }));
+    expect(content).toHaveClass("is-collapsed");
+
+    expect(styles).toMatch(
+      /\.long-text-cell\s*{[^}]*font-family:\s*"SFMono-Regular"/,
+    );
+    expect(styles).toMatch(
+      /\.long-text-cell__content\s*{[^}]*white-space:\s*pre-wrap[^}]*overflow-wrap:\s*anywhere/,
     );
   });
 });

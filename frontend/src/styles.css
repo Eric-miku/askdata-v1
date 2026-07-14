@@ -1236,6 +1236,55 @@ svg {
   white-space: nowrap;
 }
 
+.result-table .ant-table-cell:has(.long-text-cell) {
+  min-width: 320px;
+  max-width: 520px;
+  white-space: normal;
+}
+
+.long-text-cell {
+  max-width: 520px;
+  color: var(--text-soft);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.65;
+}
+
+.long-text-cell__content {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.long-text-cell__content.is-collapsed {
+  max-height: 6.6em;
+  overflow: hidden;
+}
+
+.long-text-cell__content.is-expanded {
+  max-height: none;
+}
+
+.long-text-cell__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 7px;
+}
+
+.long-text-cell__actions button {
+  min-height: 24px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  color: var(--text-faint);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 10px;
+}
+
+.long-text-cell__actions button:hover {
+  color: var(--text-soft);
+}
+
 .composer-dock {
   position: fixed;
   z-index: 20;
