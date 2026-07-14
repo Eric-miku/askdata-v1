@@ -7,12 +7,32 @@ export type QueryCellValue =
   | Record<string, unknown>
   | unknown[];
 
+export interface TraceItem {
+
+  step:number;
+
+  status:string;
+
+  message:string;
+
+}
+
+
+
 export interface QueryResponse {
-  answer: string;
-  sql?: string | null;
-  columns?: string[] | null;
-  rows?: Record<string, QueryCellValue>[] | QueryCellValue[][] | null;
-  chart?: unknown;
-  trace: string[];
-  error?: string | null;
+
+  answer:string;
+
+  sql:string;
+
+  columns:string[];
+
+  rows:any[][];
+
+  chart?:any;
+
+  trace?:TraceItem[];
+
+  error?:string;
+
 }
