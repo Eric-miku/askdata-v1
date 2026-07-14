@@ -1,3 +1,5 @@
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type { ChatTurn } from "../types/query";
 import AgentTrace from "./AgentTrace";
 import { ResultTable } from "./ResultTable";
@@ -35,7 +37,11 @@ export function QueryResultView({ turn, onRetry }: QueryResultViewProps) {
           </div>
         ) : null}
 
-        {response?.answer ? <p className="chat-turn__answer">{response.answer}</p> : null}
+        {response?.answer ? (
+          <div className="chat-turn__answer">
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>{response.answer}</ReactMarkdown>
+          </div>
+        ) : null}
 
         {turn.status === "error" ? (
           <div className="chat-turn__error" role="alert">

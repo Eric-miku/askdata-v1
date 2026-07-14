@@ -668,9 +668,97 @@ svg {
   margin: 0;
   color: var(--text);
   font-family: Georgia, "Times New Roman", "Songti SC", ui-serif, serif;
-  font-size: 18px;
-  line-height: 1.78;
-  white-space: pre-wrap;
+  font-size: 15px;
+  line-height: 1.72;
+  overflow-wrap: anywhere;
+}
+
+.chat-turn__answer > :first-child {
+  margin-top: 0;
+}
+
+.chat-turn__answer > :last-child {
+  margin-bottom: 0;
+}
+
+.chat-turn__answer p {
+  margin: 0 0 12px;
+}
+
+.chat-turn__answer ul,
+.chat-turn__answer ol {
+  margin: 6px 0 14px;
+  padding-left: 1.55em;
+}
+
+.chat-turn__answer li {
+  margin: 2px 0;
+  padding-left: 2px;
+}
+
+.chat-turn__answer li::marker {
+  color: var(--text-muted);
+}
+
+.chat-turn__answer strong {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.chat-turn__answer a {
+  color: var(--accent);
+  text-underline-offset: 3px;
+}
+
+.chat-turn__answer code {
+  padding: 0.12em 0.35em;
+  background: var(--surface-raised);
+  border-radius: 4px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 0.88em;
+}
+
+.chat-turn__answer pre {
+  margin: 12px 0;
+  padding: 13px 14px;
+  overflow-x: auto;
+  background: var(--surface-code);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+
+.chat-turn__answer pre code {
+  padding: 0;
+  background: transparent;
+  color: var(--text-soft);
+}
+
+.chat-turn__answer blockquote {
+  margin: 12px 0;
+  padding-left: 14px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-muted);
+}
+
+.chat-turn__answer table {
+  width: max-content;
+  max-width: 100%;
+  margin: 12px 0;
+  overflow-x: auto;
+  border-collapse: collapse;
+  display: block;
+}
+
+.chat-turn__answer th,
+.chat-turn__answer td {
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.chat-turn__answer th {
+  background: var(--surface-raised);
+  font-weight: 600;
 }
 
 .answer-loading {
@@ -1141,7 +1229,7 @@ svg {
   }
 
   .chat-turn__answer {
-    font-size: 17px;
+    font-size: 15px;
   }
 
   .composer-dock {
