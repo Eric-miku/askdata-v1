@@ -1,4 +1,4 @@
-"""BIRD evaluation runner — self-contained: loads processed schema, calls LLM for SQL generation, executes both generated and gold SQL, compares results, and writes JSON reports."""
+"""BIRD evaluation runner — runs AgentGraph (ReAct loop) against BIRD questions and compares results with gold SQL."""
 
 from datetime import UTC, datetime
 import json
@@ -7,20 +7,22 @@ import sqlite3
 import time
 from pathlib import Path
 
+from tqdm import tqdm
+
+from askdata.agent.graph import AgentGraph
 from askdata.core.config import settings
-from askdata.core.llm import LLMClient
 from askdata.core.paths import project_path
 from askdata.eval.metrics import BirdResultComparer, ExactMatch
 from askdata.tools.retriever import BirdSchemaIndex
 
 
 class EvalRunner:
-    """Self-contained BIRD SQL-generation evaluator."""
+    """BIRD evaluator that uses the full ReAct agent pipeline."""
 
-    def __init__(self, processed_dir=None, llm_client=None, comparer=None):
+    def __init__(self, processed_dir=None, agent_graph=None, comparer=None):
         base_dir = project_path(processed_dir or settings.BIRD_DATA_DIR)
         self.processed_dir = base_dir if (base_dir / "databases.json").exists() else base_dir / "processed"
-        self.llm_client = llm_client or LLMClient()
+        self.agent_graph = agent_graph
         self.comparer = comparer or BirdResultComparer()
 
     def Run(self, database_id=None, limit=None, out=None) -> dict:
@@ -32,11 +34,13 @@ class EvalRunner:
         if limit:
             questions = questions[:limit]
 
-        index = BirdSchemaIndex().Build(databases)
-        cases = [self._EvaluateQuestion(question, index) for question in questions]
+        index = BirdSchemaIndex().Build(databases, questions=questions)
+        cases = [self._EvaluateQuestion(question, index) for question in tqdm(questions, desc="eval", unit="q")]
         finished_at = datetime.now(UTC)
         report = {
             "summary": self._BuildSummary(cases, started_at, finished_at),
+            "byDatabase": self._BuildBreakdown(cases, "databaseId"),
+            "byDifficulty": self._BuildBreakdown(cases, "difficulty"),
             "cases": cases,
         }
         if out:
@@ -58,46 +62,46 @@ class EvalRunner:
         question_text = question.get("question") or ""
         gold_sql = question.get("goldSql") or question.get("SQL") or ""
         context = index.Retrieve(database_id, question_text)
+        database_path = context.get("database_path", "")
         generated_sql = ""
         error = None
-        valid_sql = False
         execution_succeeded = False
-        generated_columns = []
-        generated_rows = []
         gold_columns = []
         gold_rows = []
         comparison = self.comparer.BuildVerdict(False, False, None, "empty_prediction")
+        result = {}
 
         try:
-            generated_sql = self._CleanSql(self.llm_client.Complete(self._BuildSqlPrompt(question_text, context["schema_prompt"])))
-            valid_sql = self._IsSelectSql(generated_sql)
+            agent = self.agent_graph or AgentGraph(processed_dir=self.processed_dir)
+            result = agent.Run(question=question_text, database_id=database_id)
+            generated_sql = result.get("sql") or ""
+            error = result.get("error")
+
             if not generated_sql:
                 comparison = self.comparer.BuildVerdict(False, False, None, "empty_prediction")
-            elif not valid_sql:
-                comparison = self.comparer.BuildVerdict(False, False, None, "validation_error")
-                error = "Only SELECT SQL is allowed"
+            elif not database_path:
+                comparison = self.comparer.BuildVerdict(False, False, None, "execution_error")
+                error = f"No database path for {database_id}"
             else:
-                generated = self._ExecuteSql(generated_sql, context["database_path"])
-                gold = self._ExecuteSql(gold_sql, context["database_path"])
+                gold = self._ExecuteSql(gold_sql, database_path)
                 execution_succeeded = True
-                generated_columns = generated["columns"]
-                generated_rows = generated["rows"]
                 gold_columns = gold["columns"]
                 gold_rows = gold["rows"]
                 comparison = self.comparer.Compare(
-                    generated_columns,
-                    generated_rows,
+                    result.get("columns", []),
+                    result.get("rows", []),
                     generated_sql,
                     gold_columns,
                     gold_rows,
                     gold_sql,
                 )
         except Exception as exc:
-            error = str(exc)
-            if generated_sql and valid_sql:
+            error = error or str(exc)
+            if generated_sql:
                 comparison = self.comparer.BuildVerdict(False, False, None, "execution_error")
 
         latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        trace_steps = result.get("trace", [])
         return {
             "questionId": question_id,
             "databaseId": database_id,
@@ -107,46 +111,27 @@ class EvalRunner:
             "goldColumns": gold_columns,
             "goldRows": gold_rows,
             "generatedSql": generated_sql,
-            "generatedColumns": generated_columns,
-            "generatedRows": generated_rows,
-            "answer": "SQL generated." if generated_sql else "",
+            "generatedColumns": result.get("columns", []),
+            "generatedRows": result.get("rows", []),
+            "answer": result.get("answer", ""),
             "passed": comparison["passed"],
             "metrics": {
-                "validSql": valid_sql,
+                "validSql": bool(generated_sql),
                 "executionSucceeded": execution_succeeded,
                 "strictPass": comparison["strict_passed"],
                 "relaxedPass": comparison["relaxed_passed"],
                 "exactMatch": ExactMatch(generated_sql, gold_sql),
-                "answerProduced": bool(generated_sql),
+                "answerProduced": bool(result.get("answer")),
                 "matchMode": comparison["match_mode"],
                 "mismatchType": comparison["mismatch_type"],
+                "retryOrRepair": any(s.get("status") == "retry" for s in trace_steps),
             },
             "error": error,
             "latencyMs": latency_ms,
+            "trace": trace_steps,
         }
 
-    def _BuildSqlPrompt(self, question: str, schema_prompt: str) -> str:
-        return "\n".join([
-            "You are a Text-to-SQL assistant. Generate one SQLite SELECT statement only.",
-            "Do not include markdown or explanation.",
-            schema_prompt,
-            f"Question: {question}",
-            "SQL:",
-        ])
-
-    def _CleanSql(self, text: str) -> str:
-        cleaned = (text or "").strip().strip("`").strip()
-        if cleaned.lower().startswith("sql"):
-            cleaned = cleaned[3:].strip()
-        return cleaned.rstrip(";")
-
-    def _IsSelectSql(self, sql: str) -> bool:
-        cleaned = (sql or "").strip().rstrip(";")
-        return bool(cleaned) and cleaned.lower().startswith("select") and ";" not in cleaned
-
     def _ExecuteSql(self, sql: str, database_path: str) -> dict:
-        if not database_path:
-            raise ValueError("Missing database_path for evaluation")
         cleaned = sql.strip().rstrip(";")
         if not re.search(r"\blimit\b", cleaned, re.I):
             cleaned += " LIMIT 1000"
@@ -177,3 +162,19 @@ class EvalRunner:
         if not cases:
             return 0.0
         return round(sum(1 for case in cases if predicate(case)) / len(cases), 4)
+
+    def _BuildBreakdown(self, cases: list[dict], key: str) -> dict:
+        groups: dict[str, list] = {}
+        for case in cases:
+            value = case.get(key) or "unknown"
+            groups.setdefault(value, []).append(case)
+        return {value: self._BuildGroupSummary(items) for value, items in sorted(groups.items())}
+
+    def _BuildGroupSummary(self, cases: list[dict]) -> dict:
+        latencies = [case["latencyMs"] for case in cases]
+        return {
+            "total": len(cases),
+            "executionAccuracy": self._Rate(cases, lambda c: c["passed"]),
+            "validSqlRate": self._Rate(cases, lambda c: c["metrics"]["validSql"]),
+            "avgLatencyMs": round(sum(latencies) / len(latencies), 2) if latencies else 0,
+        }
