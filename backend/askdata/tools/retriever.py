@@ -29,8 +29,9 @@ class BirdSchemaIndex:
         self.databases: dict[str, Any] = {}
         self.instructions_dir = project_path(instructions_dir or settings.BIRD_INSTRUCTIONS_DIR)
 
-    def Build(self, databases: list[Any], instructions_dir=None):
+    def Build(self, databases: list[Any], instructions_dir=None, questions: list[dict] | None = None):
         self.databases = {GetValue(database, "databaseId", "database_id"): database for database in databases}
+        self.questions = questions or []
         if instructions_dir:
             self.instructions_dir = project_path(instructions_dir)
         return self
@@ -89,7 +90,8 @@ class BirdSchemaIndex:
                     "right_column": GetValue(key, "rightColumn", "right_column"),
                 })
 
-        schema_prompt = self.BuildSchemaPrompt(database, selected_names, matched_joins)
+        evidence = self._FindEvidence(database_id, question)
+        schema_prompt = self.BuildSchemaPrompt(database, selected_names, matched_joins, evidence)
         return {
             "database_id": database_id,
             "database_path": GetValue(database, "databasePath", "database_path", default=""),
@@ -99,6 +101,15 @@ class BirdSchemaIndex:
             "schema_prompt": schema_prompt,
         }
 
+    def _FindEvidence(self, database_id: str, question: str) -> str:
+        normalized = question.strip().lower()
+        for item in self.questions:
+            q_db = GetValue(item, "databaseId", "database_id", default="")
+            q_text = (GetValue(item, "question", default="") or "").strip().lower()
+            if q_db == database_id and q_text == normalized:
+                return GetValue(item, "evidence", default="") or ""
+        return ""
+
     def _ColumnDict(self, table_name: str, column: Any, reason: str) -> dict[str, str]:
         return {
             "table_name": table_name,
@@ -107,12 +118,14 @@ class BirdSchemaIndex:
             "reason": reason,
         }
 
-    def BuildSchemaPrompt(self, database: Any, selected_names: set[str], joins: list[dict[str, str]]) -> str:
+    def BuildSchemaPrompt(self, database: Any, selected_names: set[str], joins: list[dict[str, str]], evidence: str = "") -> str:
         database_id = GetValue(database, "databaseId", "database_id")
         database_path = GetValue(database, "databasePath", "database_path", default="")
         lines = [f"Database: {database_id}", "Dialect: SQLite"]
         if database_path:
             lines.append(f"SQLite path: {database_path}")
+        if evidence:
+            lines.append(f"Evidence: {evidence}")
         instructions = self._LoadInstructions(database_id)
         if instructions:
             lines.append(f"\n--- Business Context ---\n{instructions}\n---")
@@ -176,11 +189,15 @@ class SemanticRetriever:
     def Build(self):
         if self.index:
             return self
-        path = self.processed_dir / "databases.json"
-        if not path.exists():
-            raise FileNotFoundError(f"Missing BIRD processed schema file: {path}")
-        databases = json.loads(path.read_text(encoding="utf-8"))
-        self.index = BirdSchemaIndex().Build(databases)
+        databases_path = self.processed_dir / "databases.json"
+        if not databases_path.exists():
+            raise FileNotFoundError(f"Missing BIRD processed schema file: {databases_path}")
+        databases = json.loads(databases_path.read_text(encoding="utf-8"))
+        questions = []
+        questions_path = self.processed_dir / "questions.json"
+        if questions_path.exists():
+            questions = json.loads(questions_path.read_text(encoding="utf-8"))
+        self.index = BirdSchemaIndex().Build(databases, questions=questions)
         return self
 
     def Retrieve(self, database_id: str, question: str) -> str:

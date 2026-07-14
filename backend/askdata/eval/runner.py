@@ -34,11 +34,13 @@ class EvalRunner:
         if limit:
             questions = questions[:limit]
 
-        index = BirdSchemaIndex().Build(databases)
+        index = BirdSchemaIndex().Build(databases, questions=questions)
         cases = [self._EvaluateQuestion(question, index) for question in tqdm(questions, desc="eval", unit="q")]
         finished_at = datetime.now(UTC)
         report = {
             "summary": self._BuildSummary(cases, started_at, finished_at),
+            "byDatabase": self._BuildBreakdown(cases, "databaseId"),
+            "byDifficulty": self._BuildBreakdown(cases, "difficulty"),
             "cases": cases,
         }
         if out:
@@ -126,6 +128,7 @@ class EvalRunner:
             },
             "error": error,
             "latencyMs": latency_ms,
+            "trace": trace_steps,
         }
 
     def _ExecuteSql(self, sql: str, database_path: str) -> dict:
@@ -159,3 +162,19 @@ class EvalRunner:
         if not cases:
             return 0.0
         return round(sum(1 for case in cases if predicate(case)) / len(cases), 4)
+
+    def _BuildBreakdown(self, cases: list[dict], key: str) -> dict:
+        groups: dict[str, list] = {}
+        for case in cases:
+            value = case.get(key) or "unknown"
+            groups.setdefault(value, []).append(case)
+        return {value: self._BuildGroupSummary(items) for value, items in sorted(groups.items())}
+
+    def _BuildGroupSummary(self, cases: list[dict]) -> dict:
+        latencies = [case["latencyMs"] for case in cases]
+        return {
+            "total": len(cases),
+            "executionAccuracy": self._Rate(cases, lambda c: c["passed"]),
+            "validSqlRate": self._Rate(cases, lambda c: c["metrics"]["validSql"]),
+            "avgLatencyMs": round(sum(latencies) / len(latencies), 2) if latencies else 0,
+        }
