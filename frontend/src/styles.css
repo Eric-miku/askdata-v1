@@ -1041,13 +1041,18 @@ svg {
 }
 
 .result-table .ant-table {
-  overflow: hidden;
   background: transparent !important;
-  border-radius: 10px !important;
 }
 
 .result-table .ant-table-container {
+  overflow: hidden;
+  border-bottom: 1px solid var(--border) !important;
+  border-radius: 10px !important;
   border-color: var(--border) !important;
+}
+
+.result-table .ant-table-tbody > tr:last-child > td {
+  border-bottom: 0 !important;
 }
 
 .result-table .ant-table-cell {
@@ -1088,10 +1093,33 @@ svg {
   line-height: 24px;
 }
 
-.result-table .ant-pagination-item,
 .result-table .ant-pagination-jump-prev,
 .result-table .ant-pagination-jump-next {
   display: none;
+}
+
+.result-table .ant-pagination-item {
+  display: none;
+}
+
+.result-table .ant-pagination-item-active {
+  min-width: 18px;
+  height: 24px;
+  display: block;
+  margin: 0;
+  background: transparent !important;
+  border: 0 !important;
+  line-height: 24px;
+}
+
+.result-table .ant-pagination-item-active a {
+  padding: 0 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.result-table .ant-pagination-item-active:hover a {
+  color: var(--text);
 }
 
 .result-table .ant-pagination-prev,

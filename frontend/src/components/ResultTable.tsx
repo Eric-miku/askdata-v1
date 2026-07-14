@@ -137,9 +137,7 @@ export function ResultTable({ columns, rows, loading = false }: ResultTableProps
         defaultPageSize: 10,
         showTotal: (total) => `共 ${total} 行`,
         itemRender: (_, type, originalElement) =>
-          type === "page" || type === "jump-prev" || type === "jump-next"
-            ? null
-            : originalElement,
+          type === "jump-prev" || type === "jump-next" ? null : originalElement,
       }}
     />
   );
