@@ -22,7 +22,7 @@ DEFAULT_DB_DIALECT = "mysql"
 def _create_traced_node(func: Callable, *args, **kwargs) -> Callable:
     def wrapped_node(state: WorkflowState) -> Dict[str, Any]:
         return func(state, *args, **kwargs)
-    
+
     wrapped_node.__name__ = func.__name__
     return traced(wrapped_node)
 
@@ -43,14 +43,18 @@ def create_workflow_graph(
     wrapped_repair_sql = _create_traced_node(repair_sql_node, model_client)
     wrapped_finalize = _create_traced_node(finalize_node)
 
-    def validate_conditional_edge(state: WorkflowState) -> Literal["execute_sql", "repair_sql", "finalize"]:
+    def validate_conditional_edge(
+        state: WorkflowState,
+    ) -> Literal["execute_sql", "repair_sql", "finalize"]:
         if not state.validation_errors:
             return "execute_sql"
         if state.retry_count >= state.max_retries:
             return "finalize"
         return "repair_sql"
 
-    def execute_conditional_edge(state: WorkflowState) -> Literal["analyze_result", "repair_sql", "finalize"]:
+    def execute_conditional_edge(
+        state: WorkflowState,
+    ) -> Literal["analyze_result", "repair_sql", "finalize"]:
         if not state.execution_error:
             return "analyze_result"
         if state.retry_count >= state.max_retries:
@@ -131,6 +135,11 @@ def run_workflow(
         "rows": state_dict.get("execution_result", {}).get("rows", []),
         "status": state_dict.get("status", "failed"),
         "trace": state_dict.get("trace", []),
-        "error": state_dict.get("execution_error") or (", ".join(state_dict.get("validation_errors", [])) if state_dict.get("validation_errors") else None),
+        "error": state_dict.get("execution_error")
+        or (
+            ", ".join(state_dict.get("validation_errors", []))
+            if state_dict.get("validation_errors")
+            else None
+        ),
         "retry_count": state_dict.get("retry_count", 0),
     }
