@@ -1,112 +1,123 @@
-import { Typography } from "antd";
-import { Alert } from "antd";
-
+import { useEffect, useMemo, useRef } from "react";
+import AppSidebar from "../components/AppSidebar";
+import ChatComposer from "../components/ChatComposer";
+import { DatabaseIcon } from "../components/Icons";
 import { QueryResultView } from "../components/QueryResultView";
-
-import DatabaseSelector from "../components/DatabaseSelector";
-
-import QueryInput from "../components/QueryInput";
-
 import { useQueryStore } from "../store/queryStore";
+import type { ThemeMode } from "../types/query";
 
+interface QueryResultDemoProps {
+  theme: ThemeMode;
+  onToggleTheme: () => void;
+}
 
-export function QueryResultDemo() {
+export function QueryResultDemo({ theme, onToggleTheme }: QueryResultDemoProps) {
+  const {
+    database,
+    databases,
+    databasesLoading,
+    databaseError,
+    turns,
+    loading,
+    validationError,
+    loadDatabases,
+    selectDatabase,
+    newChat,
+    sendMessage,
+    retryTurn,
+  } = useQueryStore();
+  const endRef = useRef<HTMLDivElement>(null);
+  const selectedDatabase = useMemo(
+    () => databases.find((item) => item.id === database),
+    [database, databases],
+  );
 
+  useEffect(() => {
+    void loadDatabases();
+  }, [loadDatabases]);
 
-const {
+  useEffect(() => {
+    if (turns.length) {
+      endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
+  }, [turns]);
 
-database,
+  const composer = (
+    <ChatComposer
+      database={database}
+      databases={databases}
+      loading={loading}
+      validationError={validationError}
+      onDatabaseChange={(databaseId) => void selectDatabase(databaseId)}
+      onSubmit={sendMessage}
+    />
+  );
 
-setDatabase,
+  return (
+    <div className="app-layout">
+      <AppSidebar
+        theme={theme}
+        databases={databases}
+        database={database}
+        loading={loading}
+        databasesLoading={databasesLoading}
+        databaseError={databaseError}
+        onNewChat={() => void newChat()}
+        onSelectDatabase={(databaseId) => void selectDatabase(databaseId)}
+        onToggleTheme={onToggleTheme}
+      />
 
-setQuestion,
+      <main className={`chat-workspace ${turns.length ? "has-conversation" : "is-empty"}`}>
+        <header className="workspace-header">
+          <div className="workspace-header__title">
+            <strong>AskData</strong>
+            <span>/</span>
+            <span>{turns.length ? "当前对话" : "New query"}</span>
+          </div>
+          <div className="workspace-header__database">
+            <span className={`connection-dot ${database ? "is-connected" : ""}`} />
+            <DatabaseIcon />
+            <span>{selectedDatabase?.name || (databasesLoading ? "加载中…" : "未选择数据库")}</span>
+          </div>
+        </header>
 
-loading,
+        {databaseError ? (
+          <div className="workspace-alert" role="alert">
+            <strong>数据库列表加载失败</strong>
+            <span>{databaseError}</span>
+            <button type="button" onClick={() => void loadDatabases()}>
+              重新加载
+            </button>
+          </div>
+        ) : null}
 
-result,
-
-executeQuery,
-
-error
-
-}=useQueryStore();
-
-
-
-return (
-
-<div className="app-shell">
-
-
-<header className="app-shell__header">
-
-
-<Typography.Title level={2}>
-
-AskData 智能问数
-
-</Typography.Title>
-
-
-</header>
-
-
-
-<DatabaseSelector
-
-value={database}
-
-onChange={setDatabase}
-
-/>
-
-
-
-<QueryInput
-
-loading={loading}
-
-onSubmit={(question)=>{
-
-setQuestion(question);
-
-executeQuery(question);
-
-
-}}
-
-/>
-
-{error ? (
-
-<Alert
-
-type="error"
-
-showIcon
-
-message="请求失败"
-
-description={error}
-
-/>
-
-) : null}
-
-
-
-<QueryResultView
-
-result={result}
-
-loading={loading}
-
-/>
-
-
-
-</div>
-
-);
-
+        {!turns.length ? (
+          <section className="welcome-panel">
+            <div className="welcome-panel__content">
+              <h1>
+                <span>✦</span> Hi, user.
+              </h1>
+              {composer}
+              <div className="welcome-panel__suggestions" aria-label="示例问题">
+                <span>试试：</span>
+                <span>分析排名</span>
+                <span>比较趋势</span>
+                <span>统计数量</span>
+              </div>
+            </div>
+          </section>
+        ) : (
+          <>
+            <section className="conversation" aria-live="polite">
+              {turns.map((turn) => (
+                <QueryResultView key={turn.id} turn={turn} onRetry={retryTurn} />
+              ))}
+              <div ref={endRef} />
+            </section>
+            <div className="composer-dock">{composer}</div>
+          </>
+        )}
+      </main>
+    </div>
+  );
 }
