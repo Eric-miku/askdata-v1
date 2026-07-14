@@ -120,13 +120,24 @@ COLUMN SELECTION (strict — every SELECT is checked):
 - NEVER add extra columns "for context". If the question asks for Phone, SELECT Phone.
 - If the question asks for N things, your SELECT returns exactly those N things.
 
+Gold-style SELECT column discipline (BIRD evaluation compares result columns):
+- For "which card(s)" or "which record(s)" questions, prefer stable identifier columns such as id when the schema has an id-like primary key and the question does not explicitly ask for names.
+- For rate, ratio, percentage, average, or difference questions, select only the rate expression or final computed expression unless the question explicitly asks for names or supporting fields.
+- For top/most/highest/lowest questions, do not include helper ranking/count columns unless the question explicitly asks for the amount. Example: "which away team won the most" -> SELECT team name only, not team name + wins.
+- For "full address" wording, select the requested address columns separately when the schema stores them separately; do not concatenate address fields into one string.
+- Use original schema column names where possible instead of invented aliases when returning non-aggregate columns.
+
 PRE-AGGREGATED COLUMNS (do NOT double-aggregate):
 - If a column name contains Avg, Average, Rate, Percent, Pct, Total, Sum, Ratio, or Score: it is already a computed metric per row. Do NOT wrap it in AVG(), SUM(), or other aggregate functions.
 - Example: column "AvgScrWrite" means "average writing score per school". Use it directly: SELECT AvgScrWrite — never AVG(AvgScrWrite).
 - Only use aggregate functions (AVG, SUM, COUNT, MIN, MAX) on raw atomic columns, not on pre-computed metrics.
+- If the schema evidence defines a formula, follow that formula even when it aggregates a pre-computed metric.
+- Example: evidence says "Average of average math = sum(average math scores) / count(schools)" -> group by the requested school fields and use SUM(AvgScrMath) / COUNT(cds).
 
 JOIN (mandatory when data spans tables):
 - Before you skip a JOIN, ask yourself: does my WHERE column come from a different table than my SELECT column? If yes -> JOIN them.
+- Example: question asks "writing score of schools managed by Ricci Ulrich" -> manager name is in schools, writing score is in satscores -> must JOIN schools and satscores on CDSCode.
+- Example: question asks "phone number of school with lowest reading score" -> phone is in schools, reading score is in satscores, filter is district in schools -> must JOIN satscores and schools.
 
 COMPUTATION (push everything into SQL):
 - Comparisons (most/least/highest/lowest): use ORDER BY + LIMIT 1. Never fetch multiple rows and pick yourself.
@@ -137,8 +148,14 @@ COMPUTATION (push everything into SQL):
 ANSWER (final output rules):
 - Your answer MUST contain ONLY information present in the SQL results. Never invent numbers, names, or facts.
 - Do not include your reasoning, doubts, or chain-of-thought in the final answer.
+- Do not restate the question or explain why the answer follows.
+- For yes/no questions, answer with one short sentence starting with "Yes" or "No".
 - Keep answers concise — one or two sentences.
-- If data is insufficient, say so."""
+- If data is insufficient, say so.
+
+SQL RULES:
+- Only SELECT. Never INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE.
+- Never use SELECT *."""
 
         if self.skill_loader:
             skills = self.skill_loader.BuildPromptSection()
@@ -165,21 +182,30 @@ ANSWER (final output rules):
 
         asks_count = bool(re.search(r"\b(how many|number of|count|no\.)\b", question_text))
         asks_list = bool(re.search(r"\b(list|name|names|show|give|which|what are)\b", question_text))
+        asks_average = bool(re.search(r"\b(avg|average|mean)\b", question_text))
         asks_rank = "rank" in question_text
         asks_extreme = bool(re.search(r"\b(top|bottom|highest|lowest|most|least|best|worst)\b", question_text))
         is_count_sql = bool(re.search(r"\bcount\s*\(", sql))
+        is_count_only = is_count_sql and len(columns) == 1
+        is_avg_sql = bool(re.search(r"\b(avg|average)\s*\(", sql))
 
-        if asks_count:
+        if asks_average:
+            score += 7 if is_avg_sql else -5
+            if is_count_only:
+                score -= 5
+        elif asks_count:
             score += 6 if is_count_sql else -6
             if len(columns) == 1:
                 score += 2
         if asks_list and not asks_count:
-            score += -6 if is_count_sql else 3
+            score += -6 if is_count_only else 3
         if asks_rank:
             score += 5 if re.search(r"\b(rank|dense_rank|row_number)\s*\(", sql) else -4
         if asks_extreme:
             score += 3 if re.search(r"\border\s+by\b", sql) else -3
             score += 2 if re.search(r"\blimit\s+1\b", sql) else 0
+            if is_count_sql and len(columns) > 1:
+                score += 2
         if re.search(r"\boffset\b", sql):
             score -= 4
         if re.search(r"\blimit\s+([2-9]\d{2,}|\d{4,})\b", sql):

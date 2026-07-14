@@ -123,10 +123,11 @@ def EvalBird(
     processed_dir: Path | None = typer.Option(None, "--processed-dir", help="BIRD processed directory"),
     database_id: str | None = typer.Option(None, "--database-id", "-d", help="Evaluate only this database"),
     limit: int | None = typer.Option(None, "--limit", "-n", help="Limit evaluation count"),
+    seed: int | None = typer.Option(None, "--seed", help="Shuffle questions with this random seed before applying --limit"),
     out: Path = typer.Option(Path("reports/bird-eval.json"), "--out", "-o", help="JSON report output path"),
 ):
     """Run BIRD evaluation using the full ReAct agent pipeline."""
-    report = EvalRunner(processed_dir=processed_dir).Run(database_id=database_id, limit=limit, out=str(out))
+    report = EvalRunner(processed_dir=processed_dir).Run(database_id=database_id, limit=limit, out=str(out), seed=seed)
     summary = report["summary"]
     typer.echo(f"Total: {summary['total']}")
     typer.echo(f"Execution Accuracy: {summary['executionAccuracy']:.2%}")

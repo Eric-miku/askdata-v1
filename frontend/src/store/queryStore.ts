@@ -3,134 +3,65 @@ import type { QueryResponse } from "../types/query";
 import { queryData } from "../api/query";
 
 interface QueryState {
+  database: string;
+  question: string;
+  loading: boolean;
+  error: string | null;
+  result: QueryResponse | null;
 
-  database:string;
-
-  question:string;
-
-  loading:boolean;
-
-  error:string | null;
-
-  trace:string[];
-
-  result:QueryResponse | null;
-
-
-  setDatabase:(db:string)=>void;
-
-  setQuestion:(q:string)=>void;
-
-  setLoading:(v:boolean)=>void;
-
-  setError:(e:string|null)=>void;
-
-  setTrace:(t:string[])=>void;
-
-  setResult:(r:QueryResponse)=>void;
-
-  executeQuery:()=>Promise<void>;
-
+  setDatabase: (db: string) => void;
+  setQuestion: (q: string) => void;
+  setError: (e: string | null) => void;
+  setResult: (r: QueryResponse | null) => void;
+  executeQuery: (questionOverride?: string) => Promise<void>;
 }
 
+export const useQueryStore = create<QueryState>((set, get) => ({
+  database: "",
+  question: "",
+  loading: false,
+  error: null,
+  result: null,
 
+  setDatabase: (db) => set({ database: db }),
+  setQuestion: (q) => set({ question: q }),
+  setError: (e) => set({ error: e }),
+  setResult: (r) => set({ result: r }),
 
-export const useQueryStore=create<QueryState>((set,get)=>({
+  executeQuery: async (questionOverride) => {
+    const database = get().database;
+    const question = (questionOverride ?? get().question).trim();
 
-  database:"",
+    if (!database) {
+      set({ error: "请先选择数据库。" });
+      return;
+    }
+    if (!question) {
+      set({ error: "请输入问题。" });
+      return;
+    }
 
-  question:"",
+    try {
+      set({
+        loading: true,
+        error: null,
+      });
 
-  loading:false,
+      const result = await queryData({
+        database_id: database,
+        question,
+      });
 
-  error:null,
-
-  trace:[],
-
-  result:null,
-
-
-  setDatabase:(db)=>
-    set({
-      database:db
-    }),
-
-
-  setQuestion:(q)=>
-    set({
-      question:q
-    }),
-
-
-  setLoading:(v)=>
-    set({
-      loading:v
-    }),
-
-
-  setError:(e)=>
-    set({
-      error:e
-    }),
-
-
-  setTrace:(t)=>
-    set({
-      trace:t
-    }),
-
-
-  setResult:(r)=>
-    set({
-      result:r
-    }),
-
-executeQuery:async()=>{
-
-  const {
-    database,
-    question
-  }=get();
-
-
-  try{
-
-    set({
-      loading:true,
-      error:null
-    });
-
-
-    const result=await queryData({
-
-      database_id:database,
-
-      question
-
-    });
-
-
-    set({
-
-      result,
-
-      loading:false
-
-    });
-
-
-  }catch(error){
-
-    set({
-
-      error:String(error),
-
-      loading:false
-
-    });
-
-  }
-
-}
-
+      set({
+        question,
+        result,
+        loading: false,
+      });
+    } catch (err) {
+      set({
+        error: err instanceof Error ? err.message : String(err),
+        loading: false,
+      });
+    }
+  },
 }));

@@ -53,6 +53,22 @@ def write_processed_dataset(root, database_path):
     return processed
 
 
+def write_multi_question_dataset(root, database_path):
+    processed = write_processed_dataset(root, database_path)
+    questions = [
+        {
+            "questionId": f"q{index}",
+            "databaseId": "demo",
+            "question": "How many items?",
+            "goldSql": "SELECT COUNT(id) AS count FROM items",
+            "difficulty": "simple",
+        }
+        for index in range(5)
+    ]
+    (processed / "questions.json").write_text(json.dumps(questions), encoding="utf-8")
+    return processed
+
+
 def test_eval_runner_is_self_contained_and_writes_report(tmp_path):
     database_path = tmp_path / "demo.sqlite"
     connection = sqlite3.connect(database_path)
@@ -73,3 +89,23 @@ def test_eval_runner_is_self_contained_and_writes_report(tmp_path):
     assert report["summary"]["answerProducedRate"] == 1.0
     assert report["cases"][0]["generatedSql"] == "SELECT COUNT(id) AS count FROM items"
     assert report["cases"][0]["passed"] is True
+
+
+def test_eval_runner_seed_reproducibly_shuffles_questions_before_limit(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    connection = sqlite3.connect(database_path)
+    connection.execute("CREATE TABLE items(id INTEGER)")
+    connection.executemany("INSERT INTO items(id) VALUES (?)", [(1,), (2,)])
+    connection.commit()
+    connection.close()
+    processed = write_multi_question_dataset(tmp_path, database_path)
+
+    report_a = EvalRunner(processed_dir=processed, agent_graph=FakeAgentGraph()).Run(limit=3, seed=42)
+    report_b = EvalRunner(processed_dir=processed, agent_graph=FakeAgentGraph()).Run(limit=3, seed=42)
+    report_c = EvalRunner(processed_dir=processed, agent_graph=FakeAgentGraph()).Run(limit=3, seed=99)
+
+    ids_a = [case["questionId"] for case in report_a["cases"]]
+    ids_b = [case["questionId"] for case in report_b["cases"]]
+    ids_c = [case["questionId"] for case in report_c["cases"]]
+    assert ids_a == ids_b == ["q3", "q1", "q2"]
+    assert ids_c == ["q1", "q2", "q0"]

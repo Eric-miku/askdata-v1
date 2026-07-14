@@ -1,4 +1,5 @@
 import { Typography } from "antd";
+import { Alert } from "antd";
 
 import { QueryResultView } from "../components/QueryResultView";
 
@@ -24,7 +25,9 @@ loading,
 
 result,
 
-executeQuery
+executeQuery,
+
+error
 
 }=useQueryStore();
 
@@ -65,14 +68,30 @@ loading={loading}
 
 onSubmit={(question)=>{
 
-console.log(question);
+setQuestion(question);
 
-executeQuery();
+executeQuery(question);
 
 
 }}
 
 />
+
+{error ? (
+
+<Alert
+
+type="error"
+
+showIcon
+
+message="请求失败"
+
+description={error}
+
+/>
+
+) : null}
 
 
 

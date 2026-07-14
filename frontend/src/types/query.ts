@@ -9,7 +9,7 @@ export type QueryCellValue =
 
 export interface TraceItem {
 
-  step:number;
+  step:string;
 
   status:string;
 
@@ -27,7 +27,7 @@ export interface QueryResponse {
 
   columns:string[];
 
-  rows:any[][];
+  rows:Record<string, QueryCellValue>[];
 
   chart?:any;
 

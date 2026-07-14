@@ -79,6 +79,26 @@ def test_react_sql_agent_repairs_sql_after_tool_error(tmp_path):
     assert len(llm.messages_seen) == 3
 
 
+def test_react_sql_agent_prompt_includes_bird_specific_intern_agent_rules():
+    agent = ReActSqlAgent(llm_client=ScriptedToolCallingLLM([{"content": "done"}]))
+
+    messages = agent._BuildMessages(
+        question="What is the average writing score of schools managed by Ricci Ulrich?",
+        schema_prompt="Evidence: Average of average math = sum(average math scores) / count(schools)",
+        session_context=None,
+    )
+
+    system_prompt = messages[0]["content"]
+    assert "If the schema evidence defines a formula" in system_prompt
+    assert "writing score of schools managed by Ricci Ulrich" in system_prompt
+    assert "Never use SELECT *" in system_prompt
+    assert "Gold-style SELECT column discipline" in system_prompt
+    assert "prefer stable identifier columns such as id" in system_prompt
+    assert "select only the rate expression" in system_prompt
+    assert "do not include helper ranking/count columns" in system_prompt
+    assert "do not concatenate address fields" in system_prompt
+
+
 def test_react_sql_agent_keeps_count_sql_when_later_detail_query_is_exploratory(tmp_path):
     database_path = tmp_path / "demo.sqlite"
     connection = sqlite3.connect(database_path)
@@ -129,3 +149,55 @@ def test_react_sql_agent_rejects_count_as_final_sql_for_list_question(tmp_path):
     assert result["sql"] == "SELECT name FROM items ORDER BY name"
     assert result["columns"] == ["name"]
     assert result["rows"] == [{"name": "a"}, {"name": "b"}]
+
+
+def test_react_sql_agent_prefers_average_sql_for_average_number_question(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    connection = sqlite3.connect(database_path)
+    connection.execute("CREATE TABLE items(id INTEGER, takers INTEGER)")
+    connection.executemany("INSERT INTO items(id, takers) VALUES (?, ?)", [(1, 10), (2, 20)])
+    connection.commit()
+    connection.close()
+
+    llm = ScriptedToolCallingLLM([
+        {"sql": "SELECT COUNT(*) FROM items", "content": "Check count."},
+        {"sql": "SELECT AVG(takers) AS avg_takers FROM items", "content": "Compute average."},
+        {"content": "The average is 15."},
+    ])
+    agent = ReActSqlAgent(llm_client=llm)
+
+    result = agent.Run(
+        question="What is the average number of test takers?",
+        schema_prompt="Database: demo\nTable items(id integer, takers integer)",
+        database_path=str(database_path),
+    )
+
+    assert result["sql"] == "SELECT AVG(takers) AS avg_takers FROM items"
+    assert result["columns"] == ["avg_takers"]
+    assert result["rows"] == [{"avg_takers": 15.0}]
+
+
+def test_react_sql_agent_allows_count_inside_most_query_when_target_is_listed(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    connection = sqlite3.connect(database_path)
+    connection.execute("CREATE TABLE wins(team TEXT)")
+    connection.executemany("INSERT INTO wins(team) VALUES (?)", [("Rangers",), ("Rangers",), ("Celtic",)])
+    connection.commit()
+    connection.close()
+
+    llm = ScriptedToolCallingLLM([
+        {"sql": "SELECT 'Scotland Premier League' AS name", "content": "Find league."},
+        {"sql": "SELECT team, COUNT(*) AS wins FROM wins GROUP BY team ORDER BY wins DESC LIMIT 1", "content": "Find most wins."},
+        {"content": "Rangers won the most."},
+    ])
+    agent = ReActSqlAgent(llm_client=llm)
+
+    result = agent.Run(
+        question="Which away team won the most?",
+        schema_prompt="Database: demo\nTable wins(team text)",
+        database_path=str(database_path),
+    )
+
+    assert result["sql"] == "SELECT team, COUNT(*) AS wins FROM wins GROUP BY team ORDER BY wins DESC LIMIT 1"
+    assert result["columns"] == ["team", "wins"]
+    assert result["rows"] == [{"team": "Rangers", "wins": 2}]

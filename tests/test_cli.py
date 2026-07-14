@@ -43,6 +43,7 @@ def test_eval_bird_help_is_available():
     assert result.exit_code == 0
     assert "--limit" in result.output
     assert "--out" in result.output
+    assert "--seed" in result.output
     assert "--processed-dir" in result.output
 
 

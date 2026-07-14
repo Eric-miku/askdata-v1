@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 import json
+import random
 import re
 import sqlite3
 import time
@@ -25,12 +26,14 @@ class EvalRunner:
         self.agent_graph = agent_graph
         self.comparer = comparer or BirdResultComparer()
 
-    def Run(self, database_id=None, limit=None, out=None) -> dict:
+    def Run(self, database_id=None, limit=None, out=None, seed=None) -> dict:
         started_at = datetime.now(UTC)
         databases = self._LoadJson("databases.json")
         questions = [item for item in self._LoadJson("questions.json") if item.get("goldSql") or item.get("SQL")]
         if database_id:
             questions = [item for item in questions if item.get("databaseId") == database_id or item.get("db_id") == database_id]
+        if seed is not None:
+            random.Random(seed).shuffle(questions)
         if limit:
             questions = questions[:limit]
 
