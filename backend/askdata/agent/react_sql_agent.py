@@ -3,6 +3,9 @@
 import json
 import re
 
+from askdata.agent.answer_shape import CheckAnswerShape
+from askdata.agent.prompts import BuildReActSystemPrompt
+
 RUN_QUERY_TOOL = {
     "type": "function",
     "function": {
@@ -22,7 +25,7 @@ RUN_QUERY_TOOL = {
 class ReActSqlAgent:
     """Tool-calling SQL loop that can be used as one node inside AgentGraph."""
 
-    def __init__(self, llm_client, max_iterations: int = 6, skill_loader=None):
+    def __init__(self, llm_client, max_iterations: int = 8, skill_loader=None):
         self.llm_client = llm_client
         self.max_iterations = max_iterations
         self.skill_loader = skill_loader
@@ -34,7 +37,9 @@ class ReActSqlAgent:
         last_columns = []
         last_rows = []
         candidates = []
+        candidate_sequence = 0
         answer = ""
+        review_requested = False
 
         for iteration in range(self.max_iterations):
             message = self.llm_client.Chat(messages, tools=[RUN_QUERY_TOOL])
@@ -44,6 +49,19 @@ class ReActSqlAgent:
 
             tool_calls = getattr(message, "tool_calls", None) or []
             if not tool_calls:
+                latest_warnings = candidates[-1].get("shape_warnings", []) if candidates else []
+                if latest_warnings and len(candidates) < 2 and not review_requested:
+                    messages.append({"role": "assistant", "content": content or ""})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Before finalizing, produce and run one corrected SQL candidate that resolves "
+                            "these answer-shape warnings: " + "; ".join(latest_warnings)
+                        ),
+                    })
+                    review_requested = True
+                    trace.append(self._TraceStep("ReviewAnswerShape", "retry", "; ".join(latest_warnings)))
+                    continue
                 answer = self._CleanFinalAnswer(content or "")
                 break
 
@@ -57,10 +75,22 @@ class ReActSqlAgent:
                 trace.append(self._TraceStep("GenerateSql", "success", sql))
                 result = self._ExecuteSql(sql, database_path)
                 if result["success"]:
+                    shape_warnings = CheckAnswerShape(question, sql)
                     last_sql = sql
                     last_columns = result["columns"]
                     last_rows = result["rows"]
-                    candidates.append({"sql": sql, "columns": last_columns, "rows": last_rows})
+                    candidates.append({
+                        "sql": sql,
+                        "columns": last_columns,
+                        "rows": last_rows,
+                        "shape_warnings": shape_warnings,
+                        "sequence": candidate_sequence,
+                    })
+                    candidate_sequence += 1
+                    # ReAct commonly uses successful queries to inspect categorical values
+                    # before producing its final SQL. Keep the candidate set bounded without
+                    # preventing that later, directly answering query from being executed.
+                    candidates = candidates[-2:]
                     trace.append(self._TraceStep("ExecuteSql", "success", f"Returned {len(last_rows)} rows."))
                     messages.append({
                         "role": "tool",
@@ -70,6 +100,8 @@ class ReActSqlAgent:
                                 "columns": last_columns,
                                 "rowCount": len(last_rows),
                                 "rows": last_rows[:20],
+                                "shapeWarnings": shape_warnings,
+                                "reviewRequired": bool(shape_warnings),
                                 "note": "Rows are a sample for inspection. Do not paginate with OFFSET to collect all rows; keep the SQL that directly answers the question.",
                             },
                             ensure_ascii=False,
@@ -103,59 +135,7 @@ class ReActSqlAgent:
         previous = ""
         if session_context and session_context.get("last_sql"):
             previous = f"\nPrevious SQL: {session_context['last_sql']}"
-        system_prompt = """You are a SQLite data analyst. Given a question and a database schema, write and execute SQL queries to answer the question.
-
-HOW TO WORK (follow this sequence for every question):
-1. Read the question. Identify exactly what columns the answer requires.
-2. Check the schema: which table has each required column? If filter columns and target columns are in DIFFERENT tables, you MUST JOIN those tables.
-3. Before writing SQL, verify: does my SELECT list match exactly what the question asks for? No extra columns.
-4. Write and execute the SQL via the run_query tool.
-5. If the query fails or returns wrong results, read the error, fix the SQL, and retry.
-6. When satisfied, state ONLY the final answer based on the SQL results.
-
-COLUMN SELECTION (strict — every SELECT is checked):
-- "What is the phone number of X?" -> SELECT phone ONLY, not phone + school + score.
-- "List the schools and their writing scores" -> SELECT school, score ONLY.
-- "How many schools in each county?" -> SELECT county, COUNT(*) ONLY.
-- NEVER add extra columns "for context". If the question asks for Phone, SELECT Phone.
-- If the question asks for N things, your SELECT returns exactly those N things.
-
-Gold-style SELECT column discipline (BIRD evaluation compares result columns):
-- For "which card(s)" or "which record(s)" questions, prefer stable identifier columns such as id when the schema has an id-like primary key and the question does not explicitly ask for names.
-- For rate, ratio, percentage, average, or difference questions, select only the rate expression or final computed expression unless the question explicitly asks for names or supporting fields.
-- For top/most/highest/lowest questions, do not include helper ranking/count columns unless the question explicitly asks for the amount. Example: "which away team won the most" -> SELECT team name only, not team name + wins.
-- For "full address" wording, select the requested address columns separately when the schema stores them separately; do not concatenate address fields into one string.
-- Use original schema column names where possible instead of invented aliases when returning non-aggregate columns.
-
-PRE-AGGREGATED COLUMNS (do NOT double-aggregate):
-- If a column name contains Avg, Average, Rate, Percent, Pct, Total, Sum, Ratio, or Score: it is already a computed metric per row. Do NOT wrap it in AVG(), SUM(), or other aggregate functions.
-- Example: column "AvgScrWrite" means "average writing score per school". Use it directly: SELECT AvgScrWrite — never AVG(AvgScrWrite).
-- Only use aggregate functions (AVG, SUM, COUNT, MIN, MAX) on raw atomic columns, not on pre-computed metrics.
-- If the schema evidence defines a formula, follow that formula even when it aggregates a pre-computed metric.
-- Example: evidence says "Average of average math = sum(average math scores) / count(schools)" -> group by the requested school fields and use SUM(AvgScrMath) / COUNT(cds).
-
-JOIN (mandatory when data spans tables):
-- Before you skip a JOIN, ask yourself: does my WHERE column come from a different table than my SELECT column? If yes -> JOIN them.
-- Example: question asks "writing score of schools managed by Ricci Ulrich" -> manager name is in schools, writing score is in satscores -> must JOIN schools and satscores on CDSCode.
-- Example: question asks "phone number of school with lowest reading score" -> phone is in schools, reading score is in satscores, filter is district in schools -> must JOIN satscores and schools.
-
-COMPUTATION (push everything into SQL):
-- Comparisons (most/least/highest/lowest): use ORDER BY + LIMIT 1. Never fetch multiple rows and pick yourself.
-- Ratios, percentages, averages, differences: compute in the SELECT expressions. Never fetch two numbers and divide in your head.
-- Conditional counts: use SUM(CASE WHEN ... THEN 1 ELSE 0 END). Never count rows manually.
-- Do not paginate with OFFSET to collect full result sets. The tool returns samples; the final SQL should answer the question, not fetch every page.
-
-ANSWER (final output rules):
-- Your answer MUST contain ONLY information present in the SQL results. Never invent numbers, names, or facts.
-- Do not include your reasoning, doubts, or chain-of-thought in the final answer.
-- Do not restate the question or explain why the answer follows.
-- For yes/no questions, answer with one short sentence starting with "Yes" or "No".
-- Keep answers concise — one or two sentences.
-- If data is insufficient, say so.
-
-SQL RULES:
-- Only SELECT. Never INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE.
-- Never use SELECT *."""
+        system_prompt = BuildReActSystemPrompt()
 
         if self.skill_loader:
             skills = self.skill_loader.BuildPromptSection()
@@ -172,7 +152,14 @@ SQL RULES:
     def _SelectBestCandidate(self, question: str, candidates: list[dict]) -> dict | None:
         if not candidates:
             return None
-        return max(enumerate(candidates), key=lambda item: (self._IntentScore(question, item[1]), item[0]))[1]
+        return max(
+            candidates,
+            key=lambda candidate: (
+                not candidate.get("shape_warnings"),
+                candidate.get("sequence", 0),
+                self._IntentScore(question, candidate),
+            ),
+        )
 
     def _IntentScore(self, question: str, candidate: dict) -> int:
         question_text = (question or "").lower()

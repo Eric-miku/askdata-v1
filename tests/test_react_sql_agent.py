@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from askdata.agent.react_sql_agent import ReActSqlAgent
+from askdata.agent.prompts import BuildReActSystemPrompt
 
 
 def tool_call(arguments, call_id="call_1"):
@@ -34,8 +35,10 @@ class ScriptedToolCallingLLM:
     def __init__(self, steps):
         self.steps = steps
         self.index = 0
+        self.messages_seen = []
 
     def Chat(self, messages, tools=None):
+        self.messages_seen.append(list(messages))
         step = self.steps[self.index]
         self.index += 1
         if "sql" in step:
@@ -89,10 +92,12 @@ def test_react_sql_agent_prompt_includes_bird_specific_intern_agent_rules():
     )
 
     system_prompt = messages[0]["content"]
+    assert system_prompt.startswith(BuildReActSystemPrompt())
     assert "If the schema evidence defines a formula" in system_prompt
     assert "writing score of schools managed by Ricci Ulrich" in system_prompt
     assert "Never use SELECT *" in system_prompt
-    assert "Gold-style SELECT column discipline" in system_prompt
+    assert "SELECT column discipline" in system_prompt
+    assert "Normalize date-like text with SQLite date functions" in system_prompt
     assert "prefer stable identifier columns such as id" in system_prompt
     assert "select only the rate expression" in system_prompt
     assert "do not include helper ranking/count columns" in system_prompt
@@ -187,7 +192,7 @@ def test_react_sql_agent_allows_count_inside_most_query_when_target_is_listed(tm
 
     llm = ScriptedToolCallingLLM([
         {"sql": "SELECT 'Scotland Premier League' AS name", "content": "Find league."},
-        {"sql": "SELECT team, COUNT(*) AS wins FROM wins GROUP BY team ORDER BY wins DESC LIMIT 1", "content": "Find most wins."},
+        {"sql": "SELECT team FROM wins GROUP BY team ORDER BY COUNT(*) DESC LIMIT 1", "content": "Find most wins."},
         {"content": "Rangers won the most."},
     ])
     agent = ReActSqlAgent(llm_client=llm)
@@ -198,6 +203,60 @@ def test_react_sql_agent_allows_count_inside_most_query_when_target_is_listed(tm
         database_path=str(database_path),
     )
 
-    assert result["sql"] == "SELECT team, COUNT(*) AS wins FROM wins GROUP BY team ORDER BY wins DESC LIMIT 1"
-    assert result["columns"] == ["team", "wins"]
-    assert result["rows"] == [{"team": "Rangers", "wins": 2}]
+    assert result["sql"] == "SELECT team FROM wins GROUP BY team ORDER BY COUNT(*) DESC LIMIT 1"
+    assert result["columns"] == ["team"]
+    assert result["rows"] == [{"team": "Rangers"}]
+
+
+def test_react_sql_agent_requests_second_candidate_after_shape_warning(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    connection = sqlite3.connect(database_path)
+    connection.execute("CREATE TABLE items(id INTEGER, name TEXT)")
+    connection.executemany("INSERT INTO items(id, name) VALUES (?, ?)", [(1, "a"), (2, "b")])
+    connection.commit()
+    connection.close()
+    llm = ScriptedToolCallingLLM([
+        {"sql": "SELECT name FROM items", "content": "Inspect items."},
+        {"content": "There are two."},
+        {"sql": "SELECT COUNT(*) AS count FROM items", "content": "Correct the output shape."},
+        {"content": "There are two."},
+    ])
+
+    result = ReActSqlAgent(llm_client=llm).Run(
+        question="How many items are there?",
+        schema_prompt="Database: demo\nTable items(id integer, name text)",
+        database_path=str(database_path),
+    )
+
+    assert result["sql"] == "SELECT COUNT(*) AS count FROM items"
+    assert result["rows"] == [{"count": 2}]
+    assert any(step["step"] == "ReviewAnswerShape" for step in result["trace"])
+    first_tool_message = next(
+        message for message in llm.messages_seen[1]
+        if message.get("role") == "tool"
+    )
+    payload = json.loads(first_tool_message["content"])
+    assert payload["shapeWarnings"] == ["Question asks for a count, but SQL does not use COUNT."]
+
+
+def test_react_sql_agent_retains_two_candidates_but_still_executes_later_final_sql(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE items(id INTEGER)")
+        connection.executemany("INSERT INTO items(id) VALUES (?)", [(1,), (2,)])
+    llm = ScriptedToolCallingLLM([
+        {"sql": "SELECT id FROM items", "content": "First."},
+        {"sql": "SELECT COUNT(*) AS count FROM items", "content": "Second."},
+        {"sql": "SELECT COUNT(*) AS count FROM items WHERE id > 0", "content": "Third."},
+        {"content": "Done."},
+    ])
+
+    result = ReActSqlAgent(llm_client=llm).Run(
+        question="How many items?",
+        schema_prompt="Database: demo\nTable items(id integer)",
+        database_path=str(database_path),
+    )
+
+    assert result["sql"] == "SELECT COUNT(*) AS count FROM items WHERE id > 0"
+    assert sum(step["step"] == "ExecuteSql" for step in result["trace"]) == 3
+    assert not any(step["step"] == "CandidateLimit" for step in result["trace"])

@@ -1,6 +1,8 @@
-"""BIRD evaluation runner — runs AgentGraph (ReAct loop) against BIRD questions and compares results with gold SQL."""
+"""BIRD evaluation runner using the normalized data-processing contract."""
 
+from collections import Counter
 from datetime import UTC, datetime
+import hashlib
 import json
 import random
 import re
@@ -13,6 +15,12 @@ from tqdm import tqdm
 from askdata.agent.graph import AgentGraph
 from askdata.core.config import settings
 from askdata.core.paths import project_path
+from askdata.data.bird_io import (
+    LoadProcessedDatabases,
+    LoadProcessedQuestions,
+    LoadQuestionManifest,
+    ResolveProcessedDir,
+)
 from askdata.eval.metrics import BirdResultComparer, ExactMatch
 from askdata.tools.retriever import BirdSchemaIndex
 
@@ -21,21 +29,37 @@ class EvalRunner:
     """BIRD evaluator that uses the full ReAct agent pipeline."""
 
     def __init__(self, processed_dir=None, agent_graph=None, comparer=None):
-        base_dir = project_path(processed_dir or settings.BIRD_DATA_DIR)
-        self.processed_dir = base_dir if (base_dir / "databases.json").exists() else base_dir / "processed"
+        self.processed_dir = ResolveProcessedDir(processed_dir or settings.BIRD_DATA_DIR)
         self.agent_graph = agent_graph
         self.comparer = comparer or BirdResultComparer()
 
-    def Run(self, database_id=None, limit=None, out=None, seed=None) -> dict:
+    def Run(self, database_id=None, limit=None, out=None, seed=None, question_manifest=None) -> dict:
         started_at = datetime.now(UTC)
-        databases = self._LoadJson("databases.json")
-        questions = [item for item in self._LoadJson("questions.json") if item.get("goldSql") or item.get("SQL")]
+        databases = LoadProcessedDatabases(self.processed_dir)
+        database_ids = {item["database_id"] for item in databases}
+        questions = [
+            item for item in LoadProcessedQuestions(self.processed_dir, database_ids=database_ids)
+            if item["gold_sql"]
+        ]
         if database_id:
-            questions = [item for item in questions if item.get("databaseId") == database_id or item.get("db_id") == database_id]
-        if seed is not None:
-            random.Random(seed).shuffle(questions)
-        if limit:
-            questions = questions[:limit]
+            questions = [item for item in questions if item["database_id"] == database_id]
+
+        manifest_path = None
+        manifest_hash = None
+        if question_manifest:
+            manifest_path = project_path(question_manifest).resolve()
+            manifest_ids = LoadQuestionManifest(manifest_path)
+            by_id = {item["question_id"]: item for item in questions}
+            unknown_ids = [question_id for question_id in manifest_ids if question_id not in by_id]
+            if unknown_ids:
+                raise ValueError(f"Question manifest contains unknown IDs: {', '.join(unknown_ids[:10])}")
+            questions = [by_id[question_id] for question_id in manifest_ids]
+            manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        else:
+            if seed is not None:
+                random.Random(seed).shuffle(questions)
+            if limit:
+                questions = questions[:limit]
 
         index = BirdSchemaIndex().Build(databases, questions=questions)
         cases = [self._EvaluateQuestion(question, index) for question in tqdm(questions, desc="eval", unit="q")]
@@ -45,6 +69,14 @@ class EvalRunner:
             "byDatabase": self._BuildBreakdown(cases, "databaseId"),
             "byDifficulty": self._BuildBreakdown(cases, "difficulty"),
             "cases": cases,
+            "metadata": {
+                "modelName": settings.LLM_MODEL_NAME,
+                "questionManifest": str(manifest_path) if manifest_path else None,
+                "questionManifestSha256": manifest_hash,
+                "processedDataSha256": self._ProcessedDataFingerprint(),
+                "seed": seed,
+                "limit": limit,
+            },
         }
         if out:
             path = Path(out)
@@ -52,20 +84,14 @@ class EvalRunner:
             path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         return report
 
-    def _LoadJson(self, filename: str):
-        path = self.processed_dir / filename
-        if not path.exists():
-            raise FileNotFoundError(f"Missing BIRD processed file: {path}")
-        return json.loads(path.read_text(encoding="utf-8"))
-
     def _EvaluateQuestion(self, question: dict, index: BirdSchemaIndex) -> dict:
         started = time.perf_counter()
-        question_id = str(question.get("questionId") or question.get("question_id"))
-        database_id = question.get("databaseId") or question.get("db_id")
-        question_text = question.get("question") or ""
-        gold_sql = question.get("goldSql") or question.get("SQL") or ""
+        question_id = question["question_id"]
+        database_id = question["database_id"]
+        question_text = question["question"]
+        gold_sql = question["gold_sql"]
         context = index.Retrieve(database_id, question_text)
-        database_path = context.get("database_path", "")
+        database_path = context["database_path"]
         generated_sql = ""
         error = None
         execution_succeeded = False
@@ -79,12 +105,8 @@ class EvalRunner:
             result = agent.Run(question=question_text, database_id=database_id)
             generated_sql = result.get("sql") or ""
             error = result.get("error")
-
             if not generated_sql:
                 comparison = self.comparer.BuildVerdict(False, False, None, "empty_prediction")
-            elif not database_path:
-                comparison = self.comparer.BuildVerdict(False, False, None, "execution_error")
-                error = f"No database path for {database_id}"
             else:
                 gold = self._ExecuteSql(gold_sql, database_path)
                 execution_succeeded = True
@@ -108,7 +130,7 @@ class EvalRunner:
         return {
             "questionId": question_id,
             "databaseId": database_id,
-            "difficulty": question.get("difficulty") or "unknown",
+            "difficulty": question["difficulty"],
             "question": question_text,
             "goldSql": gold_sql,
             "goldColumns": gold_columns,
@@ -127,7 +149,7 @@ class EvalRunner:
                 "answerProduced": bool(result.get("answer")),
                 "matchMode": comparison["match_mode"],
                 "mismatchType": comparison["mismatch_type"],
-                "retryOrRepair": any(s.get("status") == "retry" for s in trace_steps),
+                "retryOrRepair": any(step.get("status") == "retry" for step in trace_steps),
             },
             "error": error,
             "latencyMs": latency_ms,
@@ -135,10 +157,13 @@ class EvalRunner:
         }
 
     def _ExecuteSql(self, sql: str, database_path: str) -> dict:
+        path = Path(database_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"SQLite database does not exist: {path}")
         cleaned = sql.strip().rstrip(";")
         if not re.search(r"\blimit\b", cleaned, re.I):
             cleaned += " LIMIT 1000"
-        connection = sqlite3.connect(database_path)
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             connection.row_factory = sqlite3.Row
             cursor = connection.execute(cleaned)
@@ -149,13 +174,28 @@ class EvalRunner:
             connection.close()
 
     def _BuildSummary(self, cases: list[dict], started_at: datetime, finished_at: datetime) -> dict:
+        latencies = [case["latencyMs"] for case in cases]
         return {
             "total": len(cases),
             "executionAccuracy": self._Rate(cases, lambda case: case["passed"]),
+            "executionAccuracyStrict": self._Rate(cases, lambda case: case["metrics"]["strictPass"]),
+            "executionAccuracyRelaxed": self._Rate(cases, lambda case: case["metrics"]["relaxedPass"]),
             "validSqlRate": self._Rate(cases, lambda case: case["metrics"]["validSql"]),
             "executionSuccessRate": self._Rate(cases, lambda case: case["metrics"]["executionSucceeded"]),
             "exactMatchRate": self._Rate(cases, lambda case: case["metrics"]["exactMatch"]),
             "answerProducedRate": self._Rate(cases, lambda case: case["metrics"]["answerProduced"]),
+            "retryRepairRate": self._Rate(cases, lambda case: case["metrics"]["retryOrRepair"]),
+            "mismatchBuckets": dict(Counter(
+                case["metrics"]["mismatchType"]
+                for case in cases
+                if case["metrics"]["mismatchType"]
+            )),
+            "latencyMs": {
+                "avg": round(sum(latencies) / len(latencies), 2) if latencies else 0,
+                "p50": self._Percentile(latencies, 50),
+                "p95": self._Percentile(latencies, 95),
+            },
+            "modelName": settings.LLM_MODEL_NAME,
             "startedAt": started_at.isoformat(),
             "finishedAt": finished_at.isoformat(),
             "durationSeconds": round((finished_at - started_at).total_seconds(), 2),
@@ -177,7 +217,26 @@ class EvalRunner:
         latencies = [case["latencyMs"] for case in cases]
         return {
             "total": len(cases),
-            "executionAccuracy": self._Rate(cases, lambda c: c["passed"]),
-            "validSqlRate": self._Rate(cases, lambda c: c["metrics"]["validSql"]),
+            "executionAccuracy": self._Rate(cases, lambda case: case["passed"]),
+            "executionAccuracyStrict": self._Rate(cases, lambda case: case["metrics"]["strictPass"]),
+            "executionAccuracyRelaxed": self._Rate(cases, lambda case: case["metrics"]["relaxedPass"]),
+            "validSqlRate": self._Rate(cases, lambda case: case["metrics"]["validSql"]),
             "avgLatencyMs": round(sum(latencies) / len(latencies), 2) if latencies else 0,
         }
+
+    def _Percentile(self, values: list[float], percentile: int) -> float:
+        if not values:
+            return 0
+        ordered = sorted(values)
+        return ordered[round((len(ordered) - 1) * percentile / 100)]
+
+    def _ProcessedDataFingerprint(self) -> str:
+        digest = hashlib.sha256()
+        paths = [self.processed_dir / "databases.json"]
+        questions_path = self.processed_dir / "questions.jsonl"
+        paths.append(questions_path if questions_path.exists() else self.processed_dir / "questions.json")
+        paths.extend(sorted((self.processed_dir / "schemas").glob("*.json")))
+        for path in paths:
+            digest.update(str(path.relative_to(self.processed_dir)).encode("utf-8"))
+            digest.update(path.read_bytes())
+        return digest.hexdigest()

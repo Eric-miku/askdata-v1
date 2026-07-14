@@ -1,13 +1,13 @@
 """Typer command-line entry points for AskData development workflows."""
 
 from pathlib import Path
-import json
 
 import typer
 
 from askdata.agent.graph import AgentGraph
 from askdata.core.config import settings
 from askdata.core.paths import project_path
+from askdata.data.bird_io import LoadProcessedDatabases, ResolveProcessedDir
 from askdata.eval import EvalRunner
 from askdata.tools.retriever import GetValue
 
@@ -16,18 +16,14 @@ app = typer.Typer(help="AskData — NL2SQL development CLI")
 
 
 def _ResolveProcessedDir(processed_dir: Path | None = None) -> Path:
-    base_dir = project_path(processed_dir or settings.BIRD_DATA_DIR)
-    return base_dir if (base_dir / "databases.json").exists() else base_dir / "processed"
+    return ResolveProcessedDir(processed_dir or settings.BIRD_DATA_DIR)
 
 
 def _LoadDatabases(processed_dir: Path | None = None) -> list[dict]:
-    path = _ResolveProcessedDir(processed_dir) / "databases.json"
-    if not path.exists():
-        raise typer.BadParameter(f"Missing processed databases file: {path}")
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, list):
-        raise typer.BadParameter(f"Invalid processed databases file: {path}")
-    return data
+    try:
+        return LoadProcessedDatabases(processed_dir or settings.BIRD_DATA_DIR)
+    except (FileNotFoundError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 class ChatSession:
@@ -124,13 +120,24 @@ def EvalBird(
     database_id: str | None = typer.Option(None, "--database-id", "-d", help="Evaluate only this database"),
     limit: int | None = typer.Option(None, "--limit", "-n", help="Limit evaluation count"),
     seed: int | None = typer.Option(None, "--seed", help="Shuffle questions with this random seed before applying --limit"),
+    question_manifest: Path | None = typer.Option(None, "--question-manifest", help="JSON list of exact BIRD question IDs; overrides --seed and --limit"),
+    model_name: str | None = typer.Option(None, "--model-name", help="Override LLM_MODEL_NAME for this evaluation run"),
     out: Path = typer.Option(Path("reports/bird-eval.json"), "--out", "-o", help="JSON report output path"),
 ):
     """Run BIRD evaluation using the full ReAct agent pipeline."""
-    report = EvalRunner(processed_dir=processed_dir).Run(database_id=database_id, limit=limit, out=str(out), seed=seed)
+    if model_name:
+        settings.LLM_MODEL_NAME = model_name
+    report = EvalRunner(processed_dir=processed_dir).Run(
+        database_id=database_id,
+        limit=limit,
+        out=str(out),
+        seed=seed,
+        question_manifest=question_manifest,
+    )
     summary = report["summary"]
     typer.echo(f"Total: {summary['total']}")
     typer.echo(f"Execution Accuracy: {summary['executionAccuracy']:.2%}")
+    typer.echo(f"Strict Execution Accuracy: {summary['executionAccuracyStrict']:.2%}")
     typer.echo(f"Valid SQL Rate: {summary['validSqlRate']:.2%}")
     typer.echo(f"Exact Match Rate: {summary['exactMatchRate']:.2%}")
     typer.echo(f"Report: {out}")

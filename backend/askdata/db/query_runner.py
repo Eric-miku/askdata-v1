@@ -2,6 +2,7 @@
 
 import re
 import sqlite3
+from pathlib import Path
 
 from askdata.db.validator import SQLValidator
 
@@ -34,8 +35,12 @@ def Execute(sql: str, database_path: str) -> dict:
     if not _has_limit.search(normalized):
         normalized = f"{normalized.rstrip(';').strip()} LIMIT {_safety_cap}"
 
+    path = Path(database_path).expanduser().resolve()
+    if not path.is_file():
+        return {"success": False, "sql": normalized, "error": f"SQLite database does not exist: {path}"}
+
     try:
-        connection = sqlite3.connect(database_path)
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             connection.row_factory = sqlite3.Row
             cursor = connection.execute(normalized)

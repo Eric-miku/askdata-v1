@@ -1,11 +1,11 @@
 """Schema index and semantic retriever — loads BIRD database schema, token-matches question keywords to tables/columns, builds structured prompt context with foreign key JOIN hints and per-DB business instructions."""
 
-import json
 import re
 from pathlib import Path
 from typing import Any
 
 from askdata.core.config import settings
+from askdata.data.bird_io import LoadProcessedDatabases, LoadProcessedQuestions, ResolveProcessedDir
 from askdata.core.paths import project_path
 
 
@@ -41,18 +41,28 @@ class BirdSchemaIndex:
         if not database:
             raise ValueError(f"Unknown BIRD database_id: {database_id}")
 
-        question_tokens = _Tokens(question)
+        evidence = self._FindEvidence(database_id, question)
+        question_tokens = _Tokens(f"{question} {evidence}")
         matched_tables = []
         matched_columns = []
         tables = list(GetValue(database, "tables", default=[]))
 
         for table in tables:
             table_name = GetValue(table, "tableName", "table_name")
-            table_matched = bool(question_tokens & _Tokens(table_name))
+            table_text = " ".join([
+                table_name or "",
+                GetValue(table, "display_name", "displayName", default="") or "",
+            ])
+            table_matched = bool(question_tokens & _Tokens(table_text))
             column_matches = []
             for column in GetValue(table, "columns", default=[]):
                 column_name = GetValue(column, "columnName", "column_name")
-                if question_tokens & _Tokens(column_name):
+                column_text = " ".join([
+                    column_name or "",
+                    GetValue(column, "display_name", "displayName", default="") or "",
+                    GetValue(column, "description", default="") or "",
+                ])
+                if question_tokens & _Tokens(column_text):
                     column_matches.append(column)
                     matched_columns.append(self._ColumnDict(table_name, column, "Token match."))
             if table_matched or column_matches:
@@ -65,12 +75,21 @@ class BirdSchemaIndex:
             ]
 
         selected_names = {table["table_name"] for table in matched_tables}
+        foreign_keys = GetValue(database, "foreignKeys", "foreign_keys", default=[])
+        for key in foreign_keys:
+            left_table = GetValue(key, "leftTable", "left_table", "source_table")
+            right_table = GetValue(key, "rightTable", "right_table", "target_table")
+            if left_table in selected_names or right_table in selected_names:
+                for neighbor in (left_table, right_table):
+                    if neighbor and neighbor not in selected_names:
+                        matched_tables.append({"table_name": neighbor, "reason": "Foreign-key neighbor."})
+                        selected_names.add(neighbor)
         for table in tables:
             table_name = GetValue(table, "tableName", "table_name")
             if table_name not in selected_names:
                 continue
             for column in GetValue(table, "columns", default=[]):
-                if GetValue(column, "isPrimary", "is_primary", default=False):
+                if GetValue(column, "isPrimary", "is_primary", "is_primary_key", default=False):
                     exists = any(
                         item["table_name"] == table_name and item["column_name"] == GetValue(column, "columnName", "column_name")
                         for item in matched_columns
@@ -79,18 +98,17 @@ class BirdSchemaIndex:
                         matched_columns.append(self._ColumnDict(table_name, column, "Primary key."))
 
         matched_joins = []
-        for key in GetValue(database, "foreignKeys", "foreign_keys", default=[]):
-            left_table = GetValue(key, "leftTable", "left_table")
-            right_table = GetValue(key, "rightTable", "right_table")
+        for key in foreign_keys:
+            left_table = GetValue(key, "leftTable", "left_table", "source_table")
+            right_table = GetValue(key, "rightTable", "right_table", "target_table")
             if left_table in selected_names or right_table in selected_names:
                 matched_joins.append({
                     "left_table": left_table,
-                    "left_column": GetValue(key, "leftColumn", "left_column"),
+                    "left_column": GetValue(key, "leftColumn", "left_column", "source_column"),
                     "right_table": right_table,
-                    "right_column": GetValue(key, "rightColumn", "right_column"),
+                    "right_column": GetValue(key, "rightColumn", "right_column", "target_column"),
                 })
 
-        evidence = self._FindEvidence(database_id, question)
         schema_prompt = self.BuildSchemaPrompt(database, selected_names, matched_joins, evidence)
         return {
             "database_id": database_id,
@@ -114,7 +132,7 @@ class BirdSchemaIndex:
         return {
             "table_name": table_name,
             "column_name": GetValue(column, "columnName", "column_name"),
-            "column_type": GetValue(column, "columnType", "column_type", default="text"),
+            "column_type": GetValue(column, "columnType", "column_type", "data_type", default="text"),
             "reason": reason,
         }
 
@@ -135,7 +153,7 @@ class BirdSchemaIndex:
             if selected_names and table_name not in selected_names and len(tables) > 8:
                 continue
             columns = ", ".join(
-                f"{GetValue(column, 'columnName', 'column_name')} {GetValue(column, 'columnType', 'column_type', default='text')}".strip()
+                f"{GetValue(column, 'columnName', 'column_name')} {GetValue(column, 'columnType', 'column_type', 'data_type', default='text')}".strip()
                 for column in GetValue(table, "columns", default=[])
             )
             lines.append(f"Table {table_name}({columns})")
@@ -182,21 +200,20 @@ class SemanticRetriever:
     """Loads BIRD processed schemas and returns prompt text for AgentState.schema_context."""
 
     def __init__(self, processed_dir=None, index: BirdSchemaIndex | None = None):
-        base_dir = project_path(processed_dir or settings.BIRD_DATA_DIR)
-        self.processed_dir = base_dir if (base_dir / "databases.json").exists() else base_dir / "processed"
+        self.processed_dir = ResolveProcessedDir(processed_dir or settings.BIRD_DATA_DIR) if not index else None
         self.index = index
 
     def Build(self):
         if self.index:
             return self
-        databases_path = self.processed_dir / "databases.json"
-        if not databases_path.exists():
-            raise FileNotFoundError(f"Missing BIRD processed schema file: {databases_path}")
-        databases = json.loads(databases_path.read_text(encoding="utf-8"))
-        questions = []
-        questions_path = self.processed_dir / "questions.json"
-        if questions_path.exists():
-            questions = json.loads(questions_path.read_text(encoding="utf-8"))
+        databases = LoadProcessedDatabases(self.processed_dir)
+        try:
+            questions = LoadProcessedQuestions(
+                self.processed_dir,
+                database_ids={database["database_id"] for database in databases},
+            )
+        except FileNotFoundError:
+            questions = []
         self.index = BirdSchemaIndex().Build(databases, questions=questions)
         return self
 

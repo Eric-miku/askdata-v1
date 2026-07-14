@@ -20,6 +20,11 @@ dependencies = [
 [tool.uv]
 package = true
 
+[dependency-groups]
+dev = [
+    "pytest>=8.2.0",
+]
+
 [project.scripts]
 askdata = "askdata.cli:main"
 

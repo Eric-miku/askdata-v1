@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import sqlite3
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
@@ -15,10 +16,13 @@ runner = CliRunner()
 def write_processed_dataset(root):
     processed = root / "processed"
     processed.mkdir()
+    database_path = root / "demo.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE items(id INTEGER)")
     (processed / "databases.json").write_text(json.dumps([
         {
             "databaseId": "demo",
-            "databasePath": "/tmp/demo.sqlite",
+            "databasePath": str(database_path),
             "tables": [{"tableName": "items", "columns": []}],
             "foreignKeys": [],
         }
@@ -44,6 +48,8 @@ def test_eval_bird_help_is_available():
     assert "--limit" in result.output
     assert "--out" in result.output
     assert "--seed" in result.output
+    assert "--question-manifest" in result.output
+    assert "--model-name" in result.output
     assert "--processed-dir" in result.output
 
 
@@ -55,6 +61,31 @@ def test_databases_lists_processed_database_ids(tmp_path):
     assert result.exit_code == 0
     assert "demo" in result.output
     assert "items" in result.output
+
+
+def test_databases_loads_tables_from_native_schema_file(tmp_path):
+    processed = tmp_path / "processed"
+    schemas = processed / "schemas"
+    schemas.mkdir(parents=True)
+    database_path = tmp_path / "demo.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE native_items(id INTEGER)")
+    (schemas / "demo.json").write_text(json.dumps({
+        "database_id": "demo",
+        "database_path": str(database_path),
+        "tables": [{"table_name": "native_items", "columns": []}],
+        "foreign_keys": [],
+    }), encoding="utf-8")
+    (processed / "databases.json").write_text(json.dumps([{
+        "database_id": "demo",
+        "database_path": str(database_path),
+        "schema_path": str(schemas / "demo.json"),
+    }]), encoding="utf-8")
+
+    result = runner.invoke(cli.app, ["databases", "--processed-dir", str(processed)])
+
+    assert result.exit_code == 0
+    assert "native_items" in result.output
 
 
 def test_gen_instructions_writes_one_template_per_database(tmp_path):

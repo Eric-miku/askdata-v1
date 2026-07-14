@@ -4,7 +4,8 @@
 !.env.example
 
 # Python
-.venv/
+.venv
+venv.nosync/
 __pycache__/
 *.py[cod]
 *.pyo
@@ -31,6 +32,6 @@ reports/
 *.log
 
 # Data
-data/
+/data/
 5-1-data-preprocessing-deliverable/data/
 build/

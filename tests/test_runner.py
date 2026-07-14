@@ -109,3 +109,63 @@ def test_eval_runner_seed_reproducibly_shuffles_questions_before_limit(tmp_path)
     ids_c = [case["questionId"] for case in report_c["cases"]]
     assert ids_a == ids_b == ["q3", "q1", "q2"]
     assert ids_c == ["q1", "q2", "q0"]
+
+
+def test_eval_runner_manifest_selects_exact_ids_and_records_metadata(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    connection = sqlite3.connect(database_path)
+    connection.execute("CREATE TABLE items(id INTEGER)")
+    connection.executemany("INSERT INTO items(id) VALUES (?)", [(1,), (2,)])
+    connection.commit()
+    connection.close()
+    processed = write_multi_question_dataset(tmp_path, database_path)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"question_ids": ["q4", "q1"]}), encoding="utf-8")
+
+    report = EvalRunner(processed_dir=processed, agent_graph=FakeAgentGraph()).Run(
+        limit=1,
+        seed=99,
+        question_manifest=manifest,
+    )
+
+    assert [case["questionId"] for case in report["cases"]] == ["q4", "q1"]
+    assert report["summary"]["executionAccuracyStrict"] == 1.0
+    assert report["summary"]["executionAccuracyRelaxed"] == 1.0
+    assert report["summary"]["retryRepairRate"] == 0.0
+    assert report["metadata"]["questionManifest"] == str(manifest.resolve())
+    assert len(report["metadata"]["questionManifestSha256"]) == 64
+    assert len(report["metadata"]["processedDataSha256"]) == 64
+    assert report["metadata"]["seed"] == 99
+    assert report["metadata"]["limit"] == 1
+
+
+def test_eval_runner_reads_native_questions_jsonl(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    connection = sqlite3.connect(database_path)
+    connection.execute("CREATE TABLE items(id INTEGER)")
+    connection.executemany("INSERT INTO items(id) VALUES (?)", [(1,), (2,)])
+    connection.commit()
+    connection.close()
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    (processed / "databases.json").write_text(json.dumps([{
+        "database_id": "demo",
+        "database_path": str(database_path),
+        "tables": [{
+            "table_name": "items",
+            "columns": [{"column_name": "id", "data_type": "integer", "is_primary_key": True}],
+        }],
+        "foreign_keys": [],
+    }]), encoding="utf-8")
+    (processed / "questions.jsonl").write_text(json.dumps({
+        "question_id": "bird_0001",
+        "database_id": "demo",
+        "question": "How many items?",
+        "gold_sql": "SELECT COUNT(id) AS count FROM items",
+        "difficulty": "simple",
+    }) + "\n", encoding="utf-8")
+
+    report = EvalRunner(processed_dir=processed, agent_graph=FakeAgentGraph()).Run()
+
+    assert report["summary"]["total"] == 1
+    assert report["cases"][0]["questionId"] == "bird_0001"
