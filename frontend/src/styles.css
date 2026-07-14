@@ -6,6 +6,10 @@
   --surface-raised: #2d2d2c;
   --surface-hover: #333332;
   --surface-code: #151515;
+  --code-text: #e2b69e;
+  --code-muted: #aaa49c;
+  --code-hover: rgba(255, 255, 255, 0.06);
+  --code-hover-text: #ece7df;
   --text: #deddd9;
   --text-soft: #bebdb8;
   --text-muted: #8c8b86;
@@ -30,7 +34,11 @@
   --surface: #ffffff;
   --surface-raised: #f0f0ed;
   --surface-hover: #e7e7e3;
-  --surface-code: #252421;
+  --surface-code: #f1f0ec;
+  --code-text: #8b4d38;
+  --code-muted: #6f6a63;
+  --code-hover: rgba(20, 20, 19, 0.05);
+  --code-hover-text: #292724;
   --text: #292724;
   --text-soft: #4a4641;
   --text-muted: #77716a;
@@ -445,7 +453,7 @@ svg {
 }
 
 .welcome-panel__content {
-  width: min(760px, 100%);
+  width: min(900px, 100%);
 }
 
 .welcome-panel h1 {
@@ -985,15 +993,15 @@ svg {
   background: transparent;
   border: 0;
   border-radius: 7px;
-  color: #aaa49c;
+  color: var(--code-muted);
   font-size: 10px;
   letter-spacing: 0.06em;
 }
 
 .sql-panel__toggle:hover,
 .sql-panel__copy:hover {
-  background: rgba(255, 255, 255, 0.06);
-  color: #ece7df;
+  background: var(--code-hover);
+  color: var(--code-hover-text);
 }
 
 .sql-panel__copy svg {
@@ -1005,7 +1013,7 @@ svg {
   margin: 0;
   padding: 16px 18px 18px;
   overflow-x: auto;
-  color: #e2b69e;
+  color: var(--code-text);
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 12px;
   line-height: 1.7;
@@ -1066,7 +1074,81 @@ svg {
 }
 
 .result-table .ant-pagination {
+  min-height: 26px;
+  align-items: center;
+  gap: 2px;
   margin-bottom: 0 !important;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.result-table .ant-pagination-total-text {
+  margin-right: auto;
+  color: var(--text-faint);
+  line-height: 24px;
+}
+
+.result-table .ant-pagination-item,
+.result-table .ant-pagination-jump-prev,
+.result-table .ant-pagination-jump-next {
+  display: none;
+}
+
+.result-table .ant-pagination-prev,
+.result-table .ant-pagination-next {
+  min-width: 24px;
+  height: 24px;
+  margin: 0;
+}
+
+.result-table .ant-pagination-prev button,
+.result-table .ant-pagination-next button {
+  min-width: 24px;
+  height: 24px;
+  padding: 0;
+}
+
+.result-table .ant-pagination-prev svg,
+.result-table .ant-pagination-next svg {
+  width: 10px;
+  height: 10px;
+}
+
+.result-table .ant-pagination-options {
+  margin-left: 5px;
+}
+
+.result-table .ant-pagination-options .ant-select {
+  height: 24px;
+  font-size: 11px;
+}
+
+.result-table .ant-pagination-options .ant-select-selector {
+  height: 24px !important;
+  padding: 0 20px 0 8px !important;
+  background: transparent !important;
+  border-color: var(--border) !important;
+  border-radius: 7px !important;
+}
+
+.result-table .ant-pagination-options .ant-select-selection-item {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 22px !important;
+}
+
+.result-table .ant-pagination-options .ant-select-arrow {
+  right: 7px;
+  width: 9px;
+  height: 9px;
+  margin-top: -4px;
+  color: var(--text-faint);
+  font-size: 8px;
+}
+
+.result-table .ant-pagination-options .ant-select-arrow svg {
+  width: 9px;
+  height: 9px;
 }
 
 .result-table__json-cell {
@@ -1082,12 +1164,12 @@ svg {
   display: flex;
   justify-content: center;
   padding: 16px max(36px, calc((100% - 900px) / 2)) 22px;
-  background: linear-gradient(to bottom, transparent, var(--bg) 28%);
+  background: var(--bg);
   pointer-events: none;
 }
 
 .composer-dock .chat-composer {
-  width: min(760px, 100%);
+  width: min(900px, 100%);
   padding-top: 13px;
   pointer-events: auto;
 }

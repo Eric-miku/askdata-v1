@@ -132,9 +132,14 @@ export function ResultTable({ columns, rows, loading = false }: ResultTableProps
       scroll={{ x: "max-content" }}
       pagination={{
         showSizeChanger: true,
+        showTitle: false,
         pageSizeOptions: [10, 20, 50, 100],
         defaultPageSize: 10,
         showTotal: (total) => `共 ${total} 行`,
+        itemRender: (_, type, originalElement) =>
+          type === "page" || type === "jump-prev" || type === "jump-next"
+            ? null
+            : originalElement,
       }}
     />
   );

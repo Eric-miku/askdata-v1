@@ -81,4 +81,14 @@ describe("ChatComposer", () => {
       /\.chat-composer__input:focus-visible\s*{[^}]*outline:\s*none;/,
     );
   });
+
+  it("uses an opaque dock and matches the conversation width", () => {
+    expect(styles).toMatch(/\.composer-dock\s*{[^}]*background:\s*var\(--bg\)/);
+    expect(styles).toMatch(
+      /\.composer-dock \.chat-composer\s*{[^}]*width:\s*min\(900px,\s*100%\)/,
+    );
+    expect(styles).toMatch(
+      /\.welcome-panel__content\s*{[^}]*width:\s*min\(900px,\s*100%\)/,
+    );
+  });
 });
