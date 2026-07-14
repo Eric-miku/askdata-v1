@@ -1,7 +1,6 @@
 import { useState, type KeyboardEvent } from "react";
 import type { DatabaseInfo } from "../types/query";
 import DatabasePicker from "./DatabasePicker";
-import { ArrowUpIcon } from "./Icons";
 
 interface ChatComposerProps {
   database: string;
@@ -63,15 +62,6 @@ export default function ChatComposer({
           onChange={onDatabaseChange}
         />
         <span className="chat-composer__hint">Enter 发送 · Shift+Enter 换行</span>
-        <button
-          type="button"
-          className="chat-composer__send"
-          aria-label="发送问题"
-          disabled={!canSubmit}
-          onClick={submit}
-        >
-          <ArrowUpIcon />
-        </button>
       </div>
       {validationError ? (
         <p className="chat-composer__error" role="alert">

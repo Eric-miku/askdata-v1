@@ -55,6 +55,8 @@ describe("QueryResultDemo", () => {
     render(<QueryResultDemo theme="dark" onToggleTheme={vi.fn()} />);
 
     expect(await screen.findByText("Hi, user.")).toBeVisible();
+    expect(screen.queryByLabelText("示例问题")).not.toBeInTheDocument();
+    expect(screen.queryByText("试试：")).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "打开数据库" }));
     expect(screen.getByRole("dialog", { name: "数据库" })).toBeVisible();
 

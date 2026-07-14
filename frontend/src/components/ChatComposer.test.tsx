@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import ChatComposer from "./ChatComposer";
+import styles from "../styles.css?raw";
 
 const databases = [
   { id: "demo", name: "Demo", tables_count: 2 },
@@ -32,7 +33,7 @@ describe("ChatComposer", () => {
     expect(textbox).toHaveValue("");
   });
 
-  it("disables submission while no database is selected", async () => {
+  it("does not render a send button and blocks Enter while no database is selected", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn();
     render(
@@ -51,7 +52,7 @@ describe("ChatComposer", () => {
     );
 
     expect(onSubmit).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: "发送问题" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "发送问题" })).not.toBeInTheDocument();
   });
 
   it("does not submit while an input method composition is active", async () => {
@@ -73,5 +74,11 @@ describe("ChatComposer", () => {
 
     expect(onSubmit).not.toHaveBeenCalled();
     expect(textbox).toHaveValue("正在输入中文");
+  });
+
+  it("does not draw a focus outline around the message field", () => {
+    expect(styles).toMatch(
+      /\.chat-composer__input:focus-visible\s*{[^}]*outline:\s*none;/,
+    );
   });
 });

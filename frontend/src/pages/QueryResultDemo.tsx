@@ -98,12 +98,6 @@ export function QueryResultDemo({ theme, onToggleTheme }: QueryResultDemoProps) 
                 <span>✦</span> Hi, user.
               </h1>
               {composer}
-              <div className="welcome-panel__suggestions" aria-label="示例问题">
-                <span>试试：</span>
-                <span>分析排名</span>
-                <span>比较趋势</span>
-                <span>统计数量</span>
-              </div>
             </div>
           </section>
         ) : (
