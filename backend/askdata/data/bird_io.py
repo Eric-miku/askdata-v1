@@ -203,13 +203,20 @@ def _NormalizeForeignKey(item: dict[str, Any]) -> BirdForeignKeyRecord:
 def _ResolveDeclaredPath(value: str | Path, processed: Path) -> Path:
     candidate = Path(value)
     if candidate.is_absolute():
-        return candidate.resolve()
+        if candidate.is_file():
+            return candidate.resolve()
     project_candidate = (PROJECT_ROOT / candidate).resolve()
     if project_candidate.exists():
         return project_candidate
     processed_candidate = (processed / candidate).resolve()
     if processed_candidate.exists():
         return processed_candidate
+    db_name = candidate.parent.name if candidate.parent.name else ""
+    db_file = candidate.name
+    if db_name and db_file:
+        fallback = PROJECT_ROOT / "data" / "bird" / "databases" / db_name / db_file
+        if fallback.is_file():
+            return fallback.resolve()
     return project_candidate
 
 
