@@ -216,6 +216,8 @@ def test_legacy_show_and_give_words_do_not_override_structured_scalar_intent():
 
     assert "listing_returns_only_aggregates" not in average.failures
     assert "listing_returns_only_aggregates" not in count.failures
+    assert "legacy_listing_returns_only_aggregates" not in average.warnings
+    assert "legacy_listing_returns_only_aggregates" not in count.warnings
 
 
 def test_static_check_does_not_credit_where_one_equals_one_for_filter():
@@ -271,6 +273,32 @@ def test_compound_query_requires_filter_grounding_in_every_branch():
     assert "unresolved_filter_alignment" in report.warnings
 
 
+def test_outer_filter_does_not_need_repetition_in_nested_subquery():
+    schema = {**SCHEMA, "items": {*SCHEMA["items"], "status", "school_id"}}
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", entities=["items"], filters=["status = open"]),
+        "SELECT name FROM items WHERE status = 'open' AND school_id IN "
+        "(SELECT id FROM schools WHERE score > 5)",
+        schema,
+    )
+
+    assert "unresolved_filter_alignment" not in report.warnings
+    assert "filter" in report.covered_elements
+
+
+def test_compound_filter_only_checks_branches_for_requested_entity():
+    schema = {**SCHEMA, "items": {*SCHEMA["items"], "status"}}
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", entities=["items"], filters=["status = open"]),
+        "SELECT name FROM items WHERE status = 'open' "
+        "UNION ALL SELECT name FROM schools",
+        schema,
+    )
+
+    assert "unresolved_filter_alignment" not in report.warnings
+    assert "filter" in report.covered_elements
+
+
 def test_static_check_requires_every_requested_entity():
     report = EvaluateStaticSql(
         IntentContract(shape="listing", entities=["items", "schools"]),
@@ -279,6 +307,17 @@ def test_static_check_requires_every_requested_entity():
     )
 
     assert "missing_entity" in report.failures
+
+
+def test_unused_cte_does_not_satisfy_requested_entity_coverage():
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", entities=["items", "schools"]),
+        "WITH unused AS (SELECT name FROM schools) SELECT name FROM items",
+        SCHEMA,
+    )
+
+    assert "missing_entity" in report.failures
+    assert "entity:schools" not in report.covered_elements
 
 
 def test_static_check_marks_unrequested_projection_and_reduces_directness():
@@ -362,6 +401,41 @@ def test_ranking_order_accepts_semantic_aggregate_alias():
     assert "wrong_order_target" not in report.failures
 
 
+def test_ranking_order_accepts_primary_aggregate_and_secondary_tiebreaker():
+    report = EvaluateStaticSql(
+        IntentContract(
+            shape="ranking",
+            output_attributes=["category"],
+            metrics=["count"],
+            grouping=["category"],
+            order="descending",
+            expected_max_rows=5,
+        ),
+        "SELECT category, COUNT(*) AS total FROM items GROUP BY category "
+        "ORDER BY COUNT(*) DESC, category ASC LIMIT 5",
+        SCHEMA,
+    )
+
+    assert "wrong_order_target" not in report.failures
+    assert "wrong_order_direction" not in report.failures
+
+
+def test_ranking_direction_checks_primary_order_term_only():
+    report = EvaluateStaticSql(
+        IntentContract(
+            shape="ranking",
+            output_attributes=["name"],
+            metrics=["score"],
+            order="descending",
+            expected_max_rows=5,
+        ),
+        "SELECT name, score FROM schools ORDER BY score DESC, name ASC LIMIT 5",
+        SCHEMA,
+    )
+
+    assert "wrong_order_direction" not in report.failures
+
+
 def test_static_check_treats_count_aggregate_aliases_as_requested_metric():
     for alias in ("count", "total", "total_count"):
         report = EvaluateStaticSql(
@@ -407,6 +481,26 @@ def test_projection_lineage_allows_result_aliases_to_cover_metrics():
     assert average_static.directness == 1.0
     assert average_result.coverage == 1.0
     assert "missing_result_metric" not in average_result.failures
+
+
+def test_computed_ratio_lineage_treats_percentage_rate_and_ratio_as_equivalent():
+    intent = IntentContract(shape="ratio", metrics=["percentage"])
+    static_report = EvaluateStaticSql(
+        intent,
+        "SELECT SUM(price) * 100.0 / COUNT(*) AS ratio FROM items",
+        SCHEMA,
+    )
+    result_report = EvaluateResult(
+        intent,
+        ["ratio"],
+        [{"ratio": 25.0}],
+        static_report=static_report,
+    )
+
+    assert static_report.coverage == 1.0
+    assert "missing_metric" not in static_report.failures
+    assert result_report.coverage == 1.0
+    assert "missing_result_metric" not in result_report.failures
 
 
 def test_compound_query_uses_root_order_limit_and_output_projection():

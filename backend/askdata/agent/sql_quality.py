@@ -116,6 +116,7 @@ def EvaluateStaticSql(
     virtual_schema = _virtual_schema(parsed)
     column_schema = {**normalized_schema, **virtual_schema}
     table_names = [table.name.casefold() for table in tables if table.name.casefold() not in cte_names]
+    contributing_tables = _contributing_relations(parsed)
     alias_to_table = {table.alias_or_name.casefold(): table.name.casefold() for table in tables}
     projection_aliases = {
         projection.alias.casefold()
@@ -201,31 +202,35 @@ def EvaluateStaticSql(
     if intent.expected_max_rows is not None and limit_value is not None and limit_value > intent.expected_max_rows:
         failures.append("excessive_limit")
 
-    where_clauses = list(parsed.find_all(exp.Where))
-    if intent.filters and not where_clauses:
+    where_scopes, unresolved_filter_scope = _applicable_filter_scopes(parsed, intent)
+    if intent.filters and where_scopes and any(where is None for where in where_scopes):
         failures.append("missing_filter")
-    if intent.time_condition and not where_clauses:
+    if intent.filters and not where_scopes and not unresolved_filter_scope:
+        failures.append("missing_filter")
+    if intent.time_condition and where_scopes and any(where is None for where in where_scopes):
+        failures.append("missing_time_condition")
+    if intent.time_condition and not where_scopes and not unresolved_filter_scope:
         failures.append("missing_time_condition")
     grounded_filters = [
-        _requirement_is_grounded(requirement, where_clauses)
+        _requirement_is_grounded(requirement, where_scopes)
         for requirement in intent.filters
     ]
     grounded_time = bool(
         intent.time_condition
-        and _requirement_is_grounded(intent.time_condition, where_clauses)
+        and _requirement_is_grounded(intent.time_condition, where_scopes)
     )
-    if where_clauses and any(not grounded for grounded in grounded_filters):
+    if intent.filters and (unresolved_filter_scope or any(not grounded for grounded in grounded_filters)):
         warnings.append("unresolved_filter_alignment")
-    if where_clauses and intent.time_condition and not grounded_time:
+    if intent.time_condition and (unresolved_filter_scope or not grounded_time):
         warnings.append("unresolved_time_alignment")
 
     if _has_unconnected_join(parsed):
         failures.append("unconnected_join")
 
     expected_entities = {entity.casefold() for entity in intent.entities}
-    if expected_entities - set(table_names):
+    if expected_entities - contributing_tables:
         failures.append("missing_entity")
-    if expected_entities and set(table_names) - expected_entities:
+    if expected_entities and contributing_tables - expected_entities:
         warnings.append("unnecessary_join")
 
     extra_count = _unrequested_projection_count(
@@ -249,7 +254,7 @@ def EvaluateStaticSql(
 
     covered, required = _static_coverage(
         intent,
-        set(table_names),
+        contributing_tables,
         projection_names,
         aggregate_names,
         group_names,
@@ -449,23 +454,10 @@ def _projection_semantic_outputs(
         output_name = projection.output_name.casefold() if projection.output_name else ""
         if not output_name:
             continue
-        candidates = {_normalize_concept(output_name)}
-        columns = [column.name for column in projection.find_all(exp.Column)]
-        if projection.find(exp.Count) is not None:
-            candidates.add("count")
-        for column in columns:
-            normalized_column = _normalize_concept(column)
-            candidates.add(normalized_column)
-            if projection.find(exp.Avg) is not None:
-                candidates.update(
-                    {
-                        f"avg_{normalized_column}",
-                        f"average_{normalized_column}",
-                        f"mean_{normalized_column}",
-                    }
-                )
-            if projection.find(exp.Sum) is not None:
-                candidates.update({f"sum_{normalized_column}", f"total_{normalized_column}"})
+        candidates = {
+            _normalize_concept(output_name),
+            *_expression_metric_candidates(projection),
+        }
         matched = [
             f"metric:{normalized_metric}"
             for normalized_metric in requested
@@ -537,6 +529,8 @@ def _order_targets_metric(
         names.add(_normalize_concept(ordered_expression.name))
     if names & requested:
         return True
+    if _expression_metric_candidates(ordered_expression) & requested:
+        return True
     return any(
         tag.partition(":")[2] in requested
         for name in names
@@ -548,11 +542,33 @@ def _normalize_concept(value: str) -> str:
     return re.sub(r"[^\w]+", "_", value.casefold()).strip("_")
 
 
+def _expression_metric_candidates(expression: exp.Expression) -> set[str]:
+    candidates: set[str] = set()
+    if expression.find(exp.Count) is not None:
+        candidates.add("count")
+    for column in expression.find_all(exp.Column):
+        normalized_column = _normalize_concept(column.name)
+        candidates.add(normalized_column)
+        if expression.find(exp.Avg) is not None:
+            candidates.update(
+                {
+                    f"avg_{normalized_column}",
+                    f"average_{normalized_column}",
+                    f"mean_{normalized_column}",
+                }
+            )
+        if expression.find(exp.Sum) is not None:
+            candidates.update({f"sum_{normalized_column}", f"total_{normalized_column}"})
+    if expression.find(exp.Div) is not None:
+        candidates.update({"ratio", "percentage", "percent", "rate"})
+    return candidates
+
+
 def _requirement_is_grounded(
     requirement: str,
-    where_clauses: list[exp.Where],
+    where_clauses: list[exp.Where | None],
 ) -> bool:
-    if not where_clauses:
+    if not where_clauses or any(where is None for where in where_clauses):
         return False
     stopwords = {
         "a", "an", "and", "at", "by", "during", "for", "from", "in",
@@ -567,6 +583,7 @@ def _requirement_is_grounded(
     if not required_tokens:
         return False
     for where in where_clauses:
+        assert where is not None
         where_sql = where.sql(dialect="sqlite").casefold()
         sql_tokens = set(re.findall(r"[^\W_]+(?:_[^\W_]+)*", where_sql, flags=re.UNICODE))
         sql_operators = set(re.findall(r"<=|>=|<>|!=|=|<|>", where_sql))
@@ -582,6 +599,8 @@ def _classify_legacy_shape_codes(
     failures: list[str] = []
     warnings: list[str] = []
     for code in codes:
+        if code == "listing_returns_only_aggregates" and intent.shape in {"scalar", "ratio", "grouped"}:
+            continue
         aligned = (
             (code == "missing_count_aggregation" and "count" in {_normalize_concept(item) for item in intent.metrics})
             or (code in {"computed_value_has_extra_projections", "missing_ratio_computation"} and intent.shape == "ratio")
@@ -602,7 +621,9 @@ def _column_names(expression: exp.Expression | None) -> set[str]:
 
 def _order_matches(order: exp.Order, direction: str) -> bool:
     wants_descending = direction == "descending"
-    return all(bool(ordered.args.get("desc")) == wants_descending for ordered in order.expressions)
+    if not order.expressions:
+        return False
+    return bool(order.expressions[0].args.get("desc")) == wants_descending
 
 
 def _has_unconnected_join(parsed: exp.Expression) -> bool:
@@ -671,6 +692,113 @@ def _source_names(source: exp.Expression | None) -> set[str]:
         return set()
     alias = source.alias_or_name
     return {alias.casefold()} if alias else set()
+
+
+def _contributing_relations(parsed: exp.Expression) -> set[str]:
+    ctes = {
+        cte.alias_or_name.casefold(): cte.this
+        for cte in parsed.find_all(exp.CTE)
+    }
+    relations: set[str] = set()
+    visiting_ctes: set[str] = set()
+
+    def visit_source(source: exp.Expression | None) -> None:
+        if isinstance(source, exp.Table):
+            name = source.name.casefold()
+            if name in ctes:
+                if name not in visiting_ctes:
+                    visiting_ctes.add(name)
+                    visit_query(ctes[name])
+                    visiting_ctes.remove(name)
+            else:
+                relations.add(name)
+        elif isinstance(source, exp.Subquery):
+            visit_query(source.this)
+
+    def visit_nested_subqueries(value: Any) -> None:
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            if not isinstance(item, exp.Expression):
+                continue
+            if isinstance(item, exp.Subquery):
+                visit_query(item.this)
+            for subquery in item.find_all(exp.Subquery):
+                visit_query(subquery.this)
+
+    def visit_query(query: exp.Expression) -> None:
+        if isinstance(query, exp.SetOperation):
+            visit_query(query.this)
+            visit_query(query.expression)
+            return
+        select = query if isinstance(query, exp.Select) else next(query.find_all(exp.Select), None)
+        if select is None:
+            return
+        from_clause = select.args.get("from_")
+        visit_source(from_clause.this if from_clause is not None else None)
+        for join in select.args.get("joins") or []:
+            visit_source(join.this)
+        for argument in ("expressions", "where", "having", "qualify", "order", "group"):
+            visit_nested_subqueries(select.args.get(argument))
+
+    visit_query(parsed)
+    return relations
+
+
+def _applicable_filter_scopes(
+    parsed: exp.Expression,
+    intent: IntentContract,
+) -> tuple[list[exp.Where | None], bool]:
+    expected = {entity.casefold() for entity in intent.entities}
+    ctes = {
+        cte.alias_or_name.casefold(): cte.this
+        for cte in parsed.find_all(exp.CTE)
+    }
+    scopes: list[exp.Where | None] = []
+    unresolved = False
+    for branch in _output_branches(parsed):
+        branch_relations = _direct_branch_relations(branch, ctes)
+        if expected:
+            if branch_relations & expected:
+                scopes.append(branch.args.get("where"))
+            elif not branch_relations:
+                unresolved = True
+        else:
+            scopes.append(branch.args.get("where"))
+    if expected and not scopes and not unresolved:
+        return [], False
+    return scopes, unresolved
+
+
+def _output_branches(query: exp.Expression) -> list[exp.Select]:
+    if isinstance(query, exp.SetOperation):
+        return [*_output_branches(query.this), *_output_branches(query.expression)]
+    if isinstance(query, exp.Select):
+        return [query]
+    select = next(query.find_all(exp.Select), None)
+    return [select] if select is not None else []
+
+
+def _direct_branch_relations(
+    select: exp.Select,
+    ctes: Mapping[str, exp.Expression],
+) -> set[str]:
+    relations: set[str] = set()
+
+    def add_source(source: exp.Expression | None) -> None:
+        if isinstance(source, exp.Table):
+            name = source.name.casefold()
+            if name in ctes:
+                relations.update(_contributing_relations(ctes[name]))
+            else:
+                relations.add(name)
+        elif isinstance(source, exp.Subquery):
+            relations.update(_contributing_relations(source.this))
+
+    from_clause = select.args.get("from_")
+    add_source(from_clause.this if from_clause is not None else None)
+    for join in select.args.get("joins") or []:
+        add_source(join.this)
+    return relations
 
 
 def _virtual_schema(parsed: exp.Expression) -> dict[str, set[str]]:
