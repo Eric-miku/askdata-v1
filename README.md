@@ -1,104 +1,64 @@
-# AskData V1 — NL2SQL Platform
+# AskData V2.1 — Natural Language to SQL
 
-Natural-language-to-SQL platform. Users ask questions in plain Chinese or English; the system generates SQL, executes against a database, and returns charts with explanations.
+AskData turns Chinese or English questions into read-only SQL, executes the selected query, and returns a typed answer, bounded result preview, operational trace, and optional chart specification. The backend is FastAPI; the frontend is React, TypeScript, Ant Design, and ECharts.
 
-**Stack**: Python 3.13 / FastAPI / LangGraph / SQLAlchemy / React + Ant Design + ECharts / OpenAI-compatible LLM
+## Quick start
 
-## Quick Start
+Python 3.10 or newer and Node.js are required.
 
 ```bash
-# Backend (run from the repository root)
+# Backend dependencies and API, from the repository root
 bash scripts/setup-dev-env.sh
-uv run askdata serve          # start API at :8000
+uv run askdata serve                    # http://127.0.0.1:8000
 
-# Frontend
-cd frontend && npm install && npm run dev   # start at :5173
-
-# Evaluation
-uv run askdata eval-bird --limit 100 --seed 42 --out reports/eval.json
+# Frontend, in a second shell
+cd frontend
+npm install
+npm run dev                             # http://127.0.0.1:5173
 ```
 
-## Project Structure
+The application database defaults to `data/askdata-app.sqlite`. It stores sessions, turns, clarifications, chart specifications, and bounded result previews. Set `APP_DATABASE_PATH` to move it; use a writable path and back it up like any other SQLite database. WAL mode is enabled at startup. Conversation history survives application restarts and can be listed, reopened, or explicitly deleted from the history drawer.
 
-```
-askdata-v1/
-  backend/askdata/
-    agent/             # Agent orchestration
-      graph.py         #   AgentGraph — main NL2SQL chain (ReAct or one-shot)
-      react_sql_agent.py  #   ReActSqlAgent — tool-calling loop with self-repair
-      prompts.py       #   SQL generation prompts with schema-linking checklist
-      state.py         #   AgentState TypedDict
-    api/               # FastAPI layer
-      routes.py        #   /api/query, /api/metadata, session management
-      schemas.py       #   QueryRequest / QueryResponse Pydantic models
-      session_manager.py  #   Async in-memory sessions
-      trace.py         #   Per-request step logger
-      app.py           #   FastAPI app factory + CORS
-    core/              # Config and LLM client
-      config.py        #   Pydantic Settings (LLM_API_BASE, KEY, MODEL, BIRD_DATA_DIR)
-      llm.py           #   LLMClient — OpenAI-compatible Complete() + Chat()
-      paths.py         #   Project-root-relative path resolver
-    db/                # SQL execution and safety
-      executor.py      #   SQLExecutor — pagination, type inference, error codes
-      validator.py     #   SQLValidator — sqlglot AST-based read-only enforcement
-    tools/             # Schema retrieval and answer generation
-      retriever.py     #   BirdSchemaIndex + SemanticRetriever
-      analyzer.py      #   ResultAnalyzer — LLM Chinese explanation with fallback
-      skill_loader.py  #   SkillLoader — reusable SQL pattern templates
-    skills/            # Skill markdown files
-      compare-periods.md / ratio-analysis.md / rank-top-bottom.md
-    eval/              # BIRD benchmark evaluation
-      metrics.py       #   BirdResultComparer (4-tier matching) + ExactMatch
-      runner.py        #   EvalRunner — self-contained BIRD evaluation
-    data/bird_io.py    # Native data-processing contract + legacy fallback
-    cli.py             # CLI entry: eval-bird, databases, chat, serve
-  frontend/            # React + TypeScript + Vite
-    src/
-      api/query.ts     #   Backend API client
-      components/      #   DatabaseSelector, ResultTable
-      pages/           #   QueryResultDemo
-      store/           #   Zustand state
-      types/query.ts   #   TypeScript types
-  tests/               # Backend unit and integration tests
-  data-processing/     # Team-owned BIRD data prep pipeline
-  benchmarks/          # Versioned question manifests (no database files)
-  data/bird/           # SQLite databases + processed schema (gitignored)
-```
+## Configuration
 
-## Architecture
-
-```
-POST /api/query
-  → AgentGraph.Run()
-    → SemanticRetriever.Retrieve()     # schema + business context
-    → ReActSqlAgent.Run()              # tool-calling loop
-      → LLM.Chat() → run_query(sql)
-        → SQLExecutor.execute()        # run against SQLite
-      → error? → LLM repairs SQL
-      → success? → LLM produces answer
-    → ResultAnalyzer.Analyze()         # Chinese explanation
-  → QueryResponse { answer, sql, columns, rows, chart, trace }
-```
-
-### Two execution modes
-
-1. **ReAct mode** (default): `AgentGraph` delegates to `ReActSqlAgent` which runs a tool-calling loop. LLM calls `run_query`, reads results or errors, and iterates until it has an answer.
-
-2. **One-shot fallback**: If ReAct is unavailable, `AgentGraph` uses a single LLM call for SQL generation with one repair attempt on failure. Includes Skills system context.
-
-## Configuration (.env)
+Create `.env` in the repository root. Do not commit real keys.
 
 ```env
-LLM_API_BASE=http://localhost:9001/v1
-LLM_API_KEY=your-key
-LLM_MODEL_NAME=Qwen3.5-397B-A17B
+LLM_API_BASE=https://api.example.com/v1
+LLM_API_KEY=replace-me
+LLM_MODEL_NAME=your-tool-calling-model
+
 BIRD_DATA_DIR=data/bird
 BIRD_INSTRUCTIONS_DIR=data/bird/instructions
+APP_DATABASE_PATH=data/askdata-app.sqlite
+
+# Optional hybrid retrieval
+VECTOR_RETRIEVAL_ENABLED=true
+EMBEDDING_API_URL=https://embedding.example.com/v1
+EMBEDDING_API_KEY=replace-if-required
+EMBEDDING_MODEL=BAAI/bge-m3
+EMBEDDING_DIMENSION=1024
+MILVUS_URI=http://127.0.0.1:19530
+MILVUS_COLLECTION=askdata_schema_chunks
 ```
 
-## Data Setup
+`MILVUS_URI` is the full URI consumed by the application; `MILVUS_HOST` alone is not read. The configured embedding model must return the declared model name, one vector per input in index order, and exactly `EMBEDDING_DIMENSION` finite values.
 
-BIRD Mini-Dev is prepared by the team-owned `data-processing` tool. From the repository root:
+## BIRD data
+
+The processed data contract is:
+
+```text
+data/bird/
+  databases/<database_id>/<database_id>.sqlite
+  processed/databases.json
+  processed/questions.jsonl
+  processed/schemas/<database_id>.json
+  processed/schema_prompts/<database_id>.md
+  instructions/<database_id>.md              # optional business mappings
+```
+
+Prepare Mini-Dev with the team-owned pipeline:
 
 ```bash
 ./data-processing/askdata prepare-bird \
@@ -112,45 +72,120 @@ BIRD Mini-Dev is prepared by the team-owned `data-processing` tool. From the rep
   --force
 ```
 
-The application reads the native outputs directly: metadata in `databases.json`, structured schemas in `schemas/*.json`, and questions in `questions.jsonl`. Legacy inline camelCase schemas and `questions.json` remain read-only fallbacks.
+Metadata paths should either be absolute or valid relative to the repository root. If a processed bundle was created in another checkout, regenerate it or update its declared database paths before evaluation.
 
-For the historical 100-question comparison with `deepseek-v4-pro`:
+## Optional vector retrieval
+
+Lexical schema retrieval is always available. To add semantic retrieval, install the optional Milvus client and index each database after its schema, evidence, values, or instructions change:
 
 ```bash
-uv run askdata eval-bird \
-  --model-name deepseek-v4-pro \
-  --question-manifest benchmarks/bird-minidev-v4pro-seed42-100.json \
-  --out reports/bird-eval-v4pro-100.json
+uv sync --extra vector
+uv run askdata index-schema \
+  --database-id california_schools \
+  --processed-dir data/bird/processed
 ```
 
-### macOS editable-install recovery
+When the semantic retriever is built, AskData validates the embedding response and performs a Milvus probe. Runtime retrieval embeds the original question (and resolved conversational wording when different), searches attributable schema/value/evidence/example chunks, and fuses lexical and dense rankings with reciprocal-rank fusion. Foreign-key neighbors are added for join coverage.
 
-If `uv run askdata` reports `ModuleNotFoundError` after the repository was moved from `intern agents` to `intern-agents`, inspect `.venv/lib/python*/site-packages/*.pth`. Under a synchronized `Documents` directory, macOS can repeatedly mark a dot-directory virtual environment as hidden and make Python skip editable-install `.pth` files. Run the bootstrap once:
+If vector configuration is disabled, incomplete, or the remote service fails validation/search, AskData continues with lexical retrieval and emits a safe warning. It never forwards remote exception details to the response. Low schema coverage may lead to a schema-supported clarification; when the requested entity is absent, the response is `unanswerable_from_schema` and no proxy SQL is executed.
+
+## Query API
+
+Submit either a new question or one clarification resolution:
 
 ```bash
-bash scripts/setup-dev-env.sh
-uv run askdata --help
+curl -sS http://127.0.0.1:8000/api/query \
+  -H 'Content-Type: application/json' \
+  -d '{"question":"top five schools by enrollment","database_id":"california_schools"}'
 ```
 
-On macOS the script keeps uv's `.venv` path as a local symlink to the gitignored, non-dot `venv.nosync` directory. Other platforms run a normal `uv sync`. Normal development does not require `uv pip install -e .` before each command.
+`POST /api/query` returns one discriminated response with `kind` equal to `answer`, `clarification`, `partial`, or `error`. Every response includes `session_id`, `turn_id`, and a curated operational `trace`. Answer and partial responses may include SQL, columns, at most 100 preview rows, confidence, and a chart.
 
-## Testing
+For live progress, send the same request to `POST /api/query/stream`. The response is `text/event-stream`: ordered `trace` events are followed by exactly one terminal event (`final`, `clarification`, `partial`, or `error`). The terminal payload uses the same response contract as `/api/query`; clients should use the terminal event as the source of truth and close or abort the stream when navigating away.
+
+Clarification responses contain a `clarification_id` and 2–4 schema-supported options. Resolve one with the existing session:
+
+```json
+{
+  "database_id": "california_schools",
+  "session_id": "<session-id>",
+  "clarification": {
+    "clarification_id": "<clarification-id>",
+    "option_id": "<option-id>"
+  }
+}
+```
+
+Exactly one of `option_id` or free-text `text` is allowed. Clarifications are reserved for material alternatives; vague wording alone does not justify invented options.
+
+## ChartSpec contract
+
+Charts are declarative data contracts, not executable ECharts options:
+
+```json
+{
+  "type": "line | vertical_bar | horizontal_bar | pie | scatter",
+  "title": "Monthly revenue",
+  "category_field": "month",
+  "category_label": "Month",
+  "value_fields": ["revenue"],
+  "value_labels": {"revenue": "Revenue"},
+  "reason": "time_series | comparison | ranking | proportion | correlation"
+}
+```
+
+The frontend reads values only from returned row fields named by the validated specification. Unsupported shapes remain table-only. Empty results remain successful answers with an empty table; incomplete but useful results use `partial` with explicit limitations and suggestions. Execution errors use stable safe error payloads and never expose database or model internals.
+
+## Sessions and metadata
+
+- `GET /api/sessions?limit=50` lists recent conversations.
+- `GET /api/sessions/{session_id}` reopens a conversation and all persisted turns.
+- `DELETE /api/sessions/{session_id}` explicitly deletes it.
+- `GET /api/metadata/databases` lists discoverable SQLite databases.
+- `GET /api/metadata/{database_id}/tables` returns table and column metadata.
+
+Starting a new chat or switching databases does not delete persisted history. Concurrent turns for the same session are serialized, while separate sessions can proceed independently.
+
+## Evaluation and verification
 
 ```bash
+# Complete local gates
 uv run pytest -q
-cd frontend && npm run build
+cd frontend && npm test -- --run && npm run build
+
+# Offline comparison; predictions must be captured separately from this system
+uv run askdata eval-demo \
+  --cases tests/fixtures/v2_demo_cases.json \
+  --predictions reports/v2-demo-predictions.json \
+  --out reports/v2-demo.json
+
+# Fixed BIRD baseline; always report relaxed and strict execution accuracy together
+uv run askdata eval-bird \
+  --question-manifest benchmarks/bird-minidev-v4pro-seed42-100.json \
+  --out reports/bird-v2.1-100.json
 ```
 
-## More Documentation
+The embedded predictions in `tests/fixtures/v2_demo_cases.json` are test examples only and are not release evidence. See [benchmarks/README.md](benchmarks/README.md) for comparable evaluation rules and [reports/v2-demo-summary.md](reports/v2-demo-summary.md) for the latest integrated verification record.
 
-- [Backend instructions](backend/INSTRUCTIONS.md): architecture, BIRD data contract, evaluation rules, and known limitations.
-- [BIRD benchmark](benchmarks/README.md): fixed 100-question manifest and comparable accuracy results.
-- [Data processing](data-processing/README.md): team-owned BIRD preparation commands and output contract.
+## Project structure
 
-## Key Design Decisions
+```text
+backend/askdata/
+  agent/          intent, ambiguity, SQL candidate, verification, and fallback pipeline
+  api/            FastAPI routes, typed responses, streaming, and persistent sessions
+  db/             read-only validation and bounded SQLite execution
+  eval/           deterministic demo comparison and BIRD evaluation
+  tools/          lexical/hybrid retrieval, embeddings, Milvus, analysis, and charts
+frontend/src/     React application, API clients, state, and accessible result views
+tests/            backend unit and integration tests
+data-processing/  BIRD preparation pipeline
+```
 
-- **PascalCase** for all NL2SQL-facing methods (`Build`, `Retrieve`, `Run`, `Compare`). Team `db/` modules use snake_case (`execute`, `validate`).
-- **ReAct loop** with max 8 iterations; LLM self-corrects on SQL and answer-shape warnings.
-- **Column matching** in eval uses 4 tiers: strict (all columns match) → name (shared subset) → position (by index) → subset (try combinations).
-- **Skills** are markdown files auto-loaded at agent start — no code changes needed to add patterns.
-- **Business context** per database via `data/bird/instructions/<db>.md`.
+## Safety boundaries
+
+- SQL is parsed and restricted to one read-only statement before execution.
+- The agent may attempt no more than six SQL candidates for one request.
+- Result previews and operational traces are bounded and sanitized.
+- Missing schema entities do not produce proxy queries.
+- Vector retrieval is optional and fails closed to lexical retrieval.
+- Charts contain no executable code or arbitrary ECharts configuration.
