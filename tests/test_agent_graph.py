@@ -36,10 +36,40 @@ class FakeReactAgent:
             "trace": [{"step": "Reason-1", "status": "success", "message": "using tool"}],
         }
 
+    def GenerateCandidates(self, question, schema_prompt, session_context=None):
+        from askdata.agent.react_sql_agent import SqlCandidateDraft
+
+        self.called = True
+        assert question == "How many items?"
+        assert "Table items" in schema_prompt
+        return [SqlCandidateDraft(sql="SELECT COUNT(id) AS count FROM items")]
+
 
 class FakeAnalyzer:
     def Analyze(self, question, sql, columns, rows):
         return f"共有 {rows[0]['count']} 条。"
+
+
+class GroundingFailureReact:
+    def __init__(self):
+        self.index = 0
+
+    def GenerateCandidates(self, question, schema_prompt, session_context=None):
+        from askdata.agent.react_sql_agent import SqlCandidateDraft
+
+        self.index += 1
+        return [SqlCandidateDraft(sql=f"SELECT missing_{self.index} FROM items")]
+
+
+class TrackingRetriever:
+    def __init__(self, context):
+        self.index = self
+        self.context = context
+        self.calls = 0
+
+    def Retrieve(self, database_id, question):
+        self.calls += 1
+        return dict(self.context)
 
 
 def write_processed_dataset(root, database_path):
@@ -92,18 +122,84 @@ def test_agent_graph_can_delegate_sql_work_to_react_agent(tmp_path):
     database_path = tmp_path / "demo.sqlite"
     connection = sqlite3.connect(database_path)
     connection.execute("CREATE TABLE items(id INTEGER)")
+    connection.executemany("INSERT INTO items(id) VALUES (?)", [(1,), (2,), (3,)])
     connection.commit()
     connection.close()
     processed = write_processed_dataset(tmp_path, database_path)
     react_agent = FakeReactAgent()
 
-    graph = AgentGraph(processed_dir=processed, react_agent=react_agent)
+    graph = AgentGraph(processed_dir=processed, react_agent=react_agent, analyzer=FakeAnalyzer())
     result = graph.Run(question="How many items?", database_id="demo")
 
     assert react_agent.called is True
     assert result["answer"] == "共有 3 条。"
     assert result["sql"] == "SELECT COUNT(id) AS count FROM items"
-    assert [step["step"] for step in result["trace"]] == ["RetrieveSchema", "Reason-1"]
+    assert [step["step"] for step in result["trace"]] == [
+        "RetrieveSchema", "GenerateSql", "ValidateSql", "ExecuteSql", "AnalyzeResult"
+    ]
+
+
+def test_agent_graph_uses_staged_pipeline_for_chat_llm(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE items(id INTEGER)")
+        connection.executemany("INSERT INTO items(id) VALUES (?)", [(1,), (2,), (3,)])
+    processed = write_processed_dataset(tmp_path, database_path)
+    react_agent = FakeReactAgent()
+    events = []
+
+    result = AgentGraph(
+        processed_dir=processed,
+        react_agent=react_agent,
+        analyzer=FakeAnalyzer(),
+    ).Run(question="How many items?", database_id="demo", emit=events.append)
+
+    assert react_agent.called is True
+    assert result["sql"] == "SELECT COUNT(id) AS count FROM items"
+    assert result["rows"] == [{"count": 3}]
+    assert events[0] == {
+        "step": "RetrieveSchema",
+        "status": "success",
+        "message": "Schema matched.",
+    }
+
+
+def test_agent_graph_keeps_one_shot_fallback_for_llm_without_chat(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE items(id INTEGER)")
+        connection.executemany("INSERT INTO items(id) VALUES (?)", [(1,), (2,), (3,)])
+    processed = write_processed_dataset(tmp_path, database_path)
+
+    result = AgentGraph(
+        processed_dir=processed,
+        llm_client=FakeLLM(),
+        analyzer=FakeAnalyzer(),
+    ).Run(question="How many items?", database_id="demo")
+
+    assert result["sql"] == "SELECT COUNT(id) AS count FROM items"
+    assert result["rows"] == [{"count": 3}]
+
+
+def test_agent_graph_retrieves_again_at_grounding_expansion_stage(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE items(id INTEGER)")
+    retriever = TrackingRetriever({
+        "database_id": "demo",
+        "database_path": str(database_path),
+        "schema_prompt": "Database: demo\nTable items(id integer)",
+    })
+
+    result = AgentGraph(
+        retriever=retriever,
+        react_agent=GroundingFailureReact(),
+        analyzer=FakeAnalyzer(),
+    ).Run(question="List items", database_id="demo")
+
+    assert result["kind"] == "error"
+    assert result["retrieval_expanded"] is True
+    assert retriever.calls == 2
 
 
 @pytest.mark.asyncio

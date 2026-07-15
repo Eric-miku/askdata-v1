@@ -3,6 +3,7 @@
 import asyncio
 
 from askdata.agent.prompts import BuildRepairPrompt, BuildSqlPrompt
+from askdata.agent.pipeline import StagedSqlPipeline
 from askdata.agent.react_sql_agent import ReActSqlAgent
 from askdata.core.llm import LLMClient
 from askdata.tools.analyzer import ResultAnalyzer
@@ -21,6 +22,7 @@ class AgentGraph:
         retriever=None,
         react_agent=None,
         skill_loader=None,
+        pipeline=None,
         max_repairs: int = 1,
     ):
         self.processed_dir = processed_dir
@@ -29,21 +31,38 @@ class AgentGraph:
         self.retriever = retriever
         self.react_agent = react_agent
         self.skill_loader = skill_loader or SkillLoader()
+        self.pipeline = pipeline
         self.max_repairs = max_repairs
 
-    def Run(self, question: str, database_id: str, session_context: dict | None = None) -> dict:
+    def Run(self, question: str, database_id: str, session_context: dict | None = None, emit=None) -> dict:
         trace = []
         retriever = self.retriever or SemanticRetriever(processed_dir=self.processed_dir).Build()
         context = retriever.index.Retrieve(database_id, question)
         schema_prompt = context["schema_prompt"]
-        trace.append(self._TraceStep("RetrieveSchema", "success", "Schema matched."))
+        retrieval_event = self._TraceStep("RetrieveSchema", "success", "Schema matched.")
+        trace.append(retrieval_event)
+        if emit:
+            emit(dict(retrieval_event))
 
         if self.react_agent or hasattr(self.llm_client, "Chat"):
             react_agent = self.react_agent or ReActSqlAgent(self.llm_client, skill_loader=self.skill_loader)
-            result = react_agent.Run(question, schema_prompt, context["database_path"], session_context)
+            pipeline = self.pipeline or StagedSqlPipeline(
+                react=react_agent,
+                analyzer=self.analyzer,
+                retrieval_expander=lambda expanded_question, current: self._ExpandRetrieval(
+                    retriever,
+                    database_id,
+                    expanded_question,
+                    current,
+                ),
+            )
+            result = pipeline.Run(
+                question=question,
+                retrieval=context,
+                session_context=session_context,
+                emit=emit,
+            )
             result["trace"] = trace + result.get("trace", [])
-            result["chart"] = result.get("chart")
-            result["error"] = result.get("error")
             return result
 
         skills_section = self.skill_loader.BuildPromptSection()
@@ -69,12 +88,13 @@ class AgentGraph:
             "error": None,
         }
 
-    async def ARun(self, question: str, database_id: str, session_context: dict | None = None) -> dict:
+    async def ARun(self, question: str, database_id: str, session_context: dict | None = None, emit=None) -> dict:
         return await asyncio.to_thread(
             self.Run,
             question=question,
             database_id=database_id,
             session_context=session_context,
+            emit=emit,
         )
 
     def _ExecuteWithRepair(self, question: str, sql: str, schema_prompt: str, database_path: str, trace: list[dict]) -> dict:
@@ -106,6 +126,12 @@ class AgentGraph:
     def _ExecuteSql(self, sql: str, database_path: str) -> dict:
         from askdata.db.query_runner import Execute as RunQuery
         return RunQuery(sql, database_path)
+
+    def _ExpandRetrieval(self, retriever, database_id: str, question: str, current: dict) -> dict:
+        expand = getattr(retriever.index, "Expand", None)
+        if callable(expand):
+            return expand(database_id, question, current)
+        return retriever.index.Retrieve(database_id, question)
 
     def _CleanSql(self, text: str) -> str:
         cleaned = (text or "").strip().strip("`").strip()

@@ -3,6 +3,8 @@
 import json
 import re
 
+from pydantic import BaseModel, Field
+
 from askdata.agent.answer_shape import CheckAnswerShape
 from askdata.agent.prompts import BuildReActSystemPrompt
 
@@ -22,6 +24,14 @@ RUN_QUERY_TOOL = {
 }
 
 
+class SqlCandidateDraft(BaseModel):
+    """An unexecuted SQL proposal produced by the focused ReAct generator."""
+
+    sql: str
+    reason: str = ""
+    referenced_context: list[str] = Field(default_factory=list)
+
+
 class ReActSqlAgent:
     """Tool-calling SQL loop that can be used as one node inside AgentGraph."""
 
@@ -29,6 +39,26 @@ class ReActSqlAgent:
         self.llm_client = llm_client
         self.max_iterations = max_iterations
         self.skill_loader = skill_loader
+
+    def GenerateCandidates(
+        self,
+        question: str,
+        schema_prompt: str,
+        session_context: dict | None = None,
+    ) -> list[SqlCandidateDraft]:
+        """Generate SQL drafts while leaving execution and selection to the pipeline."""
+
+        messages = self._BuildMessages(question, schema_prompt, session_context)
+        message = self.llm_client.Chat(messages, tools=[RUN_QUERY_TOOL])
+        reason = self._CleanFinalAnswer(getattr(message, "content", None) or "")
+        drafts = []
+        for tool_call in getattr(message, "tool_calls", None) or []:
+            if tool_call.function.name != "run_query":
+                continue
+            sql = self._CleanSql(self._ParseSql(tool_call.function.arguments))
+            if sql:
+                drafts.append(SqlCandidateDraft(sql=sql, reason=reason))
+        return drafts
 
     def Run(self, question: str, schema_prompt: str, database_path: str, session_context: dict | None = None) -> dict:
         messages = self._BuildMessages(question, schema_prompt, session_context)
@@ -135,6 +165,12 @@ class ReActSqlAgent:
         previous = ""
         if session_context and session_context.get("last_sql"):
             previous = f"\nPrevious SQL: {session_context['last_sql']}"
+        if session_context and session_context.get("pipeline_stage"):
+            previous += f"\nRecovery stage: {session_context['pipeline_stage']}"
+        if session_context and session_context.get("pipeline_previous_sql"):
+            previous += f"\nPrevious candidate SQL: {session_context['pipeline_previous_sql']}"
+        if session_context and session_context.get("pipeline_feedback"):
+            previous += f"\nCorrection needed: {session_context['pipeline_feedback']}"
         system_prompt = BuildReActSystemPrompt()
 
         if self.skill_loader:

@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from askdata.agent.react_sql_agent import ReActSqlAgent
+from askdata.agent.react_sql_agent import ReActSqlAgent, SqlCandidateDraft
 from askdata.agent.prompts import BuildReActSystemPrompt
 
 
@@ -260,3 +260,21 @@ def test_react_sql_agent_retains_two_candidates_but_still_executes_later_final_s
     assert result["sql"] == "SELECT COUNT(*) AS count FROM items WHERE id > 0"
     assert sum(step["step"] == "ExecuteSql" for step in result["trace"]) == 3
     assert not any(step["step"] == "CandidateLimit" for step in result["trace"])
+
+
+def test_react_sql_agent_generate_candidates_returns_drafts_without_executing():
+    llm = ScriptedToolCallingLLM([
+        {"sql": "SELECT COUNT(*) AS count FROM items", "content": "Count the rows."},
+    ])
+    agent = ReActSqlAgent(llm_client=llm)
+    agent._ExecuteSql = lambda sql, database_path: (_ for _ in ()).throw(AssertionError("must not execute"))
+
+    drafts = agent.GenerateCandidates(
+        question="How many items?",
+        schema_prompt="Database: demo\nTable items(id integer)",
+        session_context={"pipeline_stage": "initial"},
+    )
+
+    assert drafts == [
+        SqlCandidateDraft(sql="SELECT COUNT(*) AS count FROM items", reason="Count the rows.")
+    ]
