@@ -39,6 +39,82 @@ def test_cli_help_lists_development_commands():
     assert "chat" in result.output
     assert "databases" in result.output
     assert "gen-instructions" in result.output
+    assert "index-schema" in result.output
+
+
+def test_index_schema_validates_all_embeddings_before_mutating_store(tmp_path, monkeypatch):
+    processed = write_processed_dataset(tmp_path)
+
+    class BadEmbedding:
+        model = "bad-model"
+        dimension = 2
+
+        def Embed(self, texts):
+            return [[1.0, 2.0]][: max(0, len(texts) - 1)]
+
+    class RecordingStore:
+        collection_name = "test_chunks"
+
+        def __init__(self):
+            self.upserts = []
+
+        def Upsert(self, chunks, vectors):
+            self.upserts.append((chunks, vectors))
+
+    store = RecordingStore()
+    monkeypatch.setattr(cli, "_BuildEmbeddingClient", lambda: BadEmbedding())
+    monkeypatch.setattr(cli, "_BuildVectorStore", lambda: store)
+
+    result = runner.invoke(cli.app, [
+        "index-schema", "--database-id", "demo", "--processed-dir", str(processed)
+    ])
+
+    assert result.exit_code != 0
+    assert store.upserts == []
+
+
+def test_index_schema_prints_validated_index_metadata(tmp_path, monkeypatch):
+    processed = write_processed_dataset(tmp_path)
+    (processed / "questions.jsonl").write_text(json.dumps({
+        "question_id": "q1",
+        "database_id": "demo",
+        "question": "How many items?",
+        "gold_sql": "SELECT COUNT(*) FROM items",
+        "evidence": "Count item rows.",
+    }) + "\n", encoding="utf-8")
+
+    class Embedding:
+        model = "test-model"
+        dimension = 2
+
+        def Embed(self, texts):
+            return [[1.0, 2.0] for _ in texts]
+
+    class Store:
+        collection_name = "test_chunks"
+
+        def __init__(self):
+            self.upserts = []
+
+        def Upsert(self, chunks, vectors):
+            self.upserts.append((chunks, vectors))
+
+    store = Store()
+    monkeypatch.setattr(cli, "_BuildEmbeddingClient", lambda: Embedding())
+    monkeypatch.setattr(cli, "_BuildVectorStore", lambda: store)
+
+    result = runner.invoke(cli.app, [
+        "index-schema", "--database-id", "demo", "--processed-dir", str(processed)
+    ])
+
+    assert result.exit_code == 0
+    assert len(store.upserts) == 1
+    assert "model: test-model" in result.output
+    assert "dimension: 2" in result.output
+    assert "collection: test_chunks" in result.output
+    assert "source version:" in result.output
+    assert "evidence chunks: 1" in result.output
+    assert "example chunks: 1" in result.output
 
 
 def test_eval_bird_help_is_available():

@@ -192,3 +192,55 @@ def test_semantic_retriever_loads_native_contract_and_evidence(tmp_path):
 
     assert "Evidence: Count every item row." in prompt
     assert "Table items(id integer)" in prompt
+
+
+def test_schema_index_exposes_ranked_lexical_candidates_and_canonical_chunks(tmp_path):
+    instructions = tmp_path / "instructions"
+    instructions.mkdir()
+    (instructions / "demo.md").write_text(
+        "## Business Term Mappings\n- State Special School -> EdOpsCode = 'SSS'\n"
+        "## JOIN Patterns\n- students.school_id = schools.id\n",
+        encoding="utf-8",
+    )
+    questions = [{
+        "database_id": "demo",
+        "question": "How many special schools?",
+        "evidence": "SSS identifies a State Special School.",
+        "gold_sql": "SELECT COUNT(*) FROM schools WHERE EdOpsCode = 'SSS'",
+        "question_id": "q1",
+    }]
+    index = BirdSchemaIndex(instructions_dir=instructions).Build(
+        [sample_database()], questions=questions
+    )
+
+    lexical = index.LexicalCandidates("demo", "school age")
+    chunks = index.BuildChunks("demo")
+    backbone = index.SchemaBackbone("demo")
+
+    assert lexical
+    assert lexical[0].score >= lexical[-1].score
+    assert {chunk.source_type for chunk in chunks} == {"schema", "value", "evidence", "example"}
+    assert any(
+        chunk.source_type == "schema"
+        and chunk.table_name == "students"
+        and chunk.column_name == "age"
+        for chunk in chunks
+    )
+    assert len({chunk.id for chunk in chunks}) == len(chunks)
+    assert all(chunk.database_id == "demo" for chunk in chunks)
+    assert "schools.id [primary key]" in backbone
+    assert "students.school_id -> schools.id" in backbone
+
+
+def test_canonical_value_chunks_bound_and_attribute_profiled_values():
+    database = sample_database()
+    database["tables"][0]["columns"][1]["sample_values"] = [
+        f"school-{index}" for index in range(30)
+    ]
+    index = BirdSchemaIndex().Build([database])
+
+    values = [chunk for chunk in index.BuildChunks("demo") if chunk.source_type == "value"]
+
+    assert len(values) == 20
+    assert all(chunk.table_name == "schools" for chunk in values)
+    assert all(chunk.column_name == "school_name" for chunk in values)

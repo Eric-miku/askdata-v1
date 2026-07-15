@@ -1,12 +1,14 @@
 """Schema index and semantic retriever — loads BIRD database schema, token-matches question keywords to tables/columns, builds structured prompt context with foreign key JOIN hints and per-DB business instructions."""
 
 import re
+import hashlib
 from pathlib import Path
 from typing import Any
 
 from askdata.core.config import settings
 from askdata.data.bird_io import LoadProcessedDatabases, LoadProcessedQuestions, ResolveProcessedDir
 from askdata.core.paths import project_path
+from askdata.tools.vector_store import RankedChunk, SchemaChunk
 
 
 def GetValue(item: Any, *names: str, default=None):
@@ -36,10 +38,143 @@ class BirdSchemaIndex:
             self.instructions_dir = project_path(instructions_dir)
         return self
 
-    def Retrieve(self, database_id: str, question: str) -> dict[str, Any]:
+    def GetDatabase(self, database_id: str) -> Any:
         database = self.databases.get(database_id)
         if not database:
             raise ValueError(f"Unknown BIRD database_id: {database_id}")
+        return database
+
+    def LexicalCandidates(
+        self, database_id: str, question: str, top_k: int = 20
+    ) -> list[RankedChunk]:
+        """Return attributable lexical candidates without changing ``Retrieve``."""
+        tokens = _Tokens(question)
+        ranked = []
+        for chunk in self.BuildChunks(database_id):
+            chunk_tokens = _Tokens(chunk.text)
+            overlap = len(tokens & chunk_tokens)
+            identifiers = _Tokens(f"{chunk.table_name or ''} {chunk.column_name or ''}")
+            identifier_overlap = len(tokens & identifiers)
+            if overlap or identifier_overlap:
+                score = float(overlap + (2 * identifier_overlap))
+                ranked.append(RankedChunk(chunk, score))
+        ranked.sort(key=lambda item: (-item.score, item.id))
+        return ranked[:top_k]
+
+    def BuildChunks(self, database_id: str) -> list[SchemaChunk]:
+        """Build canonical, stable chunks for schema and semantic sources."""
+        database = self.GetDatabase(database_id)
+        chunks: list[SchemaChunk] = []
+        for table in GetValue(database, "tables", default=[]):
+            table_name = GetValue(table, "tableName", "table_name", default="")
+            table_description = GetValue(table, "description", "display_name", "displayName", default="") or ""
+            columns = []
+            for column in GetValue(table, "columns", default=[]):
+                name = GetValue(column, "columnName", "column_name", default="")
+                data_type = GetValue(column, "columnType", "column_type", "data_type", default="text")
+                description = GetValue(column, "description", "display_name", "displayName", default="") or ""
+                key = " primary key" if GetValue(
+                    column, "isPrimary", "is_primary", "is_primary_key", default=False
+                ) else ""
+                column_text = f"{name} {data_type}{key} {description}".strip()
+                columns.append(column_text)
+                chunks.append(SchemaChunk(
+                    id=f"{database_id}:schema:{table_name}:{name}",
+                    database_id=database_id,
+                    source_type="schema",
+                    text=f"Column {table_name}.{column_text}",
+                    table_name=table_name,
+                    column_name=name,
+                ))
+                raw_values = GetValue(
+                    column,
+                    "sample_values",
+                    "sampleValues",
+                    "representative_values",
+                    "representativeValues",
+                    default=[],
+                ) or []
+                for value in list(raw_values)[:20]:
+                    if not isinstance(value, (str, int, float, bool)):
+                        continue
+                    value_text = str(value)[:200]
+                    digest = hashlib.sha256(
+                        f"{table_name}:{name}:{value_text}".encode("utf-8")
+                    ).hexdigest()[:16]
+                    chunks.append(SchemaChunk(
+                        id=f"{database_id}:value:{table_name}:{name}:{digest}",
+                        database_id=database_id,
+                        source_type="value",
+                        text=f"{table_name}.{name} representative value: {value_text}",
+                        table_name=table_name,
+                        column_name=name,
+                    ))
+            text = f"Table {table_name}. {table_description} Columns: {', '.join(columns)}".strip()
+            chunks.append(SchemaChunk(
+                id=f"{database_id}:schema:{table_name}",
+                database_id=database_id,
+                source_type="schema",
+                text=text,
+                table_name=table_name,
+            ))
+
+        instructions = self._LoadInstructions(database_id)
+        for line in instructions.splitlines():
+            content = line.strip().lstrip("- ")
+            if not content or content.endswith(":"):
+                continue
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+            chunks.append(SchemaChunk(
+                id=f"{database_id}:value:{digest}",
+                database_id=database_id,
+                source_type="value",
+                text=content,
+            ))
+
+        for position, item in enumerate(self.questions):
+            if GetValue(item, "databaseId", "database_id", default="") != database_id:
+                continue
+            question = GetValue(item, "question", default="") or ""
+            evidence = GetValue(item, "evidence", default="") or ""
+            question_id = GetValue(item, "questionId", "question_id", default="") or str(position)
+            if evidence:
+                chunks.append(SchemaChunk(
+                    id=f"{database_id}:evidence:{question_id}",
+                    database_id=database_id,
+                    source_type="evidence",
+                    text=f"Question: {question}\nEvidence: {evidence}",
+                ))
+            gold_sql = GetValue(item, "goldSql", "gold_sql", "SQL", default="") or ""
+            if gold_sql:
+                chunks.append(SchemaChunk(
+                    id=f"{database_id}:example:{question_id}",
+                    database_id=database_id,
+                    source_type="example",
+                    text=f"Validated example only. Question: {question}\nSQL: {gold_sql}",
+                ))
+        return chunks
+
+    def SchemaBackbone(self, database_id: str) -> str:
+        database = self.GetDatabase(database_id)
+        lines = ["Schema backbone:"]
+        for table in GetValue(database, "tables", default=[]):
+            table_name = GetValue(table, "tableName", "table_name", default="")
+            for column in GetValue(table, "columns", default=[]):
+                column_name = GetValue(column, "columnName", "column_name", default="")
+                suffix = " [primary key]" if GetValue(
+                    column, "isPrimary", "is_primary", "is_primary_key", default=False
+                ) else ""
+                lines.append(f"- {table_name}.{column_name}{suffix}")
+        for key in GetValue(database, "foreignKeys", "foreign_keys", default=[]):
+            left_table = GetValue(key, "leftTable", "left_table", "source_table", default="")
+            left_column = GetValue(key, "leftColumn", "left_column", "source_column", default="")
+            right_table = GetValue(key, "rightTable", "right_table", "target_table", default="")
+            right_column = GetValue(key, "rightColumn", "right_column", "target_column", default="")
+            lines.append(f"- {left_table}.{left_column} -> {right_table}.{right_column}")
+        return "\n".join(lines)
+
+    def Retrieve(self, database_id: str, question: str) -> dict[str, Any]:
+        database = self.GetDatabase(database_id)
 
         evidence = self._FindEvidence(database_id, question)
         question_tokens = _Tokens(f"{question} {evidence}")
@@ -214,7 +349,28 @@ class SemanticRetriever:
             )
         except FileNotFoundError:
             questions = []
-        self.index = BirdSchemaIndex().Build(databases, questions=questions)
+        lexical = BirdSchemaIndex().Build(databases, questions=questions)
+        self.index = lexical
+        if (
+            settings.VECTOR_RETRIEVAL_ENABLED
+            and settings.EMBEDDING_API_URL
+            and settings.MILVUS_URI
+        ):
+            from askdata.tools.embedding_client import EmbeddingClient
+            from askdata.tools.hybrid_retriever import HybridRetriever, HybridSchemaIndex
+            from askdata.tools.vector_store import MilvusVectorStore
+
+            embedding = EmbeddingClient(
+                base_url=settings.EMBEDDING_API_URL,
+                api_key=settings.EMBEDDING_API_KEY,
+                model=settings.EMBEDDING_MODEL,
+                dimension=settings.EMBEDDING_DIMENSION,
+            )
+            vector = MilvusVectorStore(settings.MILVUS_URI, settings.MILVUS_COLLECTION)
+            self.index = HybridSchemaIndex(
+                lexical,
+                HybridRetriever(lexical, vector, embedding),
+            )
         return self
 
     def Retrieve(self, database_id: str, question: str) -> str:

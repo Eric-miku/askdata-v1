@@ -7,9 +7,15 @@ import typer
 from askdata.agent.graph import AgentGraph
 from askdata.core.config import settings
 from askdata.core.paths import project_path
-from askdata.data.bird_io import LoadProcessedDatabases, ResolveProcessedDir
+from askdata.data.bird_io import (
+    LoadProcessedDatabases,
+    LoadProcessedQuestions,
+    ResolveProcessedDir,
+)
 from askdata.eval import EvalRunner
-from askdata.tools.retriever import GetValue
+from askdata.tools.embedding_client import EmbeddingClient, EmbeddingConfigurationError
+from askdata.tools.retriever import BirdSchemaIndex, GetValue
+from askdata.tools.vector_store import MilvusVectorStore, SOURCE_VERSION
 
 
 app = typer.Typer(help="AskData — NL2SQL development CLI")
@@ -24,6 +30,23 @@ def _LoadDatabases(processed_dir: Path | None = None) -> list[dict]:
         return LoadProcessedDatabases(processed_dir or settings.BIRD_DATA_DIR)
     except (FileNotFoundError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+def _BuildEmbeddingClient() -> EmbeddingClient:
+    if not settings.EMBEDDING_API_URL:
+        raise typer.BadParameter("EMBEDDING_API_URL is required to build the schema index")
+    return EmbeddingClient(
+        base_url=settings.EMBEDDING_API_URL,
+        api_key=settings.EMBEDDING_API_KEY,
+        model=settings.EMBEDDING_MODEL,
+        dimension=settings.EMBEDDING_DIMENSION,
+    )
+
+
+def _BuildVectorStore() -> MilvusVectorStore:
+    if not settings.MILVUS_URI:
+        raise typer.BadParameter("MILVUS_URI is required to build the schema index")
+    return MilvusVectorStore(settings.MILVUS_URI, settings.MILVUS_COLLECTION)
 
 
 class ChatSession:
@@ -186,6 +209,59 @@ def GenInstructions(
         ])
         (out_path / f"{database_id}.md").write_text(content, encoding="utf-8")
     typer.echo(f"Generated {len(databases)} instruction files in {out_path}")
+
+
+@app.command("index-schema")
+def IndexSchema(
+    database_id: str = typer.Option(..., "--database-id", "-d", help="Database to index"),
+    processed_dir: Path | None = typer.Option(None, "--processed-dir", help="BIRD processed directory"),
+):
+    """Validate and index canonical schema chunks for one database."""
+    databases = _LoadDatabases(processed_dir)
+    try:
+        questions = LoadProcessedQuestions(
+            processed_dir or settings.BIRD_DATA_DIR,
+            database_ids={GetValue(database, "databaseId", "database_id") for database in databases},
+        )
+    except FileNotFoundError:
+        questions = []
+    try:
+        index = BirdSchemaIndex().Build(databases, questions=questions)
+        chunks = index.BuildChunks(database_id)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if not chunks:
+        raise typer.BadParameter(f"No indexable chunks for database_id: {database_id}")
+
+    embedding = _BuildEmbeddingClient()
+    store = _BuildVectorStore()
+    try:
+        vectors = embedding.Embed([chunk.text for chunk in chunks])
+        # Validate the entire batch before the first collection mutation. This is
+        # deliberately repeated here so custom clients used by operators cannot
+        # bypass the atomicity boundary.
+        if len(vectors) != len(chunks):
+            raise EmbeddingConfigurationError(
+                f"Embedding service returned {len(vectors)} vectors for {len(chunks)} texts"
+            )
+        if any(len(vector) != embedding.dimension for vector in vectors):
+            raise EmbeddingConfigurationError(
+                f"Embedding dimension mismatch: expected {embedding.dimension}"
+            )
+    except (EmbeddingConfigurationError, RuntimeError, ValueError) as exc:
+        raise typer.BadParameter(f"Schema index validation failed: {exc}") from exc
+
+    store.Upsert(chunks, vectors)
+    counts: dict[str, int] = {}
+    for chunk in chunks:
+        counts[chunk.source_type] = counts.get(chunk.source_type, 0) + 1
+    typer.echo(f"database: {database_id}")
+    for source_type in sorted(counts):
+        typer.echo(f"{source_type} chunks: {counts[source_type]}")
+    typer.echo(f"model: {embedding.model}")
+    typer.echo(f"dimension: {embedding.dimension}")
+    typer.echo(f"collection: {store.collection_name}")
+    typer.echo(f"source version: {SOURCE_VERSION}")
 
 
 @app.command("chat")
