@@ -2,14 +2,16 @@
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
+import threading
 import uuid
 from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum
-from typing import Any, AsyncIterator, Awaitable, Callable, Mapping
+from typing import Any, AsyncIterator, Callable, Mapping
 
 from pydantic import BaseModel
 
@@ -138,12 +140,46 @@ class QueryService:
     async def Run(
         self,
         request: QueryRequest,
-        emit: Callable[[TraceEvent], Awaitable[None]] | None = None,
+        emit: Callable[[TraceEvent], Any] | None = None,
     ) -> QueryResponse:
-        response = await self._Run(request)
-        if emit is not None:
+        loop = asyncio.get_running_loop()
+        emitted = 0
+        emit_lock = threading.Lock()
+        pending_emits: list[Any] = []
+
+        def dispatch(event: TraceEvent) -> None:
+            nonlocal emitted
+            with emit_lock:
+                if emitted >= _TRACE_EVENT_LIMIT:
+                    return
+                emitted += 1
+                sequence = emitted
+            delivered = event.model_copy(update={"sequence": sequence})
+            result = emit(delivered) if emit is not None else None
+            if inspect.isawaitable(result):
+                try:
+                    current_loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    current_loop = None
+                if current_loop is loop:
+                    pending = loop.create_task(result)
+                else:
+                    pending = asyncio.run_coroutine_threadsafe(result, loop)
+                with emit_lock:
+                    pending_emits.append(pending)
+
+        response = await self._Run(request, emit=dispatch if emit is not None else None)
+        if emit is not None and emitted == 0:
             for event in response.trace:
-                await emit(event)
+                dispatch(event)
+
+        with emit_lock:
+            pending = list(pending_emits)
+        for delivery in pending:
+            if isinstance(delivery, asyncio.Future):
+                await delivery
+            else:
+                await asyncio.wrap_future(delivery)
         return response
 
     async def Stream(self, request: QueryRequest) -> AsyncIterator[str]:
@@ -152,8 +188,41 @@ class QueryService:
             maxsize=100
         )
 
-        async def emit(event: TraceEvent) -> None:
-            await queue.put(("trace", event.model_dump(mode="json")))
+        loop = asyncio.get_running_loop()
+        accepting_events = threading.Event()
+        accepting_events.set()
+
+        def emit(event: TraceEvent) -> None:
+            if not accepting_events.is_set():
+                return
+
+            def enqueue() -> None:
+                if not accepting_events.is_set():
+                    return
+                try:
+                    queue.put_nowait(("trace", event.model_dump(mode="json")))
+                except asyncio.QueueFull:
+                    logger.warning("Dropping excess streaming trace event")
+
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            if current_loop is loop:
+                enqueue()
+            else:
+                try:
+                    loop.call_soon_threadsafe(enqueue)
+                except RuntimeError:
+                    if accepting_events.is_set():
+                        raise
+
+        def terminal_name(response: QueryResponse) -> str:
+            if isinstance(response, ClarificationResponse):
+                return "clarification"
+            if isinstance(response, ErrorResponse):
+                return "error"
+            return "final"
 
         async def produce() -> None:
             try:
@@ -165,7 +234,12 @@ class QueryService:
                 response = self._QueryFailed(
                     request.session_id or "", str(uuid.uuid4())
                 )
-            await queue.put(("final", response.model_dump(mode="json")))
+            barrier = loop.create_future()
+            loop.call_soon(barrier.set_result, None)
+            await barrier
+            await queue.put(
+                (terminal_name(response), response.model_dump(mode="json"))
+            )
             await queue.put(None)
 
         task = asyncio.create_task(produce())
@@ -176,14 +250,19 @@ class QueryService:
                     break
                 yield EncodeSse(event[0], event[1])
         finally:
+            accepting_events.clear()
             if not task.done():
                 task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
 
-    async def _Run(self, request: QueryRequest) -> QueryResponse:
+    async def _Run(
+        self,
+        request: QueryRequest,
+        emit: Callable[[TraceEvent], None] | None = None,
+    ) -> QueryResponse:
         if request.clarification is not None:
-            return await self._ContinueClarification(request)
+            return await self._ContinueClarification(request, emit=emit)
         if not request.question:
             return self._InvalidClarification(request.session_id or "", "")
 
@@ -197,7 +276,9 @@ class QueryService:
                 if session is None or session["database_id"] != request.database_id:
                     replacement_required = True
                 else:
-                    return await self._RunInSession(request, session_id, session)
+                    return await self._RunInSession(
+                        request, session_id, session, emit=emit
+                    )
 
             if replacement_required:
                 session_id = await self._store.CreateSession(request.database_id)
@@ -215,6 +296,7 @@ class QueryService:
         turn_id: str | None = None,
         graph_question: str | None = None,
         stored_question: str | None = None,
+        emit: Callable[[TraceEvent], None] | None = None,
     ) -> QueryResponse:
         turn_id = turn_id or str(uuid.uuid4())
         question = graph_question or request.question or ""
@@ -228,10 +310,11 @@ class QueryService:
             }
 
         try:
-            result = await self._graph_factory().ARun(
+            result = await self._RunGraph(
                 question=question,
                 database_id=request.database_id,
                 session_context=context,
+                emit=emit,
             )
             if not isinstance(result, Mapping):
                 response = self._QueryFailed(session_id, turn_id)
@@ -275,6 +358,40 @@ class QueryService:
             self._TurnForStorage(original_question, response),
         )
         return response
+
+    async def _RunGraph(
+        self,
+        *,
+        question: str,
+        database_id: str,
+        session_context: Mapping[str, Any],
+        emit: Callable[[TraceEvent], None] | None,
+    ) -> Any:
+        graph = self._graph_factory()
+        graph_emit: Callable[[Any], None] | None = None
+        if emit is not None:
+
+            def safe_graph_emit(raw_event: Any) -> None:
+                event = self._NormalizeTraceItem(raw_event)
+                if event is not None:
+                    emit(event)
+
+            graph_emit = safe_graph_emit
+
+        run = graph.ARun
+        parameters = inspect.signature(run).parameters
+        accepts_emit = "emit" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        kwargs = {
+            "question": question,
+            "database_id": database_id,
+            "session_context": dict(session_context),
+        }
+        if accepts_emit:
+            kwargs["emit"] = graph_emit
+        return await run(**kwargs)
 
     async def _SaveClarification(
         self,
@@ -337,7 +454,11 @@ class QueryService:
             trace=trace,
         )
 
-    async def _ContinueClarification(self, request: QueryRequest) -> QueryResponse:
+    async def _ContinueClarification(
+        self,
+        request: QueryRequest,
+        emit: Callable[[TraceEvent], None] | None = None,
+    ) -> QueryResponse:
         resolution = request.clarification
         session_id = request.session_id or ""
         if resolution is None or not session_id:
@@ -402,6 +523,7 @@ class QueryService:
                 turn_id=str(owner_turn["id"]),
                 graph_question=combined_question,
                 stored_question=original_question,
+                emit=emit,
             )
 
     @staticmethod
@@ -431,35 +553,47 @@ class QueryService:
         ).rstrip()
 
     @staticmethod
-    def _NormalizeTrace(value: Any) -> list[TraceEvent]:
-        items = value[:_TRACE_EVENT_LIMIT] if isinstance(value, list) else []
+    def _NormalizeTraceItem(item: Any) -> TraceEvent | None:
+        if not isinstance(item, Mapping):
+            return None
+        step = str(item.get("step") or "")
+        message = _OPERATIONAL_TRACE_MESSAGES.get(step)
+        if message is None:
+            return None
+        candidate_status = str(item.get("status") or "success")
+        status = (
+            candidate_status if candidate_status in _TRACE_STATUSES else "warning"
+        )
+        return TraceEvent(
+            step=step,
+            status=status,
+            message=message[:_TRACE_MESSAGE_LIMIT],
+            sequence=0,
+        )
+
+    @classmethod
+    def _NormalizeTrace(cls, value: Any) -> list[TraceEvent]:
         curated = []
-        for item in items:
-            if not isinstance(item, Mapping):
-                continue
-            step = str(item.get("step") or "")
-            message = _OPERATIONAL_TRACE_MESSAGES.get(step)
-            if message is None:
-                continue
-            candidate_status = str(item.get("status") or "success")
-            status = candidate_status if candidate_status in _TRACE_STATUSES else "warning"
-            curated.append((step, status, message[:_TRACE_MESSAGE_LIMIT]))
+        for item in value if isinstance(value, list) else []:
+            event = cls._NormalizeTraceItem(item)
+            if event is not None:
+                curated.append(event)
             if len(curated) == _TRACE_EVENT_LIMIT:
                 break
 
         if not curated:
-            curated = [("QueryComplete", "success", "查询完成")]
+            curated = [
+                TraceEvent(
+                    step="QueryComplete",
+                    status="success",
+                    message="查询完成",
+                    sequence=0,
+                )
+            ]
 
         events = []
-        for sequence, (step, status, message) in enumerate(curated, start=1):
-            events.append(
-                TraceEvent(
-                    step=step,
-                    status=status,
-                    message=message,
-                    sequence=sequence,
-                )
-            )
+        for sequence, event in enumerate(curated, start=1):
+            events.append(event.model_copy(update={"sequence": sequence}))
         return events
 
     @staticmethod

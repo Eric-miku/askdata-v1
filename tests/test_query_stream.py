@@ -3,6 +3,7 @@ import asyncio
 import json
 from pathlib import Path
 import sys
+import threading
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -157,7 +158,7 @@ async def test_stream_converts_unexpected_task_exception_to_one_safe_final(tmp_p
     )
 
     frames = _frames(body)
-    assert [name for name, _ in frames] == ["final"]
+    assert [name for name, _ in frames] == ["error"]
     assert frames[0][1]["kind"] == "error"
     assert frames[0][1]["code"] == "query_failed"
     assert secret not in body
@@ -218,4 +219,156 @@ async def test_stream_uses_queue_with_maxsize_100(tmp_path, monkeypatch):
 
     assert sizes == [100]
     assert sum(frame.startswith("event: final\n") for frame in frames) == 1
+    await store.Close()
+
+
+@pytest.mark.asyncio
+async def test_stream_emits_live_worker_trace_before_graph_finishes(tmp_path):
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    worker_finished = threading.Event()
+
+    class ThreadedLiveGraph:
+        async def ARun(self, question, database_id, session_context=None, emit=None):
+            def run():
+                worker_started.set()
+                emit(
+                    {
+                        "step": "RetrieveSchema",
+                        "status": "started",
+                        "message": "secret schema and chain of thought",
+                    }
+                )
+                release_worker.wait(timeout=2)
+                worker_finished.set()
+                return stream_graph_result()
+
+            return await asyncio.to_thread(run)
+
+    store = SessionStore(tmp_path / "sessions.sqlite")
+    await store.Initialize()
+    service = QueryService(store, graph_factory=ThreadedLiveGraph)
+    stream = service.Stream(QueryRequest(question="live", database_id="demo"))
+    first_frame_task = asyncio.create_task(stream.__anext__())
+    try:
+        assert await asyncio.to_thread(worker_started.wait, 1)
+        first_frame = await asyncio.wait_for(first_frame_task, timeout=1)
+        assert first_frame.startswith("event: trace\n")
+        first_payload = _frames(first_frame)[0][1]
+        assert first_payload["step"] == "RetrieveSchema"
+        assert first_payload["status"] == "started"
+        assert first_payload["sequence"] == 1
+        assert "secret schema" not in first_frame
+        assert not worker_finished.is_set()
+    finally:
+        release_worker.set()
+
+    remaining = [frame async for frame in stream]
+    assert worker_finished.is_set()
+    assert sum(frame.startswith("event: final\n") for frame in remaining) == 1
+    await store.Close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_releases_lock_while_to_thread_worker_exits_cooperatively(
+    tmp_path,
+):
+    release_worker = threading.Event()
+    worker_finished = threading.Event()
+
+    class CooperativeThreadGraph:
+        async def ARun(self, question, database_id, session_context=None, emit=None):
+            def run():
+                emit({"step": "RetrieveSchema", "status": "started", "message": "raw"})
+                release_worker.wait(timeout=2)
+                emit({"step": "ExecuteSql", "status": "success", "message": "raw"})
+                worker_finished.set()
+                return stream_graph_result()
+
+            return await asyncio.to_thread(run)
+
+    store = SessionStore(tmp_path / "sessions.sqlite")
+    await store.Initialize()
+    service = QueryService(store, graph_factory=CooperativeThreadGraph)
+    stream = service.Stream(QueryRequest(question="cancel", database_id="demo"))
+
+    assert (await stream.__anext__()).startswith("event: trace\n")
+    await stream.aclose()
+    assert service._locks._entries == {}
+
+    release_worker.set()
+    assert await asyncio.to_thread(worker_finished.wait, 1)
+    await asyncio.sleep(0)
+    assert service._locks._entries == {}
+    await store.Close()
+
+
+def stream_graph_result():
+    return {
+        "answer": "共有 3 条。",
+        "sql": "SELECT COUNT(*) AS count FROM items",
+        "columns": ["count"],
+        "rows": [{"count": 3}],
+        "chart": None,
+        "trace": [
+            {
+                "step": "RetrieveSchema",
+                "status": "started",
+                "message": "secret schema and chain of thought",
+            }
+        ],
+        "error": None,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("graph_result", "terminal_name", "response_kind"),
+    [
+        (
+            {
+                "kind": "clarification",
+                "question": "Which revenue metric?",
+                "options": [
+                    {"id": "gross", "label": "Gross revenue"},
+                    {"id": "net", "label": "Net revenue"},
+                ],
+                "trace": [
+                    {
+                        "step": "RetrieveSchema",
+                        "status": "success",
+                        "message": "raw",
+                    }
+                ],
+            },
+            "clarification",
+            "clarification",
+        ),
+        ({"error": {"private": "secret"}}, "error", "error"),
+    ],
+)
+async def test_stream_uses_distinct_terminal_event_for_non_answer_response(
+    tmp_path, graph_result, terminal_name, response_kind
+):
+    class TerminalGraph:
+        async def ARun(self, question, database_id, session_context=None):
+            return graph_result
+
+    store = SessionStore(tmp_path / "sessions.sqlite")
+    await store.Initialize()
+    service = QueryService(store, graph_factory=TerminalGraph)
+
+    body = "".join(
+        [
+            frame
+            async for frame in service.Stream(
+                QueryRequest(question="terminal", database_id="demo")
+            )
+        ]
+    )
+
+    frames = _frames(body)
+    terminal_frames = [frame for frame in frames if frame[0] != "trace"]
+    assert [name for name, _ in terminal_frames] == [terminal_name]
+    assert terminal_frames[0][1]["kind"] == response_kind
     await store.Close()
