@@ -125,6 +125,7 @@ async def test_save_turn_updates_session_timestamp_and_upserts_same_turn(tmp_pat
     assert after["turns"][0]["answer"] == "Updated answer"
     with pytest.raises(ValueError, match="Session does not exist"):
         await store.SaveTurn("missing-session", answer_turn("turn-2"))
+    assert store._connection.in_transaction is False
     await store.Close()
 
 
@@ -172,6 +173,7 @@ async def test_clarification_state_persists_and_resolution_is_session_scoped(tmp
     assert session["turns"][0]["clarification"] == resolved
     with pytest.raises(ValueError, match="Turn does not exist"):
         await reopened.CreateClarification("missing-turn", "Prompt", [])
+    assert reopened._connection.in_transaction is False
     await reopened.Close()
 
 
@@ -268,3 +270,67 @@ async def test_reads_wait_for_an_in_flight_write_transaction(tmp_path, monkeypat
     assert [turn["id"] for turn in session["turns"]] == ["turn-1"]
     monkeypatch.setattr(store._connection, "commit", original_commit)
     await store.Close()
+
+
+@pytest.mark.asyncio
+async def test_two_stores_can_save_turns_concurrently(tmp_path, monkeypatch):
+    path = tmp_path / "sessions.sqlite"
+    first = SessionStore(path)
+    second = SessionStore(path)
+    await first.Initialize()
+    await second.Initialize()
+    session_id = await first.CreateSession("db")
+
+    begin_count = 0
+    begin_count_lock = asyncio.Lock()
+    both_begun = asyncio.Event()
+    first_has_write_reservation = asyncio.Event()
+    second_attempted_write = asyncio.Event()
+
+    async def wait_for_both_begins():
+        nonlocal begin_count
+        async with begin_count_lock:
+            begin_count += 1
+            if begin_count == 2:
+                both_begun.set()
+        await both_begun.wait()
+
+    def coordinate_connection(store, position):
+        original_execute = store._connection.execute
+        transaction_mode = ""
+
+        async def coordinated_execute(sql, parameters=()):
+            nonlocal transaction_mode
+            normalized = " ".join(sql.split()).upper()
+            if normalized in {"BEGIN", "BEGIN IMMEDIATE"}:
+                transaction_mode = normalized
+                await wait_for_both_begins()
+                return await original_execute(sql, parameters)
+            if normalized.startswith("INSERT INTO TURNS") and transaction_mode == "BEGIN":
+                if position == "first":
+                    cursor = await original_execute(sql, parameters)
+                    first_has_write_reservation.set()
+                    await second_attempted_write.wait()
+                    return cursor
+                await first_has_write_reservation.wait()
+                second_attempted_write.set()
+            return await original_execute(sql, parameters)
+
+        monkeypatch.setattr(store._connection, "execute", coordinated_execute)
+        return original_execute
+
+    first_execute = coordinate_connection(first, "first")
+    second_execute = coordinate_connection(second, "second")
+    results = await asyncio.gather(
+        first.SaveTurn(session_id, answer_turn("turn-1")),
+        second.SaveTurn(session_id, answer_turn("turn-2")),
+        return_exceptions=True,
+    )
+    monkeypatch.setattr(first._connection, "execute", first_execute)
+    monkeypatch.setattr(second._connection, "execute", second_execute)
+
+    assert results == ["turn-1", "turn-2"]
+    session = await first.GetSession(session_id)
+    assert {turn["id"] for turn in session["turns"]} == {"turn-1", "turn-2"}
+    await first.Close()
+    await second.Close()

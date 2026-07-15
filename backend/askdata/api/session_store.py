@@ -110,7 +110,7 @@ class SessionStore:
             connection = self._require_connection()
             timestamp = _utc_now()
             try:
-                await connection.execute("BEGIN")
+                await connection.execute("BEGIN IMMEDIATE")
                 await connection.execute(
                     """
                     INSERT INTO sessions (id, database_id, title, created_at, updated_at)
@@ -179,7 +179,7 @@ class SessionStore:
         async with self._connection_lock:
             connection = self._require_connection()
             try:
-                await connection.execute("BEGIN")
+                await connection.execute("BEGIN IMMEDIATE")
                 cursor = await connection.execute(
                     "DELETE FROM sessions WHERE id = ?", (session_id,)
                 )
@@ -201,7 +201,7 @@ class SessionStore:
             if question is None or not response_kind:
                 raise ValueError("turn must contain question and response_kind")
             try:
-                await connection.execute("BEGIN")
+                await connection.execute("BEGIN IMMEDIATE")
                 session_cursor = await connection.execute(
                     "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
                 )
@@ -266,7 +266,7 @@ class SessionStore:
             connection = self._require_connection()
             timestamp = _utc_now()
             try:
-                await connection.execute("BEGIN")
+                await connection.execute("BEGIN IMMEDIATE")
                 turn_cursor = await connection.execute(
                     "SELECT 1 FROM turns WHERE id = ?", (turn_id,)
                 )
@@ -308,7 +308,7 @@ class SessionStore:
             connection = self._require_connection()
             resolved_at = _utc_now()
             try:
-                await connection.execute("BEGIN")
+                await connection.execute("BEGIN IMMEDIATE")
                 cursor = await connection.execute(
                     """
                     UPDATE clarifications
