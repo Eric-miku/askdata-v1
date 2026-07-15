@@ -269,6 +269,50 @@ def test_query_failure_sanitizes_public_response_and_persisted_turn(
     assert "database password leaked" in caplog.text
 
 
+def test_query_sanitizes_returned_agent_error_and_discards_sensitive_fields(
+    api, monkeypatch
+):
+    client, _, _ = api
+    secret = "returned-agent-secret-7391"
+
+    class ErrorGraph:
+        async def ARun(self, **kwargs):
+            return {
+                "answer": f"unsafe answer {secret}",
+                "sql": f"SELECT '{secret}'",
+                "columns": ["secret"],
+                "rows": [{"secret": secret}],
+                "chart": {"title": secret},
+                "trace": [{"message": secret}],
+                "error": {"detail": secret},
+            }
+
+    monkeypatch.setattr(routes, "AgentGraph", ErrorGraph)
+
+    response = client.post(
+        "/api/query", json={"question": "Return safely", "database_id": "demo"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert secret not in json.dumps(body)
+    assert body["answer"] == "查询失败，请稍后重试或换一种问法。"
+    assert body["sql"] is None
+    assert body["columns"] == []
+    assert body["rows"] == []
+    assert body["chart"] is None
+    assert body["error"] == "query_failed"
+    session_id = client.get("/api/sessions").json()[0]["id"]
+    turn = client.get(f"/api/sessions/{session_id}").json()["turns"][0]
+    assert secret not in json.dumps(turn)
+    assert turn["answer"] == body["answer"]
+    assert turn["sql"] is None
+    assert turn["result_preview"] == []
+    assert turn["chart"] is None
+    assert turn["error"] == "query_failed"
+    assert turn["trace"] == body["trace"]
+
+
 def test_query_normalizes_non_json_graph_values_for_response_and_history(api, monkeypatch):
     client, _, _ = api
     item_id = UUID("12345678-1234-5678-1234-567812345678")
@@ -355,6 +399,11 @@ def test_concurrent_queries_for_one_session_serialize_and_share_context(api, mon
         )
         try:
             assert not second_entered.wait(timeout=0.1)
+            manager = client.app.state.session_lock_manager
+            assert list(manager._entries) == [session_id]
+            entry = manager._entries[session_id]
+            assert entry["refs"] == 2
+            assert entry["lock"].locked()
         finally:
             release_first.set()
         assert first.result(timeout=2).status_code == 200
@@ -367,6 +416,7 @@ def test_concurrent_queries_for_one_session_serialize_and_share_context(api, mon
             {"last_question": "First", "last_sql": "SELECT 'First'"},
         ),
     ]
+    assert client.app.state.session_lock_manager._entries == {}
 
 
 def test_delete_waits_for_in_flight_query_then_deletes_session(api, monkeypatch):
@@ -407,3 +457,32 @@ def test_delete_waits_for_in_flight_query_then_deletes_session(api, monkeypatch)
         assert delete.result(timeout=2).status_code == 200
 
     assert client.get(f"/api/sessions/{session_id}").status_code == 404
+    assert client.app.state.session_lock_manager._entries == {}
+
+
+def test_missing_delete_releases_lock_registry_entry(api):
+    client, _, _ = api
+
+    response = client.delete("/api/sessions/arbitrary-missing-id")
+
+    assert response.status_code == 404
+    assert client.app.state.session_lock_manager._entries == {}
+
+
+def test_missing_session_replacement_query_releases_all_lock_entries(api):
+    client, _, _ = api
+
+    response = client.post(
+        "/api/query",
+        json={
+            "question": "Replace missing",
+            "database_id": "demo",
+            "session_id": "arbitrary-missing-id",
+        },
+    )
+
+    assert response.status_code == 200
+    assert client.app.state.session_lock_manager._entries == {}
+    sessions = client.get("/api/sessions").json()
+    assert len(sessions) == 1
+    assert sessions[0]["id"] != "arbitrary-missing-id"

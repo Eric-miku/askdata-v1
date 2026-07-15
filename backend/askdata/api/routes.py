@@ -21,6 +21,7 @@ import glob
 import logging
 import sqlite3
 import uuid
+from contextlib import asynccontextmanager
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum
@@ -73,18 +74,71 @@ def _JsonSafe(value: Any) -> Any:
     )
 
 
-async def _SessionLock(request: Request, session_id: str) -> asyncio.Lock:
-    registry = getattr(request.app.state, "session_lock_registry", None)
-    if registry is None:
-        registry = {"guard": asyncio.Lock(), "locks": {}}
-        request.app.state.session_lock_registry = registry
+class _SessionLockManager:
+    def __init__(self) -> None:
+        self._guard = asyncio.Lock()
+        self._entries: dict[str, dict[str, Any]] = {}
 
-    async with registry["guard"]:
-        lock = registry["locks"].get(session_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            registry["locks"][session_id] = lock
-        return lock
+    @asynccontextmanager
+    async def Hold(self, session_id: str):
+        async with self._guard:
+            entry = self._entries.get(session_id)
+            if entry is None:
+                entry = {"lock": asyncio.Lock(), "refs": 0}
+                self._entries[session_id] = entry
+            entry["refs"] += 1
+
+        acquired = False
+        try:
+            await entry["lock"].acquire()
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                entry["lock"].release()
+            async with self._guard:
+                entry["refs"] -= 1
+                if entry["refs"] == 0 and self._entries.get(session_id) is entry:
+                    del self._entries[session_id]
+
+
+def _SessionLocks(request: Request) -> _SessionLockManager:
+    manager = getattr(request.app.state, "session_lock_manager", None)
+    if manager is None:
+        manager = _SessionLockManager()
+        request.app.state.session_lock_manager = manager
+    return manager
+
+
+@asynccontextmanager
+async def _LockedSession(
+    request: Request,
+    store: SessionStore,
+    session_id: str,
+    database_id: str,
+    trace: TraceLogger,
+):
+    while True:
+        async with _SessionLocks(request).Hold(session_id):
+            session = await store.GetSession(session_id)
+            if session is not None and session["database_id"] == database_id:
+                yield session_id, session
+                return
+        trace.log("会话未找到，创建新会话", f"session_id={session_id}")
+        session_id = await store.CreateSession(database_id)
+
+
+def _SafeQueryError(trace: TraceLogger) -> QueryResponse:
+    trace.log("查询失败", _PUBLIC_QUERY_ERROR)
+    return QueryResponse(
+        answer="查询失败，请稍后重试或换一种问法。",
+        sql=None,
+        columns=[],
+        rows=[],
+        chart=None,
+        trace=_JsonSafe(trace.get_logs()),
+        error=_PUBLIC_QUERY_ERROR,
+    )
 
 
 def _CountTables(db_path: str) -> int:
@@ -317,8 +371,7 @@ async def delete_session(session_id: str, request: Request):
     trace = TraceLogger()
     trace.log("删除会话", f"session_id={session_id}")
 
-    lock = await _SessionLock(request, session_id)
-    async with lock:
+    async with _SessionLocks(request).Hold(session_id):
         success = await _Store(request).DeleteSession(session_id)
     if not success:
         trace.log("会话未找到", f"session_id={session_id}")
@@ -375,21 +428,9 @@ async def execute_query(query_request: QueryRequest, request: Request):
         session_id = await store.CreateSession(query_request.database_id)
         trace.log("创建新会话", f"session_id={session_id}")
 
-    while True:
-        lock = await _SessionLock(request, session_id)
-        await lock.acquire()
-        try:
-            session = await store.GetSession(session_id)
-        except BaseException:
-            lock.release()
-            raise
-        if session is not None and session["database_id"] == query_request.database_id:
-            break
-        lock.release()
-        trace.log("会话未找到，创建新会话", f"session_id={session_id}")
-        session_id = await store.CreateSession(query_request.database_id)
-
-    try:
+    async with _LockedSession(
+        request, store, session_id, query_request.database_id, trace
+    ) as (session_id, session):
         history = session["turns"] if session else []
         session_context = {}
         if history:
@@ -407,27 +448,21 @@ async def execute_query(query_request: QueryRequest, request: Request):
                     session_context=session_context,
                 )
             )
-            response = QueryResponse(
-                answer=result["answer"],
-                sql=result.get("sql"),
-                columns=result.get("columns"),
-                rows=result.get("rows"),
-                chart=result.get("chart"),
-                trace=result.get("trace", []),
-                error=_PUBLIC_QUERY_ERROR if result.get("error") else None,
-            )
+            if result.get("error"):
+                response = _SafeQueryError(trace)
+            else:
+                response = QueryResponse(
+                    answer=result["answer"],
+                    sql=result.get("sql"),
+                    columns=result.get("columns"),
+                    rows=result.get("rows"),
+                    chart=result.get("chart"),
+                    trace=result.get("trace", []),
+                    error=None,
+                )
         except Exception:
             logger.exception("Query execution failed")
-            trace.log("查询失败", _PUBLIC_QUERY_ERROR)
-            response = QueryResponse(
-                answer="查询失败，请稍后重试或换一种问法。",
-                sql=None,
-                columns=[],
-                rows=[],
-                chart=None,
-                trace=_JsonSafe(trace.get_logs()),
-                error=_PUBLIC_QUERY_ERROR,
-            )
+            response = _SafeQueryError(trace)
 
         # ---------- 保存会话历史 ----------
         await store.SaveTurn(
@@ -444,8 +479,6 @@ async def execute_query(query_request: QueryRequest, request: Request):
                 "trace": _JsonSafe(response.trace),
             },
         )
-    finally:
-        lock.release()
 
     trace.log("查询完成")
     return response
