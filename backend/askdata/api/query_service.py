@@ -29,6 +29,18 @@ logger = logging.getLogger(__name__)
 _QUERY_FAILED_MESSAGE = "查询失败，请稍后重试或换一种问法。"
 _QUERY_FAILED_SUGGESTIONS = ["重试", "换一种问法"]
 _TRACE_STATUSES = {"started", "success", "retry", "warning", "error"}
+_ROW_PREVIEW_LIMIT = 100
+_TRACE_EVENT_LIMIT = 50
+_TRACE_MESSAGE_LIMIT = 300
+_OPERATIONAL_TRACE_MESSAGES = {
+    "RetrieveSchema": "已匹配数据库结构",
+    "GenerateSql": "已生成查询语句",
+    "ValidateSql": "正在校验查询语句",
+    "ExecuteSql": "已执行查询",
+    "RepairSql": "已修复查询语句",
+    "ReviewAnswerShape": "已检查回答结构",
+    "AnalyzeResult": "已生成查询结果",
+}
 
 
 class QueryClarificationUnsupported(ValueError):
@@ -155,22 +167,28 @@ class QueryService:
                 session_context=context,
             )
             normalized = _JsonSafe(result)
-            if not isinstance(normalized, Mapping) or normalized.get("error"):
+            if not isinstance(normalized, Mapping):
                 response = self._QueryFailed(session_id, turn_id)
-            elif not normalized.get("sql"):
-                response = self._NoTrustworthySql(session_id, turn_id)
+            elif "error" in normalized and normalized["error"] is not None:
+                response = self._QueryFailed(session_id, turn_id)
             else:
-                response = AnswerResponse(
-                    session_id=session_id,
-                    turn_id=turn_id,
-                    answer=str(normalized.get("answer", "")),
-                    sql=str(normalized["sql"]),
-                    columns=normalized.get("columns") or [],
-                    rows=normalized.get("rows") or [],
-                    chart=normalized.get("chart"),
-                    confidence="medium",
-                    trace=self._NormalizeTrace(normalized.get("trace")),
-                )
+                sql = normalized.get("sql")
+                if not isinstance(sql, str) or not sql.strip():
+                    response = self._NoTrustworthySql(session_id, turn_id)
+                else:
+                    rows = normalized.get("rows")
+                    bounded_rows = rows[:_ROW_PREVIEW_LIMIT] if isinstance(rows, list) else []
+                    response = AnswerResponse(
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        answer=str(normalized.get("answer", "")),
+                        sql=sql.strip(),
+                        columns=normalized.get("columns") or [],
+                        rows=bounded_rows,
+                        chart=normalized.get("chart"),
+                        confidence="medium",
+                        trace=self._NormalizeTrace(normalized.get("trace")),
+                    )
         except Exception:
             logger.exception("Query execution failed")
             response = self._QueryFailed(session_id, turn_id)
@@ -183,27 +201,26 @@ class QueryService:
 
     @staticmethod
     def _NormalizeTrace(value: Any) -> list[TraceEvent]:
-        if value is None:
-            return []
         items = value if isinstance(value, list) else [value]
+        curated = []
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            step = str(item.get("step") or "")
+            message = _OPERATIONAL_TRACE_MESSAGES.get(step)
+            if message is None:
+                continue
+            candidate_status = str(item.get("status") or "success")
+            status = candidate_status if candidate_status in _TRACE_STATUSES else "warning"
+            curated.append((step, status, message[:_TRACE_MESSAGE_LIMIT]))
+            if len(curated) == _TRACE_EVENT_LIMIT:
+                break
+
+        if not curated:
+            curated = [("QueryComplete", "success", "查询完成")]
+
         events = []
-        for sequence, item in enumerate(items, start=1):
-            if isinstance(item, str):
-                step = "agent"
-                status = "success"
-                message = item
-            elif isinstance(item, Mapping):
-                step = str(item.get("step") or "agent")
-                candidate_status = str(item.get("status") or "success")
-                status = candidate_status if candidate_status in _TRACE_STATUSES else "warning"
-                raw_message = item.get("message")
-                if raw_message is None:
-                    raw_message = json.dumps(item, sort_keys=True, ensure_ascii=False)
-                message = str(raw_message)
-            else:
-                step = "agent"
-                status = "success"
-                message = str(item)
+        for sequence, (step, status, message) in enumerate(curated, start=1):
             events.append(
                 TraceEvent(
                     step=step,

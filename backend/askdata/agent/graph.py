@@ -1,5 +1,7 @@
 """AgentGraph — minimal NL2SQL orchestration chain. Delegates to ReActSqlAgent or falls back to a one-shot SQL pipeline with repair."""
 
+import asyncio
+
 from askdata.agent.prompts import BuildRepairPrompt, BuildSqlPrompt
 from askdata.agent.react_sql_agent import ReActSqlAgent
 from askdata.core.llm import LLMClient
@@ -68,7 +70,12 @@ class AgentGraph:
         }
 
     async def ARun(self, question: str, database_id: str, session_context: dict | None = None) -> dict:
-        return self.Run(question=question, database_id=database_id, session_context=session_context)
+        return await asyncio.to_thread(
+            self.Run,
+            question=question,
+            database_id=database_id,
+            session_context=session_context,
+        )
 
     def _ExecuteWithRepair(self, question: str, sql: str, schema_prompt: str, database_path: str, trace: list[dict]) -> dict:
         current_sql = sql

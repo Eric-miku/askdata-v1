@@ -72,8 +72,9 @@ async def test_success_maps_legacy_result_to_answer_and_persists(tmp_path):
     assert response.rows == [{"count": 3}]
     assert response.chart is None
     assert response.confidence == "medium"
-    assert [event.sequence for event in response.trace] == [1, 2]
-    assert response.trace[0].message == "开始查询"
+    assert [event.sequence for event in response.trace] == [1]
+    assert response.trace[0].step == "ExecuteSql"
+    assert response.trace[0].message == "已执行查询"
     session = await store.GetSession(response.session_id)
     assert session["turns"][0]["id"] == response.turn_id
     assert session["turns"][0]["response_kind"] == "answer"
@@ -188,6 +189,116 @@ async def test_nominal_success_without_sql_returns_safe_no_trustworthy_sql(tmp_p
     turn = (await store.GetSession(response.session_id))["turns"][0]
     assert turn["response_kind"] == "error"
     assert turn["error"]["code"] == "no_trustworthy_sql"
+    await store.Close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_value", ["", {}, False, 0, []])
+async def test_present_non_none_error_is_failure_even_when_falsey(tmp_path, error_value):
+    store = await initialized_store(tmp_path)
+    graph = RecordingGraph(successful_result(error=error_value))
+    service = QueryService(store, graph_factory=lambda: graph)
+
+    response = await service.Run(QueryRequest(database_id="demo", question="error"))
+
+    assert isinstance(response, ErrorResponse)
+    assert response.code == "query_failed"
+    assert (await store.GetSession(response.session_id))["turns"][0]["response_kind"] == "error"
+    await store.Close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sql", [None, 123, False, "", "   ", "\n\t"])
+async def test_missing_non_string_or_blank_sql_is_not_trustworthy(tmp_path, sql):
+    store = await initialized_store(tmp_path)
+    graph = RecordingGraph(successful_result(sql=sql))
+    service = QueryService(store, graph_factory=lambda: graph)
+
+    response = await service.Run(QueryRequest(database_id="demo", question="bad sql"))
+
+    assert isinstance(response, ErrorResponse)
+    assert response.code == "no_trustworthy_sql"
+    await store.Close()
+
+
+@pytest.mark.asyncio
+async def test_sql_is_stripped_before_response_and_storage(tmp_path):
+    store = await initialized_store(tmp_path)
+    graph = RecordingGraph(successful_result(sql="  SELECT 1  "))
+    service = QueryService(store, graph_factory=lambda: graph)
+
+    response = await service.Run(QueryRequest(database_id="demo", question="strip"))
+
+    assert response.sql == "SELECT 1"
+    assert (await store.GetSession(response.session_id))["turns"][0]["sql"] == "SELECT 1"
+    await store.Close()
+
+
+@pytest.mark.asyncio
+async def test_rows_and_operational_trace_are_bounded_with_storage_parity(tmp_path):
+    secret = "trace-secret-7391"
+    trace = [
+        {
+            "step": "ExecuteSql",
+            "status": "success",
+            "message": secret * 100,
+        }
+        for _ in range(60)
+    ]
+    store = await initialized_store(tmp_path)
+    graph = RecordingGraph(
+        successful_result(rows=[{"id": index} for index in range(150)], trace=trace)
+    )
+    service = QueryService(store, graph_factory=lambda: graph)
+
+    response = await service.Run(QueryRequest(database_id="demo", question="bounded"))
+
+    assert len(response.rows) == 100
+    assert len(response.trace) == 50
+    assert all(len(event.message) <= 300 for event in response.trace)
+    assert secret not in json.dumps(response.model_dump(mode="json"))
+    turn = (await store.GetSession(response.session_id))["turns"][0]
+    assert turn["result_preview"] == response.rows
+    assert turn["trace"] == [event.model_dump(mode="json") for event in response.trace]
+    await store.Close()
+
+
+@pytest.mark.asyncio
+async def test_trace_exposes_only_curated_operational_events(tmp_path):
+    secret = "operational-secret-7391"
+    graph = RecordingGraph(
+        successful_result(
+            trace=[
+                f"Reason-1 {secret}",
+                {"step": "Reason-2", "status": "success", "message": secret},
+                {
+                    "step": "GenerateSql",
+                    "status": "success",
+                    "message": f"SELECT '{secret}'",
+                    "unknown": secret,
+                },
+                {
+                    "step": "ValidateSql",
+                    "status": "retry",
+                    "message": f"database error {secret}",
+                },
+                {"step": "Unknown", "status": "error", "message": secret},
+            ]
+        )
+    )
+    store = await initialized_store(tmp_path)
+    service = QueryService(store, graph_factory=lambda: graph)
+
+    response = await service.Run(QueryRequest(database_id="demo", question="trace"))
+
+    assert [(event.step, event.status, event.message) for event in response.trace] == [
+        ("GenerateSql", "success", "已生成查询语句"),
+        ("ValidateSql", "retry", "正在校验查询语句"),
+    ]
+    assert secret not in json.dumps(response.model_dump(mode="json"), ensure_ascii=False)
+    turn = (await store.GetSession(response.session_id))["turns"][0]
+    assert turn["trace"] == [event.model_dump(mode="json") for event in response.trace]
+    assert secret not in json.dumps(turn, ensure_ascii=False)
     await store.Close()
 
 
@@ -317,7 +428,8 @@ async def test_rich_values_normalize_deterministically_for_response_and_storage(
     assert response.chart.title == "/wA="
     assert response.chart.value_labels == {"amount": "12.50"}
     assert turn["chart"] == response.chart.model_dump(mode="json")
-    assert response.trace[0].message == "2026-07-15T10:30:00+00:00"
+    assert response.trace[0].step == "QueryComplete"
+    assert response.trace[0].message == "查询完成"
     assert turn["trace"] == [response.trace[0].model_dump(mode="json")]
     await store.Close()
 

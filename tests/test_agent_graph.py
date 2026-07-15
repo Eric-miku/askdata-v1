@@ -1,7 +1,11 @@
+import asyncio
 from pathlib import Path
 import json
 import sqlite3
 import sys
+import threading
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
@@ -100,3 +104,34 @@ def test_agent_graph_can_delegate_sql_work_to_react_agent(tmp_path):
     assert result["answer"] == "共有 3 条。"
     assert result["sql"] == "SELECT COUNT(id) AS count FROM items"
     assert [step["step"] for step in result["trace"]] == ["RetrieveSchema", "Reason-1"]
+
+
+@pytest.mark.asyncio
+async def test_agent_graph_arun_does_not_block_event_loop():
+    graph = object.__new__(AgentGraph)
+    run_entered = threading.Event()
+    release_run = threading.Event()
+    heartbeat_ran = threading.Event()
+
+    def blocking_run(**kwargs):
+        run_entered.set()
+        release_run.wait(timeout=3)
+        return {"answer": "done"}
+
+    graph.Run = blocking_run
+
+    def coordinate_release():
+        assert run_entered.wait(timeout=2)
+        observed_heartbeat = heartbeat_ran.wait(timeout=2)
+        release_run.set()
+        return observed_heartbeat
+
+    coordinator = asyncio.create_task(asyncio.to_thread(coordinate_release))
+    await asyncio.sleep(0)
+    result_task = asyncio.create_task(graph.ARun("question", "demo"))
+    asyncio.get_running_loop().call_soon(heartbeat_ran.set)
+
+    result = await result_task
+
+    assert result == {"answer": "done"}
+    assert await coordinator is True

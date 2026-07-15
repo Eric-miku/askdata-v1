@@ -1,4 +1,4 @@
-"""Lightweight SQLite executor — validates with SQLValidator, preserves model's LIMIT, adds safety cap only when missing."""
+"""Lightweight read-only SQLite executor with a bounded result preview."""
 
 import re
 import sqlite3
@@ -9,15 +9,15 @@ from askdata.db.validator import SQLValidator
 
 _validator = SQLValidator(dialect="sqlite")
 _select_only = re.compile(r"^\s*(SELECT|WITH|UNION)\b", re.I)
-_has_limit = re.compile(r"\blimit\b", re.I)
-_safety_cap = 100
+_PREVIEW_ROW_LIMIT = 100
 
 
 def Execute(sql: str, database_path: str) -> dict:
     """Validate and execute a SELECT query against a SQLite database.
 
-    Preserves the model's explicit LIMIT. Adds a safety cap only when no LIMIT is present.
-    Returns {"success": True, "sql": <executed_sql>, "columns": [...], "rows": [...]}
+    Preserves the model's SQL and bounds the returned preview without rewriting LIMIT.
+    Returns {"success": True, "sql": <executed_sql>, "columns": [...],
+    "rows": [...], "truncated": bool}
     or {"success": False, "sql": <attempted_sql>, "error": "..."}.
     """
     cleaned = (sql or "").strip().rstrip(";")
@@ -32,9 +32,6 @@ def Execute(sql: str, database_path: str) -> dict:
     if not _select_only.search(normalized):
         return {"success": False, "sql": normalized, "error": "Only SELECT / WITH / UNION queries are allowed"}
 
-    if not _has_limit.search(normalized):
-        normalized = f"{normalized.rstrip(';').strip()} LIMIT {_safety_cap}"
-
     path = Path(database_path).expanduser().resolve()
     if not path.is_file():
         return {"success": False, "sql": normalized, "error": f"SQLite database does not exist: {path}"}
@@ -45,8 +42,15 @@ def Execute(sql: str, database_path: str) -> dict:
             connection.row_factory = sqlite3.Row
             cursor = connection.execute(normalized)
             columns = [item[0] for item in cursor.description or []]
-            rows = [dict(row) for row in cursor.fetchall()]
-            return {"success": True, "sql": normalized, "columns": columns, "rows": rows}
+            preview = cursor.fetchmany(_PREVIEW_ROW_LIMIT + 1)
+            rows = [dict(row) for row in preview[:_PREVIEW_ROW_LIMIT]]
+            return {
+                "success": True,
+                "sql": normalized,
+                "columns": columns,
+                "rows": rows,
+                "truncated": len(preview) > _PREVIEW_ROW_LIMIT,
+            }
         finally:
             connection.close()
     except Exception as exc:

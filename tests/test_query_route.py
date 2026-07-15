@@ -214,7 +214,7 @@ def test_query_uses_persisted_context_and_saves_turns(api):
         {
             "step": "RetrieveSchema",
             "status": "success",
-            "message": "Schema matched.",
+            "message": "已匹配数据库结构",
             "sequence": 1,
         }
     ]
@@ -375,9 +375,9 @@ def test_query_normalizes_non_json_graph_values_for_response_and_history(api):
     assert turn["chart"] is None
     assert turn["trace"] == [
         {
-            "step": "agent",
+            "step": "QueryComplete",
             "status": "success",
-            "message": '{"at": "2026-07-15T10:30:00+00:00"}',
+            "message": "查询完成",
             "sequence": 1,
         }
     ]
