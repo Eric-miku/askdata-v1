@@ -213,12 +213,22 @@ class HybridRetriever:
 class HybridSchemaIndex:
     """Compatibility adapter retaining ``BirdSchemaIndex.Retrieve``'s mapping."""
 
-    def __init__(self, lexical, hybrid: HybridRetriever) -> None:
+    def __init__(
+        self,
+        lexical,
+        hybrid: HybridRetriever | None = None,
+        fallback_warning: dict[str, str] | None = None,
+    ) -> None:
         self.lexical = lexical
         self.hybrid = hybrid
+        self.fallback_warning = dict(fallback_warning or {})
 
     def Retrieve(self, database_id: str, question: str):
         context = self.lexical.Retrieve(database_id, question)
+        if self.hybrid is None:
+            if self.fallback_warning:
+                context["retrieval_trace"] = [dict(self.fallback_warning)]
+            return context
         result = self.hybrid.Retrieve(database_id, question)
         context["schema_prompt"] = result.prompt
         context["retrieval_trace"] = [

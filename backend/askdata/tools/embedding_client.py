@@ -39,7 +39,11 @@ class EmbeddingClient:
             return []
         response = self.api.create(model=self.model, input=inputs)
         returned_model = getattr(response, "model", None)
-        if returned_model and returned_model != self.model:
+        if not isinstance(returned_model, str) or not returned_model.strip():
+            raise EmbeddingConfigurationError(
+                "Embedding response must declare model provenance"
+            )
+        if returned_model != self.model:
             raise EmbeddingConfigurationError(
                 f"Embedding model mismatch: expected {self.model}, got {returned_model}"
             )
@@ -49,7 +53,11 @@ class EmbeddingClient:
                 f"Embedding service returned {len(items)} vectors for {len(inputs)} texts"
             )
 
-        indices = [getattr(item, "index", index) for index, item in enumerate(items)]
+        if not all(hasattr(item, "index") for item in items):
+            raise EmbeddingConfigurationError(
+                "Every embedding item must provide an explicit index"
+            )
+        indices = [item.index for item in items]
         if (
             not all(isinstance(index, int) and not isinstance(index, bool) for index in indices)
             or sorted(indices) != list(range(len(inputs)))
@@ -68,3 +76,7 @@ class EmbeddingClient:
                 raise EmbeddingConfigurationError("Embedding vector contains a non-finite value")
             vectors.append([float(value) for value in vector])
         return vectors
+
+    def Validate(self) -> list[float]:
+        """Validate service model, dimension, and response shape with one probe."""
+        return self.Embed(["AskData schema retrieval validation"])[0]

@@ -232,6 +232,46 @@ def test_schema_index_exposes_ranked_lexical_candidates_and_canonical_chunks(tmp
     assert "students.school_id -> schools.id" in backbone
 
 
+def test_schema_chunks_attribute_foreign_keys_and_join_neighbors():
+    chunks = BirdSchemaIndex().Build([sample_database()]).BuildChunks("demo")
+    students = next(
+        chunk for chunk in chunks
+        if chunk.source_type == "schema"
+        and chunk.table_name == "students"
+        and chunk.column_name is None
+    )
+
+    assert "students.school_id -> schools.id" in students.text
+    assert "schools" in students.join_neighbors
+    assert "students.school_id -> schools.id" in students.foreign_keys
+
+
+def test_instruction_chunks_separate_value_mappings_from_business_evidence(tmp_path):
+    instructions = tmp_path / "instructions"
+    instructions.mkdir()
+    (instructions / "demo.md").write_text(
+        "## Business Term Mappings\n"
+        "- SSS = State Special School\n"
+        "- enrollment means count of students\n"
+        "- pupils is an alias for students\n"
+        "## JOIN Patterns\n"
+        "- students.school_id = schools.id\n",
+        encoding="utf-8",
+    )
+
+    chunks = BirdSchemaIndex(instructions_dir=instructions).Build(
+        [sample_database()]
+    ).BuildChunks("demo")
+    by_text = {chunk.text: chunk for chunk in chunks}
+
+    assert by_text["SSS = State Special School"].source_type == "value"
+    assert by_text["enrollment means count of students"].source_type == "evidence"
+    assert by_text["pupils is an alias for students"].source_type == "evidence"
+    join = by_text["JOIN pattern: students.school_id = schools.id"]
+    assert join.source_type == "evidence"
+    assert set(join.join_neighbors) == {"students", "schools"}
+
+
 def test_canonical_value_chunks_bound_and_attribute_profiled_values():
     database = sample_database()
     database["tables"][0]["columns"][1]["sample_values"] = [
@@ -244,3 +284,91 @@ def test_canonical_value_chunks_bound_and_attribute_profiled_values():
     assert len(values) == 20
     assert all(chunk.table_name == "schools" for chunk in values)
     assert all(chunk.column_name == "school_name" for chunk in values)
+
+
+def test_vector_startup_failure_is_cached_and_returns_safe_fallback(
+    tmp_path, monkeypatch
+):
+    processed = tmp_path / "processed"
+    schemas = processed / "schemas"
+    schemas.mkdir(parents=True)
+    database_path = tmp_path / "demo.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE items(id INTEGER PRIMARY KEY)")
+    (schemas / "demo.json").write_text(json.dumps({
+        "database_id": "demo",
+        "database_path": str(database_path),
+        "tables": [{"table_name": "items", "columns": [{
+            "column_name": "id", "data_type": "integer", "is_primary_key": True,
+        }]}],
+        "foreign_keys": [],
+    }), encoding="utf-8")
+    (processed / "databases.json").write_text(json.dumps([{
+        "database_id": "demo", "database_path": str(database_path),
+        "schema_path": str(schemas / "demo.json"),
+    }]), encoding="utf-8")
+
+    from askdata.core.config import settings
+    from askdata.tools import embedding_client, vector_store
+    from askdata.tools.retriever import _ResetVectorValidationFailuresForTests
+
+    calls = {"embed": 0, "search": 0}
+
+    class Embedding:
+        def __init__(self, **kwargs):
+            pass
+
+        def Validate(self):
+            calls["embed"] += 1
+            return [0.1, 0.2]
+
+    class Store:
+        def __init__(self, *args):
+            pass
+
+        def Search(self, database_id, vectors, top_k):
+            calls["search"] += 1
+            raise RuntimeError("secret remote failure")
+
+    monkeypatch.setattr(settings, "VECTOR_RETRIEVAL_ENABLED", True)
+    monkeypatch.setattr(settings, "EMBEDDING_API_URL", "http://embedding.test/v1")
+    monkeypatch.setattr(settings, "MILVUS_URI", "http://milvus.test")
+    monkeypatch.setattr(embedding_client, "EmbeddingClient", Embedding)
+    monkeypatch.setattr(vector_store, "MilvusVectorStore", Store)
+    _ResetVectorValidationFailuresForTests()
+
+    first = SemanticRetriever(processed_dir=processed).Build().index.Retrieve("demo", "items")
+    second = SemanticRetriever(processed_dir=processed).Build().index.Retrieve("demo", "items")
+
+    assert calls == {"embed": 1, "search": 1}
+    assert first["schema_prompt"].startswith("Database: demo")
+    assert first["retrieval_trace"] == second["retrieval_trace"]
+    assert first["retrieval_trace"] == [{
+        "status": "warning",
+        "message": "Semantic retrieval is unavailable; lexical schema retrieval was used.",
+    }]
+    assert "secret" not in str(first)
+
+
+def test_disabled_vector_configuration_makes_no_validation_call(tmp_path, monkeypatch):
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    database_path = tmp_path / "demo.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE items(id INTEGER)")
+    (processed / "databases.json").write_text(json.dumps([{
+        "databaseId": "demo", "databasePath": str(database_path),
+        "tables": [{"tableName": "items", "columns": []}], "foreignKeys": [],
+    }]), encoding="utf-8")
+
+    from askdata.core.config import settings
+    from askdata.tools import embedding_client
+
+    monkeypatch.setattr(settings, "VECTOR_RETRIEVAL_ENABLED", False)
+    monkeypatch.setattr(embedding_client, "EmbeddingClient", lambda **kwargs: (_ for _ in ()).throw(
+        AssertionError("disabled vector retrieval must not construct a network client")
+    ))
+
+    prompt = SemanticRetriever(processed_dir=processed).Build().Retrieve("demo", "items")
+
+    assert "Table items" in prompt

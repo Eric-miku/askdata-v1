@@ -19,6 +19,8 @@ class SchemaChunk:
     table_name: str | None = None
     column_name: str | None = None
     source_version: str = SOURCE_VERSION
+    join_neighbors: tuple[str, ...] = ()
+    foreign_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,7 @@ class MilvusVectorStore:
             output_fields=[
                 "chunk_id", "database_id", "source_type", "text",
                 "table_name", "column_name", "source_version",
+                "join_neighbors", "foreign_keys",
             ],
         )
         results: list[RankedChunk] = []
@@ -129,6 +132,8 @@ class MilvusVectorStore:
                     table_name=entity.get("table_name"),
                     column_name=entity.get("column_name"),
                     source_version=str(entity.get("source_version") or SOURCE_VERSION),
+                    join_neighbors=tuple(entity.get("join_neighbors") or ()),
+                    foreign_keys=tuple(entity.get("foreign_keys") or ()),
                 )
                 results.append(RankedChunk(chunk, float(hit.get("distance", 0.0))))
         return results

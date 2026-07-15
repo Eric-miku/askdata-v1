@@ -10,7 +10,7 @@ from askdata.tools.embedding_client import EmbeddingClient, EmbeddingConfigurati
 
 
 class FakeEmbeddingsApi:
-    def __init__(self, data, model=None):
+    def __init__(self, data, model="test-model"):
         self.data = data
         self.model = model
         self.calls = []
@@ -61,4 +61,26 @@ def test_embedding_client_rejects_a_different_returned_model():
     client = EmbeddingClient(api=api, model="configured-model", dimension=2)
 
     with pytest.raises(EmbeddingConfigurationError, match="configured-model"):
+        client.Embed(["schema"])
+
+
+def test_embedding_client_rejects_missing_returned_model():
+    client = EmbeddingClient(
+        api=FakeEmbeddingsApi([item(0, [1.0, 2.0])], model=None),
+        model="test-model",
+        dimension=2,
+    )
+
+    with pytest.raises(EmbeddingConfigurationError, match="must declare model"):
+        client.Embed(["schema"])
+
+
+def test_embedding_client_rejects_missing_explicit_item_index():
+    client = EmbeddingClient(
+        api=FakeEmbeddingsApi([SimpleNamespace(embedding=[1.0, 2.0])]),
+        model="test-model",
+        dimension=2,
+    )
+
+    with pytest.raises(EmbeddingConfigurationError, match="explicit index"):
         client.Embed(["schema"])

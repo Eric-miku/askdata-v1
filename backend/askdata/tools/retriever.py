@@ -11,6 +11,17 @@ from askdata.core.paths import project_path
 from askdata.tools.vector_store import RankedChunk, SchemaChunk
 
 
+_VECTOR_VALIDATION_FAILURES: set[tuple[str, str, int, str, str]] = set()
+_SAFE_VECTOR_WARNING = {
+    "status": "warning",
+    "message": "Semantic retrieval is unavailable; lexical schema retrieval was used.",
+}
+
+
+def _ResetVectorValidationFailuresForTests() -> None:
+    _VECTOR_VALIDATION_FAILURES.clear()
+
+
 def GetValue(item: Any, *names: str, default=None):
     for name in names:
         if isinstance(item, dict) and name in item:
@@ -65,6 +76,23 @@ class BirdSchemaIndex:
         """Build canonical, stable chunks for schema and semantic sources."""
         database = self.GetDatabase(database_id)
         chunks: list[SchemaChunk] = []
+        foreign_keys = GetValue(database, "foreignKeys", "foreign_keys", default=[])
+        table_relationships: dict[str, list[str]] = {}
+        table_neighbors: dict[str, set[str]] = {}
+        column_relationships: dict[tuple[str, str], list[str]] = {}
+        for key in foreign_keys:
+            left_table = GetValue(key, "leftTable", "left_table", "source_table", default="")
+            left_column = GetValue(key, "leftColumn", "left_column", "source_column", default="")
+            right_table = GetValue(key, "rightTable", "right_table", "target_table", default="")
+            right_column = GetValue(key, "rightColumn", "right_column", "target_column", default="")
+            relationship = f"{left_table}.{left_column} -> {right_table}.{right_column}"
+            for table_name, neighbor in ((left_table, right_table), (right_table, left_table)):
+                if table_name:
+                    table_relationships.setdefault(table_name, []).append(relationship)
+                    if neighbor:
+                        table_neighbors.setdefault(table_name, set()).add(neighbor)
+            column_relationships.setdefault((left_table, left_column), []).append(relationship)
+            column_relationships.setdefault((right_table, right_column), []).append(relationship)
         for table in GetValue(database, "tables", default=[]):
             table_name = GetValue(table, "tableName", "table_name", default="")
             table_description = GetValue(table, "description", "display_name", "displayName", default="") or ""
@@ -78,13 +106,19 @@ class BirdSchemaIndex:
                 ) else ""
                 column_text = f"{name} {data_type}{key} {description}".strip()
                 columns.append(column_text)
+                column_fks = tuple(column_relationships.get((table_name, name), []))
                 chunks.append(SchemaChunk(
                     id=f"{database_id}:schema:{table_name}:{name}",
                     database_id=database_id,
                     source_type="schema",
-                    text=f"Column {table_name}.{column_text}",
+                    text=(
+                        f"Column {table_name}.{column_text}"
+                        + (f". Foreign keys: {'; '.join(column_fks)}" if column_fks else "")
+                    ),
                     table_name=table_name,
                     column_name=name,
+                    join_neighbors=tuple(sorted(table_neighbors.get(table_name, set()))),
+                    foreign_keys=column_fks,
                 ))
                 raw_values = GetValue(
                     column,
@@ -109,27 +143,48 @@ class BirdSchemaIndex:
                         table_name=table_name,
                         column_name=name,
                     ))
+            relationships = tuple(table_relationships.get(table_name, []))
+            neighbors = tuple(sorted(table_neighbors.get(table_name, set())))
             text = f"Table {table_name}. {table_description} Columns: {', '.join(columns)}".strip()
+            if relationships:
+                text += f". Foreign keys: {'; '.join(relationships)}"
+            if neighbors:
+                text += f". Join neighbors: {', '.join(neighbors)}"
             chunks.append(SchemaChunk(
                 id=f"{database_id}:schema:{table_name}",
                 database_id=database_id,
                 source_type="schema",
                 text=text,
                 table_name=table_name,
+                join_neighbors=neighbors,
+                foreign_keys=relationships,
             ))
 
-        instructions = self._LoadInstructions(database_id)
-        for line in instructions.splitlines():
-            content = line.strip().lstrip("- ")
-            if not content or content.endswith(":"):
-                continue
+        sections = self._InstructionSections(database_id)
+        for content in sections.get("Business Term Mappings", []):
+            source_type = "value" if self._LooksLikeValueMapping(content) else "evidence"
             digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
             chunks.append(SchemaChunk(
-                id=f"{database_id}:value:{digest}",
-                database_id=database_id,
-                source_type="value",
-                text=content,
+                id=f"{database_id}:{source_type}:{digest}", database_id=database_id,
+                source_type=source_type, text=content,
             ))
+        for content in sections.get("JOIN Patterns", []):
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+            tables = tuple(dict.fromkeys(re.findall(r"([A-Za-z_][\w]*)\.", content)))
+            chunks.append(SchemaChunk(
+                id=f"{database_id}:evidence:join:{digest}", database_id=database_id,
+                source_type="evidence", text=f"JOIN pattern: {content}",
+                join_neighbors=tables,
+            ))
+        for heading, lines in sections.items():
+            if heading in {"Business Term Mappings", "JOIN Patterns"}:
+                continue
+            for content in lines:
+                digest = hashlib.sha256(f"{heading}:{content}".encode("utf-8")).hexdigest()[:16]
+                chunks.append(SchemaChunk(
+                    id=f"{database_id}:evidence:{digest}", database_id=database_id,
+                    source_type="evidence", text=f"{heading}: {content}",
+                ))
 
         for position, item in enumerate(self.questions):
             if GetValue(item, "databaseId", "database_id", default="") != database_id:
@@ -312,6 +367,27 @@ class BirdSchemaIndex:
             parts.append(f"JOIN patterns:\n{joins}")
         return "\n\n".join(parts)
 
+    def _InstructionSections(self, database_id: str) -> dict[str, list[str]]:
+        path = self.instructions_dir / f"{database_id}.md"
+        if not path.exists():
+            return {}
+        sections: dict[str, list[str]] = {}
+        heading = ""
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                heading = stripped[3:].strip()
+                sections.setdefault(heading, [])
+            elif heading and stripped and not stripped.startswith(("#", "```")):
+                sections[heading].append(stripped.lstrip("- "))
+        return sections
+
+    def _LooksLikeValueMapping(self, content: str) -> bool:
+        if re.search(r"=\s*(['\"]).+?\1", content):
+            return True
+        match = re.match(r"\s*([A-Z][A-Z0-9_-]{1,11})\s*=", content)
+        return bool(match)
+
     def _ExtractSection(self, content: str, heading: str) -> str:
         collecting = False
         result = []
@@ -360,17 +436,34 @@ class SemanticRetriever:
             from askdata.tools.hybrid_retriever import HybridRetriever, HybridSchemaIndex
             from askdata.tools.vector_store import MilvusVectorStore
 
-            embedding = EmbeddingClient(
-                base_url=settings.EMBEDDING_API_URL,
-                api_key=settings.EMBEDDING_API_KEY,
-                model=settings.EMBEDDING_MODEL,
-                dimension=settings.EMBEDDING_DIMENSION,
+            key = (
+                settings.EMBEDDING_API_URL, settings.EMBEDDING_MODEL,
+                settings.EMBEDDING_DIMENSION, settings.MILVUS_URI,
+                settings.MILVUS_COLLECTION,
             )
-            vector = MilvusVectorStore(settings.MILVUS_URI, settings.MILVUS_COLLECTION)
-            self.index = HybridSchemaIndex(
-                lexical,
-                HybridRetriever(lexical, vector, embedding),
-            )
+            if key in _VECTOR_VALIDATION_FAILURES:
+                self.index = HybridSchemaIndex(lexical, fallback_warning=_SAFE_VECTOR_WARNING)
+            else:
+                try:
+                    embedding = EmbeddingClient(
+                        base_url=settings.EMBEDDING_API_URL,
+                        api_key=settings.EMBEDDING_API_KEY,
+                        model=settings.EMBEDDING_MODEL,
+                        dimension=settings.EMBEDDING_DIMENSION,
+                    )
+                    probe = embedding.Validate()
+                    vector = MilvusVectorStore(settings.MILVUS_URI, settings.MILVUS_COLLECTION)
+                    vector.Search(GetValue(databases[0], "databaseId", "database_id"), [probe], 1)
+                except Exception:
+                    _VECTOR_VALIDATION_FAILURES.add(key)
+                    self.index = HybridSchemaIndex(
+                        lexical, fallback_warning=_SAFE_VECTOR_WARNING
+                    )
+                else:
+                    self.index = HybridSchemaIndex(
+                        lexical,
+                        HybridRetriever(lexical, vector, embedding),
+                    )
         return self
 
     def Retrieve(self, database_id: str, question: str) -> str:
