@@ -15,7 +15,9 @@ vi.mock("axios", () => ({
 import {
   createSession,
   deleteSession,
+  getSession,
   listDatabases,
+  listSessions,
   queryData,
 } from "./query";
 
@@ -50,6 +52,39 @@ describe("query API", () => {
     await deleteSession("session/with space");
 
     expect(client.delete).toHaveBeenCalledWith(
+      "/sessions/session%2Fwith%20space",
+    );
+  });
+
+  it("lists persisted session summaries", async () => {
+    const sessions = [
+      {
+        id: "session-1",
+        database_id: "demo",
+        title: "First question",
+        created_at: "2026-07-15T10:00:00+00:00",
+        updated_at: "2026-07-15T10:01:00+00:00",
+      },
+    ];
+    client.get.mockResolvedValue({ data: sessions });
+
+    await expect(listSessions()).resolves.toEqual(sessions);
+    expect(client.get).toHaveBeenCalledWith("/sessions");
+  });
+
+  it("gets a restored session using an encoded path", async () => {
+    const session = {
+      id: "session/with space",
+      database_id: "demo",
+      title: "First question",
+      created_at: "2026-07-15T10:00:00+00:00",
+      updated_at: "2026-07-15T10:01:00+00:00",
+      turns: [],
+    };
+    client.get.mockResolvedValue({ data: session });
+
+    await expect(getSession("session/with space")).resolves.toEqual(session);
+    expect(client.get).toHaveBeenCalledWith(
       "/sessions/session%2Fwith%20space",
     );
   });
