@@ -6,6 +6,8 @@ const apiMocks = vi.hoisted(() => ({
   listDatabases: vi.fn(),
   createSession: vi.fn(),
   deleteSession: vi.fn(),
+  listSessions: vi.fn(),
+  getSession: vi.fn(),
   queryData: vi.fn(),
 }));
 
@@ -27,6 +29,8 @@ describe("QueryResultDemo", () => {
       created_at: 1,
     });
     apiMocks.deleteSession.mockReset().mockResolvedValue(undefined);
+    apiMocks.listSessions.mockReset().mockResolvedValue([]);
+    apiMocks.getSession.mockReset();
     apiMocks.queryData.mockReset().mockResolvedValue({
       answer: "Demo 中共有 3 条记录。",
       sql: "SELECT COUNT(id) AS count FROM items",
@@ -43,6 +47,9 @@ describe("QueryResultDemo", () => {
       databases: [],
       databasesLoading: false,
       databaseError: null,
+      sessions: [],
+      sessionsLoading: false,
+      sessionsError: null,
       sessionId: null,
       turns: [],
       loading: false,
@@ -81,5 +88,53 @@ describe("QueryResultDemo", () => {
     expect(screen.getByText("思考过程")).toBeVisible();
     expect(screen.getByRole("columnheader", { name: "count" })).toBeVisible();
     expect(screen.queryByText("图表配置已返回")).not.toBeInTheDocument();
+  });
+
+  it("reopens a persisted conversation from the history rail action", async () => {
+    const user = userEvent.setup();
+    apiMocks.listSessions.mockResolvedValue([
+      {
+        id: "session-history",
+        database_id: "finance",
+        title: "Monthly revenue",
+        created_at: "2026-07-15T10:00:00+00:00",
+        updated_at: "2026-07-15T10:01:00+00:00",
+      },
+    ]);
+    apiMocks.getSession.mockResolvedValue({
+      id: "session-history",
+      database_id: "finance",
+      title: "Monthly revenue",
+      created_at: "2026-07-15T10:00:00+00:00",
+      updated_at: "2026-07-15T10:01:00+00:00",
+      turns: [
+        {
+          id: "turn-history",
+          question: "What was monthly revenue?",
+          response_kind: "answer",
+          answer: "Monthly revenue was 42.",
+          sql: "SELECT 42 AS revenue",
+          result_preview: [{ revenue: 42 }],
+          chart: null,
+          confidence: "high",
+          error: null,
+          trace: [],
+          created_at: "2026-07-15T10:01:00+00:00",
+          clarification: null,
+        },
+      ],
+    });
+    render(<QueryResultDemo theme="dark" onToggleTheme={vi.fn()} />);
+    await screen.findByText("Hi, user.");
+    await waitFor(() => expect(apiMocks.listSessions).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("button", { name: "打开历史记录" }));
+    await user.click(screen.getByRole("option", { name: /Monthly revenue/ }));
+
+    await waitFor(() =>
+      expect(apiMocks.getSession).toHaveBeenCalledWith("session-history"),
+    );
+    expect(await screen.findByText("Monthly revenue was 42.")).toBeVisible();
+    expect(screen.getAllByText("Finance")[0]).toBeVisible();
   });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createQueryStore, type QueryApi } from "./queryStore";
-import type { QueryResponse } from "../types/query";
+import type { QueryResponse, RestoredSession } from "../types/query";
 
 const successfulResponse: QueryResponse = {
   answer: "共有 3 条记录。",
@@ -25,6 +25,8 @@ function createApi(overrides: Partial<QueryApi> = {}): QueryApi {
       created_at: 1,
     }),
     deleteSession: vi.fn().mockResolvedValue(undefined),
+    listSessions: vi.fn().mockResolvedValue([]),
+    getSession: vi.fn(),
     queryData: vi.fn().mockResolvedValue(successfulResponse),
     ...overrides,
   };
@@ -66,7 +68,7 @@ describe("query store", () => {
     ]);
   });
 
-  it("clears the conversation and retires the old session when the database changes", async () => {
+  it("clears the local conversation without deleting persisted history when the database changes", async () => {
     const api = createApi();
     const store = createQueryStore(api);
     await store.getState().loadDatabases();
@@ -74,10 +76,119 @@ describe("query store", () => {
 
     await store.getState().selectDatabase("finance");
 
-    expect(api.deleteSession).toHaveBeenCalledWith("session-1");
+    expect(api.deleteSession).not.toHaveBeenCalled();
     expect(store.getState().database).toBe("finance");
     expect(store.getState().sessionId).toBeNull();
     expect(store.getState().turns).toEqual([]);
+  });
+
+  it("starts a new local conversation without deleting persisted history", async () => {
+    const api = createApi();
+    const store = createQueryStore(api);
+    await store.getState().loadDatabases();
+    await store.getState().sendMessage("第一问");
+
+    await store.getState().newChat();
+
+    expect(api.deleteSession).not.toHaveBeenCalled();
+    expect(store.getState().sessionId).toBeNull();
+    expect(store.getState().turns).toEqual([]);
+  });
+
+  it("loads recent sessions and opens a persisted conversation", async () => {
+    const restoredSession: RestoredSession = {
+      id: "session-history",
+      database_id: "finance",
+      title: "How many?",
+      created_at: "2026-07-15T10:00:00+00:00",
+      updated_at: "2026-07-15T10:01:00+00:00",
+      turns: [
+        {
+          id: "turn-history",
+          question: "How many?",
+          response_kind: "answer",
+          answer: "There are 3 rows.",
+          sql: "SELECT COUNT(*) AS count FROM items",
+          result_preview: [{ count: 3 }],
+          chart: null,
+          confidence: "high",
+          error: null,
+          trace: [
+            {
+              step: "ExecuteSql",
+              status: "success",
+              message: "Query completed.",
+              sequence: 1,
+            },
+          ],
+          created_at: "2026-07-15T10:01:00+00:00",
+          clarification: null,
+        },
+      ],
+    };
+    const sessions = [
+      {
+        id: "session-history",
+        database_id: "finance",
+        title: "How many?",
+        created_at: "2026-07-15T10:00:00+00:00",
+        updated_at: "2026-07-15T10:01:00+00:00",
+      },
+    ];
+    const api = createApi({
+      listSessions: vi.fn().mockResolvedValue(sessions),
+      getSession: vi.fn().mockResolvedValue(restoredSession),
+    });
+    const store = createQueryStore(api);
+
+    await store.getState().loadSessions();
+    await store.getState().openSession("session-history");
+
+    expect(store.getState()).toMatchObject({
+      sessions,
+      sessionsLoading: false,
+      sessionsError: null,
+      sessionId: "session-history",
+      database: "finance",
+    });
+    expect(store.getState().turns[0]).toMatchObject({
+      id: "turn-history",
+      question: "How many?",
+      databaseId: "finance",
+      status: "success",
+      response: {
+        answer: "There are 3 rows.",
+        sql: "SELECT COUNT(*) AS count FROM items",
+        columns: ["count"],
+        rows: [{ count: 3 }],
+      },
+    });
+  });
+
+  it("exposes recent-session loading failures without clearing the active conversation", async () => {
+    const api = createApi({
+      listSessions: vi.fn().mockRejectedValue(new Error("历史记录不可用")),
+    });
+    const store = createQueryStore(api);
+    store.setState({
+      sessionId: "active-session",
+      turns: [
+        {
+          id: "active-turn",
+          question: "Keep me",
+          databaseId: "demo",
+          status: "success",
+          response: successfulResponse,
+        },
+      ],
+    });
+
+    await store.getState().loadSessions();
+
+    expect(store.getState().sessionsLoading).toBe(false);
+    expect(store.getState().sessionsError).toBe("历史记录不可用");
+    expect(store.getState().sessionId).toBe("active-session");
+    expect(store.getState().turns).toHaveLength(1);
   });
 
   it("keeps a failed turn and can retry the original question", async () => {

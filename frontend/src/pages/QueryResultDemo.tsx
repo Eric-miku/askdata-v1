@@ -17,10 +17,16 @@ export function QueryResultDemo({ theme, onToggleTheme }: QueryResultDemoProps) 
     databases,
     databasesLoading,
     databaseError,
+    sessions,
+    sessionsLoading,
+    sessionsError,
+    sessionId,
     turns,
     loading,
     validationError,
     loadDatabases,
+    loadSessions,
+    openSession,
     selectDatabase,
     newChat,
     sendMessage,
@@ -34,7 +40,8 @@ export function QueryResultDemo({ theme, onToggleTheme }: QueryResultDemoProps) 
 
   useEffect(() => {
     void loadDatabases();
-  }, [loadDatabases]);
+    void loadSessions();
+  }, [loadDatabases, loadSessions]);
 
   useEffect(() => {
     if (turns.length) {
@@ -62,7 +69,12 @@ export function QueryResultDemo({ theme, onToggleTheme }: QueryResultDemoProps) 
         loading={loading}
         databasesLoading={databasesLoading}
         databaseError={databaseError}
+        sessions={sessions}
+        activeSessionId={sessionId}
+        sessionsLoading={sessionsLoading}
+        sessionsError={sessionsError}
         onNewChat={() => void newChat()}
+        onOpenSession={(selectedSessionId) => void openSession(selectedSessionId)}
         onSelectDatabase={(databaseId) => void selectDatabase(databaseId)}
         onToggleTheme={onToggleTheme}
       />

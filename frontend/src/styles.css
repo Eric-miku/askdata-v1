@@ -325,6 +325,40 @@ svg {
   font-size: 10px;
 }
 
+.conversation-drawer__item {
+  align-items: flex-start;
+  min-height: 58px;
+}
+
+.conversation-drawer__item > svg {
+  margin-top: 3px;
+}
+
+.conversation-drawer__content {
+  min-width: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.conversation-drawer__content strong,
+.conversation-drawer__content small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-drawer__content strong {
+  color: var(--text-soft);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.conversation-drawer__item.is-selected .conversation-drawer__content strong {
+  color: var(--text);
+}
+
 .database-drawer__footnote {
   margin: auto 7px 0;
   padding-top: 16px;
