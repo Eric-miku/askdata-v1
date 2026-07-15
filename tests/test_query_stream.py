@@ -158,9 +158,9 @@ async def test_stream_converts_unexpected_task_exception_to_one_safe_final(tmp_p
     )
 
     frames = _frames(body)
-    assert [name for name, _ in frames] == ["error"]
-    assert frames[0][1]["kind"] == "error"
-    assert frames[0][1]["code"] == "query_failed"
+    assert [name for name, _ in frames] == ["error", "final"]
+    assert frames[-1][1]["kind"] == "error"
+    assert frames[-1][1]["code"] == "query_failed"
     assert secret not in body
     await store.Close()
 
@@ -369,6 +369,9 @@ async def test_stream_uses_distinct_terminal_event_for_non_answer_response(
 
     frames = _frames(body)
     terminal_frames = [frame for frame in frames if frame[0] != "trace"]
-    assert [name for name, _ in terminal_frames] == [terminal_name]
+    assert [name for name, _ in terminal_frames] == [terminal_name, "final"]
     assert terminal_frames[0][1]["kind"] == response_kind
+    assert terminal_frames[-1][1]["kind"] == response_kind
+    assert frames[-1][0] == "final"
+    assert sum(name == "final" for name, _ in frames) == 1
     await store.Close()

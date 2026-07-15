@@ -217,12 +217,12 @@ class QueryService:
                     if accepting_events.is_set():
                         raise
 
-        def terminal_name(response: QueryResponse) -> str:
+        def lifecycle_name(response: QueryResponse) -> str | None:
             if isinstance(response, ClarificationResponse):
                 return "clarification"
             if isinstance(response, ErrorResponse):
                 return "error"
-            return "final"
+            return None
 
         async def produce() -> None:
             try:
@@ -237,9 +237,11 @@ class QueryService:
             barrier = loop.create_future()
             loop.call_soon(barrier.set_result, None)
             await barrier
-            await queue.put(
-                (terminal_name(response), response.model_dump(mode="json"))
-            )
+            payload = response.model_dump(mode="json")
+            lifecycle = lifecycle_name(response)
+            if lifecycle is not None:
+                await queue.put((lifecycle, payload))
+            await queue.put(("final", payload))
             await queue.put(None)
 
         task = asyncio.create_task(produce())
