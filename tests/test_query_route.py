@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from askdata.api import routes
+from askdata.api.query_service import QueryService
 from askdata.api.session_store import SessionStore
 
 
@@ -39,7 +40,13 @@ class FakeGraph:
             "sql": "SELECT COUNT(id) AS count FROM items",
             "columns": ["count"],
             "rows": [{"count": 3}],
-            "chart": {"type": "bar"},
+            "chart": {
+                "type": "vertical_bar",
+                "title": "Item count",
+                "category_field": None,
+                "value_fields": ["count"],
+                "reason": "comparison",
+            },
             "trace": [
                 {
                     "step": "RetrieveSchema",
@@ -52,7 +59,7 @@ class FakeGraph:
 
 
 @pytest.fixture
-def api(tmp_path, monkeypatch):
+def api(tmp_path):
     database_path = tmp_path / "sessions.sqlite"
     state = {}
 
@@ -61,6 +68,7 @@ def api(tmp_path, monkeypatch):
         store = SessionStore(database_path)
         await store.Initialize()
         app.state.session_store = store
+        app.state.query_service = QueryService(store, graph_factory=FakeGraph)
         state["store"] = store
         try:
             yield
@@ -70,7 +78,6 @@ def api(tmp_path, monkeypatch):
     app = FastAPI(lifespan=lifespan)
     app.include_router(routes.router, prefix="/api")
     FakeGraph.calls = []
-    monkeypatch.setattr(routes, "AgentGraph", FakeGraph)
     with TestClient(app) as client:
         yield client, state, database_path
 
@@ -170,6 +177,11 @@ def test_query_uses_persisted_context_and_saves_turns(api):
     )
 
     assert second.status_code == 200
+    body = second.json()
+    assert body["kind"] == "answer"
+    assert body["session_id"] == session_id
+    assert body["turn_id"]
+    assert body["confidence"] == "medium"
     assert FakeGraph.calls == [
         {
             "question": "First question",
@@ -189,12 +201,21 @@ def test_query_uses_persisted_context_and_saves_turns(api):
     assert [turn["question"] for turn in turns] == ["First question", "Second question"]
     assert all(turn["response_kind"] == "answer" for turn in turns)
     assert turns[-1]["result_preview"] == [{"count": 3}]
-    assert turns[-1]["chart"] == {"type": "bar"}
+    assert turns[-1]["chart"] == {
+        "type": "vertical_bar",
+        "title": "Item count",
+        "category_field": None,
+        "category_label": None,
+        "value_fields": ["count"],
+        "value_labels": {},
+        "reason": "comparison",
+    }
     assert turns[-1]["trace"] == [
         {
             "step": "RetrieveSchema",
             "status": "success",
             "message": "Schema matched.",
+            "sequence": 1,
         }
     ]
 
@@ -242,36 +263,35 @@ def test_query_rejects_clarification_until_continuations_are_supported(api):
     assert response.json() == {"detail": "Only question queries are supported"}
 
 
-def test_query_failure_sanitizes_public_response_and_persisted_turn(
-    api, monkeypatch, caplog
-):
+def test_query_failure_sanitizes_public_response_and_persisted_turn(api, caplog):
     client, _, _ = api
 
     class FailingGraph:
         async def ARun(self, **kwargs):
             raise RuntimeError("database password leaked")
 
-    monkeypatch.setattr(routes, "AgentGraph", FailingGraph)
+    client.app.state.query_service._graph_factory = FailingGraph
     response = client.post(
         "/api/query", json={"question": "Fail safely", "database_id": "demo"}
     )
 
     assert response.status_code == 200
-    assert "database password leaked" not in response.json()["answer"]
-    assert response.json()["error"] == "query_failed"
+    assert response.json()["kind"] == "error"
+    assert response.json()["code"] == "query_failed"
+    assert "database password leaked" not in response.json()["message"]
+    assert response.json()["retryable"] is True
+    assert response.json()["suggestions"] == ["重试", "换一种问法"]
     assert "database password leaked" not in json.dumps(response.json()["trace"])
     session_id = client.get("/api/sessions").json()[0]["id"]
     turn = client.get(f"/api/sessions/{session_id}").json()["turns"][0]
     assert turn["question"] == "Fail safely"
     assert turn["response_kind"] == "error"
-    assert turn["error"] == "query_failed"
+    assert turn["error"]["code"] == "query_failed"
     assert "database password leaked" not in json.dumps(turn["trace"])
     assert "database password leaked" in caplog.text
 
 
-def test_query_sanitizes_returned_agent_error_and_discards_sensitive_fields(
-    api, monkeypatch
-):
+def test_query_sanitizes_returned_agent_error_and_discards_sensitive_fields(api):
     client, _, _ = api
     secret = "returned-agent-secret-7391"
 
@@ -287,7 +307,7 @@ def test_query_sanitizes_returned_agent_error_and_discards_sensitive_fields(
                 "error": {"detail": secret},
             }
 
-    monkeypatch.setattr(routes, "AgentGraph", ErrorGraph)
+    client.app.state.query_service._graph_factory = ErrorGraph
 
     response = client.post(
         "/api/query", json={"question": "Return safely", "database_id": "demo"}
@@ -296,24 +316,22 @@ def test_query_sanitizes_returned_agent_error_and_discards_sensitive_fields(
     assert response.status_code == 200
     body = response.json()
     assert secret not in json.dumps(body)
-    assert body["answer"] == "查询失败，请稍后重试或换一种问法。"
-    assert body["sql"] is None
-    assert body["columns"] == []
-    assert body["rows"] == []
-    assert body["chart"] is None
-    assert body["error"] == "query_failed"
+    assert body["kind"] == "error"
+    assert body["code"] == "query_failed"
+    assert body["message"] == "查询失败，请稍后重试或换一种问法。"
+    assert body["retryable"] is True
     session_id = client.get("/api/sessions").json()[0]["id"]
     turn = client.get(f"/api/sessions/{session_id}").json()["turns"][0]
     assert secret not in json.dumps(turn)
-    assert turn["answer"] == body["answer"]
+    assert turn["answer"] is None
     assert turn["sql"] is None
     assert turn["result_preview"] == []
     assert turn["chart"] is None
-    assert turn["error"] == "query_failed"
+    assert turn["error"]["code"] == "query_failed"
     assert turn["trace"] == body["trace"]
 
 
-def test_query_normalizes_non_json_graph_values_for_response_and_history(api, monkeypatch):
+def test_query_normalizes_non_json_graph_values_for_response_and_history(api):
     client, _, _ = api
     item_id = UUID("12345678-1234-5678-1234-567812345678")
     created_at = datetime(2026, 7, 15, 10, 30, tzinfo=timezone.utc)
@@ -332,12 +350,12 @@ def test_query_normalizes_non_json_graph_values_for_response_and_history(api, mo
                         "payload": b"\xff\x00",
                     }
                 ],
-                "chart": {"generated_at": created_at},
+                "chart": None,
                 "trace": [{"at": created_at}],
                 "error": None,
             }
 
-    monkeypatch.setattr(routes, "AgentGraph", RichGraph)
+    client.app.state.query_service._graph_factory = RichGraph
 
     response = client.post(
         "/api/query", json={"question": "Rich values", "database_id": "demo"}
@@ -354,11 +372,18 @@ def test_query_normalizes_non_json_graph_values_for_response_and_history(api, mo
     session_id = client.get("/api/sessions").json()[0]["id"]
     turn = client.get(f"/api/sessions/{session_id}").json()["turns"][0]
     assert turn["result_preview"] == [expected_row]
-    assert turn["chart"] == {"generated_at": "2026-07-15T10:30:00+00:00"}
-    assert turn["trace"] == [{"at": "2026-07-15T10:30:00+00:00"}]
+    assert turn["chart"] is None
+    assert turn["trace"] == [
+        {
+            "step": "agent",
+            "status": "success",
+            "message": '{"at": "2026-07-15T10:30:00+00:00"}',
+            "sequence": 1,
+        }
+    ]
 
 
-def test_concurrent_queries_for_one_session_serialize_and_share_context(api, monkeypatch):
+def test_concurrent_queries_for_one_session_serialize_and_share_context(api):
     client, _, _ = api
     session_id = client.post("/api/sessions?database_id=demo").json()["session_id"]
     first_entered = threading.Event()
@@ -384,7 +409,7 @@ def test_concurrent_queries_for_one_session_serialize_and_share_context(api, mon
                 "error": None,
             }
 
-    monkeypatch.setattr(routes, "AgentGraph", BlockingGraph)
+    client.app.state.query_service._graph_factory = BlockingGraph
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(
             client.post,
@@ -399,7 +424,7 @@ def test_concurrent_queries_for_one_session_serialize_and_share_context(api, mon
         )
         try:
             assert not second_entered.wait(timeout=0.1)
-            manager = client.app.state.session_lock_manager
+            manager = client.app.state.query_service._locks
             assert list(manager._entries) == [session_id]
             entry = manager._entries[session_id]
             assert entry["refs"] == 2
@@ -416,10 +441,10 @@ def test_concurrent_queries_for_one_session_serialize_and_share_context(api, mon
             {"last_question": "First", "last_sql": "SELECT 'First'"},
         ),
     ]
-    assert client.app.state.session_lock_manager._entries == {}
+    assert client.app.state.query_service._locks._entries == {}
 
 
-def test_delete_waits_for_in_flight_query_then_deletes_session(api, monkeypatch):
+def test_delete_waits_for_in_flight_query_then_deletes_session(api):
     client, _, _ = api
     session_id = client.post("/api/sessions?database_id=demo").json()["session_id"]
     query_entered = threading.Event()
@@ -439,7 +464,7 @@ def test_delete_waits_for_in_flight_query_then_deletes_session(api, monkeypatch)
                 "error": None,
             }
 
-    monkeypatch.setattr(routes, "AgentGraph", BlockingGraph)
+    client.app.state.query_service._graph_factory = BlockingGraph
     with ThreadPoolExecutor(max_workers=2) as executor:
         query = executor.submit(
             client.post,
@@ -457,7 +482,7 @@ def test_delete_waits_for_in_flight_query_then_deletes_session(api, monkeypatch)
         assert delete.result(timeout=2).status_code == 200
 
     assert client.get(f"/api/sessions/{session_id}").status_code == 404
-    assert client.app.state.session_lock_manager._entries == {}
+    assert client.app.state.query_service._locks._entries == {}
 
 
 def test_missing_delete_releases_lock_registry_entry(api):
@@ -466,7 +491,7 @@ def test_missing_delete_releases_lock_registry_entry(api):
     response = client.delete("/api/sessions/arbitrary-missing-id")
 
     assert response.status_code == 404
-    assert client.app.state.session_lock_manager._entries == {}
+    assert client.app.state.query_service._locks._entries == {}
 
 
 def test_missing_session_replacement_query_releases_all_lock_entries(api):
@@ -482,7 +507,7 @@ def test_missing_session_replacement_query_releases_all_lock_entries(api):
     )
 
     assert response.status_code == 200
-    assert client.app.state.session_lock_manager._entries == {}
+    assert client.app.state.query_service._locks._entries == {}
     sessions = client.get("/api/sessions").json()
     assert len(sessions) == 1
     assert sessions[0]["id"] != "arbitrary-missing-id"

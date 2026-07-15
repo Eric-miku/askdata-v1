@@ -14,34 +14,24 @@ API 路由定义 —— 所有 HTTP 接口的入口
   - 核心 /api/query 接口通过 AgentGraph → ReActSqlAgent 完成 NL2SQL 全链路
 """
 
-import asyncio
-import base64
 import os
 import glob
-import logging
 import sqlite3
-import uuid
-from contextlib import asynccontextmanager
-from datetime import date, datetime, time
-from decimal import Decimal
-from enum import Enum
-from typing import Any, List, Optional
+from datetime import datetime
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.encoders import jsonable_encoder
-from askdata.api.schemas import QueryRequest, QueryResponse
+from askdata.api.query_service import QueryClarificationUnsupported, QueryService
+from askdata.api.response_models import QueryResponse
+from askdata.api.schemas import QueryRequest
 from askdata.api.session_store import SessionStore
 from askdata.api.trace import TraceLogger
-from askdata.agent.graph import AgentGraph
 from askdata.core.config import settings
 from askdata.core.paths import project_path
 
 # 创建 APIRouter 实例
 # 在 app.py 中通过 app.include_router(router, prefix="/api") 注册
 router = APIRouter()
-logger = logging.getLogger(__name__)
-
-_PUBLIC_QUERY_ERROR = "query_failed"
 
 
 # ============================================================
@@ -55,90 +45,11 @@ def _Store(request: Request) -> SessionStore:
     return store
 
 
-def _JsonSafe(value: Any) -> Any:
-    """Normalize agent output for both HTTP responses and SQLite JSON storage.
-
-    Bytes use base64 so arbitrary binary values have one deterministic public form.
-    """
-    return jsonable_encoder(
-        value,
-        custom_encoder={
-            Decimal: str,
-            datetime: lambda item: item.isoformat(),
-            date: lambda item: item.isoformat(),
-            time: lambda item: item.isoformat(),
-            uuid.UUID: str,
-            Enum: lambda item: item.value,
-            bytes: lambda item: base64.b64encode(item).decode("ascii"),
-        },
-    )
-
-
-class _SessionLockManager:
-    def __init__(self) -> None:
-        self._guard = asyncio.Lock()
-        self._entries: dict[str, dict[str, Any]] = {}
-
-    @asynccontextmanager
-    async def Hold(self, session_id: str):
-        async with self._guard:
-            entry = self._entries.get(session_id)
-            if entry is None:
-                entry = {"lock": asyncio.Lock(), "refs": 0}
-                self._entries[session_id] = entry
-            entry["refs"] += 1
-
-        acquired = False
-        try:
-            await entry["lock"].acquire()
-            acquired = True
-            yield
-        finally:
-            if acquired:
-                entry["lock"].release()
-            async with self._guard:
-                entry["refs"] -= 1
-                if entry["refs"] == 0 and self._entries.get(session_id) is entry:
-                    del self._entries[session_id]
-
-
-def _SessionLocks(request: Request) -> _SessionLockManager:
-    manager = getattr(request.app.state, "session_lock_manager", None)
-    if manager is None:
-        manager = _SessionLockManager()
-        request.app.state.session_lock_manager = manager
-    return manager
-
-
-@asynccontextmanager
-async def _LockedSession(
-    request: Request,
-    store: SessionStore,
-    session_id: str,
-    database_id: str,
-    trace: TraceLogger,
-):
-    while True:
-        async with _SessionLocks(request).Hold(session_id):
-            session = await store.GetSession(session_id)
-            if session is not None and session["database_id"] == database_id:
-                yield session_id, session
-                return
-        trace.log("会话未找到，创建新会话", f"session_id={session_id}")
-        session_id = await store.CreateSession(database_id)
-
-
-def _SafeQueryError(trace: TraceLogger) -> QueryResponse:
-    trace.log("查询失败", _PUBLIC_QUERY_ERROR)
-    return QueryResponse(
-        answer="查询失败，请稍后重试或换一种问法。",
-        sql=None,
-        columns=[],
-        rows=[],
-        chart=None,
-        trace=_JsonSafe(trace.get_logs()),
-        error=_PUBLIC_QUERY_ERROR,
-    )
+def _QueryService(request: Request) -> QueryService:
+    service = getattr(request.app.state, "query_service", None)
+    if not isinstance(service, QueryService):
+        raise RuntimeError("app.state.query_service must be an initialized QueryService")
+    return service
 
 
 def _CountTables(db_path: str) -> int:
@@ -371,8 +282,7 @@ async def delete_session(session_id: str, request: Request):
     trace = TraceLogger()
     trace.log("删除会话", f"session_id={session_id}")
 
-    async with _SessionLocks(request).Hold(session_id):
-        success = await _Store(request).DeleteSession(session_id)
+    success = await _QueryService(request).DeleteSession(session_id)
     if not success:
         trace.log("会话未找到", f"session_id={session_id}")
         raise HTTPException(
@@ -411,74 +321,7 @@ async def execute_query(query_request: QueryRequest, request: Request):
     注意:
         调用 AgentGraph → ReActSqlAgent 完成 NL2SQL 全链路。
     """
-    trace = TraceLogger()
-    if query_request.clarification is not None or not query_request.question:
-        raise HTTPException(status_code=422, detail="Only question queries are supported")
-
-    trace.log(
-        "收到查询请求",
-        f"question='{query_request.question}', database_id='{query_request.database_id}'",
-    )
-
-    # ---------- 会话管理 ----------
-    store = _Store(request)
-    session_id = query_request.session_id
-    if not session_id:
-        # 没有 session_id，创建一个新会话
-        session_id = await store.CreateSession(query_request.database_id)
-        trace.log("创建新会话", f"session_id={session_id}")
-
-    async with _LockedSession(
-        request, store, session_id, query_request.database_id, trace
-    ) as (session_id, session):
-        history = session["turns"] if session else []
-        session_context = {}
-        if history:
-            last_item = history[-1]
-            session_context = {
-                "last_question": last_item.get("question"),
-                "last_sql": last_item.get("sql"),
-            }
-
-        try:
-            result = _JsonSafe(
-                await AgentGraph().ARun(
-                    question=query_request.question,
-                    database_id=query_request.database_id,
-                    session_context=session_context,
-                )
-            )
-            if result.get("error"):
-                response = _SafeQueryError(trace)
-            else:
-                response = QueryResponse(
-                    answer=result["answer"],
-                    sql=result.get("sql"),
-                    columns=result.get("columns"),
-                    rows=result.get("rows"),
-                    chart=result.get("chart"),
-                    trace=result.get("trace", []),
-                    error=None,
-                )
-        except Exception:
-            logger.exception("Query execution failed")
-            response = _SafeQueryError(trace)
-
-        # ---------- 保存会话历史 ----------
-        await store.SaveTurn(
-            session_id,
-            {
-                "id": str(uuid.uuid4()),
-                "question": query_request.question,
-                "response_kind": "error" if response.error else "answer",
-                "answer": response.answer,
-                "sql": response.sql,
-                "result_preview": _JsonSafe(response.rows),
-                "chart": _JsonSafe(response.chart),
-                "error": _JsonSafe(response.error),
-                "trace": _JsonSafe(response.trace),
-            },
-        )
-
-    trace.log("查询完成")
-    return response
+    try:
+        return await _QueryService(request).Run(query_request)
+    except QueryClarificationUnsupported as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error

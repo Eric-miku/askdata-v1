@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from askdata.api.query_service import QueryService
 from askdata.api.routes import router
 from askdata.api.session_store import SessionStore
 from askdata.core.config import settings
@@ -25,6 +26,7 @@ async def lifespan(application: FastAPI):
     store = SessionStore(project_path(settings.APP_DATABASE_PATH))
     await store.Initialize()
     application.state.session_store = store
+    application.state.query_service = QueryService(store)
     try:
         yield
     finally:
