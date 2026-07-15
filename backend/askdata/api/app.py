@@ -8,40 +8,28 @@ FastAPI 应用入口 —— 整个后端服务的心脏
 """
 
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
 from askdata.api.routes import router
+from askdata.api.session_store import SessionStore
+from askdata.core.config import settings
+from askdata.core.paths import project_path
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    """
-    应用生命周期管理
-
-    startup（yield 之前）:
-      应用启动时执行，适合做：
-      - 初始化数据库连接池
-      - 加载元数据到缓存
-      - 预热 LLM 模型
-
-    shutdown（yield 之后）:
-      应用关闭时执行，适合做：
-      - 关闭所有数据库连接
-      - 清理临时文件
-      - 释放资源
-
-    目前 V1 阶段还未接入真实模块，先预留空实现。
-    """
-    # ---------- 启动逻辑 ----------
+    """Initialize and close application-scoped resources."""
     print("[AskData] 服务启动中...")
-    # TODO: 初始化数据库连接池（等待 db/executor.py 实现）
-    # TODO: 加载 BIRD 元数据缓存（等待 tools/retriever.py 实现）
-
-    yield  # 应用在此运行，直到收到关闭信号
-
-    # ---------- 关闭逻辑 ----------
-    print("[AskData] 服务关闭中...")
-    # TODO: 关闭数据库连接池
+    store = SessionStore(project_path(settings.APP_DATABASE_PATH))
+    await store.Initialize()
+    application.state.session_store = store
+    try:
+        yield
+    finally:
+        print("[AskData] 服务关闭中...")
+        await store.Close()
 
 
 # 创建 FastAPI 应用实例
