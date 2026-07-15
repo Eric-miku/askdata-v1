@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "name": "askdata-v2.1-golden-journeys",
+  "cases": [
+    {
+      "id": "ranking",
+      "category": "clear",
+      "question": "top five schools by enrollment",
+      "expected_kind": "answer",
+      "expected_chart": "horizontal_bar",
+      "gold_tables": ["schools"],
+      "gold_columns": ["school_name", "enrollment"],
+      "expected_stream_parity": true,
+      "prediction": {
+        "kind": "answer",
+        "sql": "SELECT school_name, enrollment FROM schools ORDER BY enrollment DESC LIMIT 5",
+        "chart": {
+          "type": "horizontal_bar",
+          "title": "Schools by enrollment",
+          "category_field": "school_name",
+          "value_fields": ["enrollment"],
+          "reason": "ranking"
+        },
+        "retrieved_tables": ["schools"],
+        "retrieved_columns": ["schools.school_name", "schools.enrollment"],
+        "stream_parity": true,
+        "latency_ms": 120,
+        "llm_calls": 1,
+        "sql_executions": 1,
+        "token_usage": 420
+      }
+    },
+    {
+      "id": "revenue",
+      "category": "ambiguous",
+      "question": "show revenue",
+      "expected_kind": "clarification",
+      "prediction": {
+        "kind": "clarification",
+        "sql": null,
+        "latency_ms": 80,
+        "llm_calls": 1,
+        "sql_executions": 0,
+        "token_usage": 180
+      }
+    },
+    {
+      "id": "sss",
+      "category": "semantic_mapping",
+      "question": "list State Special Schools",
+      "expected_kind": "answer",
+      "expected_context": "SSS = State Special School",
+      "gold_tables": ["schools"],
+      "gold_columns": ["schools.ed_ops_code"],
+      "prediction": {
+        "kind": "answer",
+        "sql": "SELECT school_name FROM schools WHERE ed_ops_code = 'SSS'",
+        "retrieved_context": "SSS = State Special School",
+        "retrieved_tables": ["schools"],
+        "retrieved_columns": ["schools.ed_ops_code"],
+        "latency_ms": 140,
+        "llm_calls": 2,
+        "sql_executions": 1,
+        "token_usage": 610
+      }
+    },
+    {
+      "id": "restart",
+      "category": "persistence",
+      "question": "reopen this conversation after restart",
+      "expected_kind": "answer",
+      "expected_restart_persistence": true,
+      "prediction": {
+        "kind": "answer",
+        "sql": "SELECT 1",
+        "restart_persistence": true,
+        "latency_ms": 60,
+        "llm_calls": 0,
+        "sql_executions": 0,
+        "token_usage": 0
+      }
+    },
+    {
+      "id": "missing_students",
+      "category": "unanswerable",
+      "question": "list student names",
+      "expected_kind": "error",
+      "expected_error_code": "unanswerable_from_schema",
+      "prediction": {
+        "kind": "error",
+        "code": "unanswerable_from_schema",
+        "sql": null,
+        "latency_ms": 70,
+        "llm_calls": 1,
+        "sql_executions": 0,
+        "token_usage": 130
+      }
+    }
+  ]
+}

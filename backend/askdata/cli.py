@@ -1,5 +1,6 @@
 """Typer command-line entry points for AskData development workflows."""
 
+import json
 from pathlib import Path
 
 import typer
@@ -12,7 +13,7 @@ from askdata.data.bird_io import (
     LoadProcessedQuestions,
     ResolveProcessedDir,
 )
-from askdata.eval import EvalRunner
+from askdata.eval import DemoSuite, EvalRunner
 from askdata.tools.embedding_client import EmbeddingClient, EmbeddingConfigurationError
 from askdata.tools.retriever import BirdSchemaIndex, GetValue
 from askdata.tools.vector_store import MilvusVectorStore, SOURCE_VERSION
@@ -164,6 +165,50 @@ def EvalBird(
     typer.echo(f"Valid SQL Rate: {summary['validSqlRate']:.2%}")
     typer.echo(f"Exact Match Rate: {summary['exactMatchRate']:.2%}")
     typer.echo(f"Report: {out}")
+
+
+@app.command("eval-demo")
+def EvalDemo(
+    cases: Path = typer.Option(..., "--cases", help="Versioned demo case JSON"),
+    predictions: Path | None = typer.Option(
+        None,
+        "--predictions",
+        help="Captured prediction JSON; defaults to embedded case predictions",
+    ),
+    out: Path = typer.Option(
+        Path("reports/v2-demo.json"), "--out", "-o", help="JSON report output path"
+    ),
+):
+    """Compare offline V2 demo predictions and write a deterministic report."""
+    try:
+        loaded_cases = DemoSuite.Load(cases, "cases")
+        if predictions is not None:
+            loaded_predictions = DemoSuite.Load(predictions, "predictions")
+        else:
+            loaded_predictions = []
+            for item in loaded_cases:
+                prediction = item.pop("prediction", None)
+                if isinstance(prediction, dict):
+                    loaded_predictions.append({"id": item["id"], **prediction})
+        report = DemoSuite(loaded_cases).Compare(loaded_predictions)
+        DemoSuite.WriteReport(report, out)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    typer.echo("Category             Passed   Rate")
+    for category, metrics in report["by_category"].items():
+        typer.echo(
+            f"{category:<20} {metrics['passed']}/{metrics['total']:<7} "
+            f"{metrics['pass_rate']:.0%}"
+        )
+    summary = report["summary"]
+    typer.echo(
+        f"Overall              {summary['passed']}/{summary['total']}     "
+        f"{summary['pass_rate']:.0%}"
+    )
+    typer.echo(f"Report: {out}")
+    if summary["passed"] != summary["total"]:
+        raise typer.Exit(code=1)
 
 
 @app.command("databases")
