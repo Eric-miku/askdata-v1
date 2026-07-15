@@ -4,9 +4,13 @@ import json
 from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from enum import Enum
+from pathlib import Path
+import sys
 from uuid import UUID
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from askdata.api.query_service import QueryClarificationUnsupported, QueryService
 from askdata.api.response_models import AnswerResponse, ErrorResponse
