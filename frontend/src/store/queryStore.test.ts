@@ -1,17 +1,30 @@
 import { describe, expect, it, vi } from "vitest";
 import { createQueryStore, type QueryApi } from "./queryStore";
-import type { QueryResponse, RestoredSession } from "../types/query";
+import type {
+  AnswerResponse,
+  ClarificationResponse,
+  ErrorResponse,
+  PartialResponse,
+  QueryResponse,
+  QueryStreamEvent,
+  RestoredSession,
+  V2QueryRequest,
+  V2QueryResponse,
+} from "../types/query";
 
 const successfulResponse: QueryResponse = {
+  kind: "answer",
+  session_id: "session-1",
+  turn_id: "backend-turn-1",
   answer: "共有 3 条记录。",
   sql: "SELECT COUNT(id) AS count FROM items",
   columns: ["count"],
   rows: [{ count: 3 }],
   chart: null,
   trace: [
-    { step: "RetrieveSchema", status: "success", message: "Schema matched." },
+    { step: "RetrieveSchema", status: "success", message: "Schema matched.", sequence: 1 },
   ],
-  error: null,
+  confidence: "high",
 };
 
 function createApi(overrides: Partial<QueryApi> = {}): QueryApi {
@@ -28,6 +41,7 @@ function createApi(overrides: Partial<QueryApi> = {}): QueryApi {
     listSessions: vi.fn().mockResolvedValue([]),
     getSession: vi.fn(),
     queryData: vi.fn().mockResolvedValue(successfulResponse),
+    queryStream: vi.fn().mockResolvedValue(successfulResponse),
     ...overrides,
   };
 }
@@ -39,6 +53,29 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
+
+type StreamFunction = (
+  request: V2QueryRequest,
+  onEvent: (event: QueryStreamEvent) => void,
+  signal?: AbortSignal,
+) => Promise<V2QueryResponse>;
+
+function withStream(api: QueryApi, stream: StreamFunction) {
+  return Object.assign(api, { queryStream: vi.fn(stream) });
+}
+
+const answerResponse: AnswerResponse = {
+  kind: "answer",
+  session_id: "session-1",
+  turn_id: "backend-turn-1",
+  answer: "共有 3 条记录。",
+  sql: "SELECT COUNT(id) AS count FROM items",
+  columns: ["count"],
+  rows: [{ count: 3 }],
+  chart: null,
+  confidence: "high",
+  trace: [],
+};
 
 function restoredSession(
   id: string,
@@ -71,6 +108,198 @@ function restoredSession(
 }
 
 describe("query store", () => {
+  it("streams monotonic operational traces into the loading turn", async () => {
+    const finish = deferred<V2QueryResponse>();
+    let emit!: (event: QueryStreamEvent) => void;
+    const api = withStream(createApi(), async (_request, onEvent) => {
+      emit = onEvent;
+      return finish.promise;
+    });
+    const store = createQueryStore(api);
+    store.setState({ database: "demo" });
+
+    const sending = store.getState().sendMessage("How many?");
+    await vi.waitFor(() => expect(emit).toBeTypeOf("function"));
+    emit({
+      type: "trace",
+      data: { step: "RetrieveSchema", status: "started", message: "Started", sequence: 2 },
+    });
+    emit({
+      type: "trace",
+      data: { step: "GenerateSql", status: "success", message: "Stale", sequence: 1 },
+    });
+    emit({
+      type: "trace",
+      data: { step: "ExecuteSql", status: "success", message: "Done", sequence: 3 },
+    });
+
+    expect(store.getState().turns[0]).toMatchObject({
+      status: "loading",
+      response: { trace: [{ sequence: 2 }, { sequence: 3 }] },
+    });
+
+    finish.resolve({
+      ...answerResponse,
+      trace: [
+        { step: "RetrieveSchema", status: "success", message: "Ready", sequence: 2 },
+        { step: "ExecuteSql", status: "success", message: "Done", sequence: 3 },
+      ],
+    });
+    await sending;
+    expect(store.getState().turns[0].status).toBe("success");
+  });
+
+  it("keeps streamed trace events when the final payload omits its trace copy", async () => {
+    const api = withStream(createApi(), async (_request, onEvent) => {
+      onEvent({
+        type: "trace",
+        data: {
+          step: "RetrieveSchema",
+          status: "success",
+          message: "Schema ready",
+          sequence: 1,
+        },
+      });
+      return answerResponse;
+    });
+    const store = createQueryStore(api);
+    store.setState({ database: "demo" });
+
+    await store.getState().sendMessage("How many?");
+
+    expect(store.getState().turns[0].response?.trace).toEqual([
+      expect.objectContaining({ sequence: 1, step: "RetrieveSchema" }),
+    ]);
+  });
+
+  it.each<{
+    response: ClarificationResponse | PartialResponse | ErrorResponse;
+    status: "awaiting_clarification" | "partial" | "error";
+  }>([
+    {
+      response: {
+        kind: "clarification",
+        session_id: "session-1",
+        turn_id: "t1",
+        trace: [],
+        clarification_id: "c1",
+        question: "Which revenue?",
+        options: [{ id: "net", label: "Net", description: null }],
+        recommended_option_id: "net",
+      },
+      status: "awaiting_clarification",
+    },
+    {
+      response: {
+        kind: "partial",
+        session_id: "session-1",
+        turn_id: "t1",
+        trace: [],
+        answer: "Partial",
+        limitations: ["Missing dates"],
+        suggestions: [],
+        confidence: "low",
+        sql: null,
+        columns: [],
+        rows: [],
+        chart: null,
+      },
+      status: "partial",
+    },
+    {
+      response: {
+        kind: "error",
+        session_id: "session-1",
+        turn_id: "t1",
+        trace: [],
+        code: "query_failed",
+        message: "Try again.",
+        retryable: true,
+        suggestions: [],
+      },
+      status: "error",
+    },
+  ])("maps a $response.kind final response to $status", async ({ response, status }) => {
+    const api = withStream(createApi(), async () => response);
+    const store = createQueryStore(api);
+    store.setState({ database: "demo" });
+
+    await store.getState().sendMessage("Question");
+
+    expect(store.getState().turns[0]).toMatchObject({ status, response });
+    expect(api.listSessions).toHaveBeenCalledTimes(1);
+  });
+
+  it("resolves clarification in the same turn and preserves the original question", async () => {
+    const clarification: ClarificationResponse = {
+      kind: "clarification",
+      session_id: "session-1",
+      turn_id: "backend-turn",
+      trace: [],
+      clarification_id: "c1",
+      question: "Which revenue?",
+      options: [{ id: "net", label: "Net", description: null }],
+      recommended_option_id: "net",
+    };
+    const api = withStream(
+      createApi(),
+      vi.fn()
+        .mockResolvedValueOnce(clarification)
+        .mockResolvedValueOnce(answerResponse),
+    );
+    const store = createQueryStore(api);
+    store.setState({ database: "demo" });
+    await store.getState().sendMessage("What is revenue?");
+    const turnId = store.getState().turns[0].id;
+
+    await store.getState().resolveClarification(turnId, "c1", { option_id: "net" });
+
+    expect(api.queryStream).toHaveBeenLastCalledWith(
+      {
+        database_id: "demo",
+        session_id: "session-1",
+        clarification: { clarification_id: "c1", option_id: "net" },
+      },
+      expect.any(Function),
+      expect.any(AbortSignal),
+    );
+    expect(store.getState().turns).toHaveLength(1);
+    expect(store.getState().turns[0]).toMatchObject({
+      id: turnId,
+      question: "What is revenue?",
+      status: "success",
+    });
+  });
+
+  it("cancels the active request and ignores events from the cancelled stream", async () => {
+    let emit!: (event: QueryStreamEvent) => void;
+    const api = withStream(createApi(), (_request, onEvent, signal) => {
+      emit = onEvent;
+      return new Promise<V2QueryResponse>((_resolve, reject) => {
+        signal?.addEventListener("abort", () =>
+          reject(new DOMException("Aborted", "AbortError")),
+        );
+      });
+    });
+    const store = createQueryStore(api);
+    store.setState({ database: "demo" });
+    const sending = store.getState().sendMessage("Cancel me");
+    await vi.waitFor(() => expect(emit).toBeTypeOf("function"));
+
+    store.getState().cancelActiveQuery();
+    await sending;
+    emit({
+      type: "trace",
+      data: { step: "ExecuteSql", status: "success", message: "Late", sequence: 99 },
+    });
+
+    expect(store.getState().loading).toBe(false);
+    expect(store.getState().turns[0]).toMatchObject({
+      status: "error",
+      error: "查询已取消。",
+    });
+    expect(JSON.stringify(store.getState().turns[0])).not.toContain("Late");
+  });
   it("loads databases and selects the first available database", async () => {
     const store = createQueryStore(createApi());
 
@@ -90,16 +319,26 @@ describe("query store", () => {
     await store.getState().sendMessage("第二问");
 
     expect(api.createSession).toHaveBeenCalledTimes(1);
-    expect(api.queryData).toHaveBeenNthCalledWith(1, {
-      database_id: "demo",
-      question: "第一问",
-      session_id: "session-1",
-    });
-    expect(api.queryData).toHaveBeenNthCalledWith(2, {
-      database_id: "demo",
-      question: "第二问",
-      session_id: "session-1",
-    });
+    expect(api.queryStream).toHaveBeenNthCalledWith(
+      1,
+      {
+        database_id: "demo",
+        question: "第一问",
+        session_id: "session-1",
+      },
+      expect.any(Function),
+      expect.any(AbortSignal),
+    );
+    expect(api.queryStream).toHaveBeenNthCalledWith(
+      2,
+      {
+        database_id: "demo",
+        question: "第二问",
+        session_id: "session-1",
+      },
+      expect.any(Function),
+      expect.any(AbortSignal),
+    );
     expect(store.getState().turns.map((turn) => turn.status)).toEqual([
       "success",
       "success",
@@ -335,7 +574,7 @@ describe("query store", () => {
 
   it("keeps a failed turn and can retry the original question", async () => {
     const api = createApi({
-      queryData: vi
+      queryStream: vi
         .fn()
         .mockRejectedValueOnce(new Error("网络不可用"))
         .mockResolvedValueOnce(successfulResponse),
@@ -351,22 +590,30 @@ describe("query store", () => {
     await store.getState().retryTurn(failedTurn.id);
 
     expect(store.getState().turns[0].status).toBe("success");
-    expect(api.queryData).toHaveBeenLastCalledWith({
-      database_id: "demo",
-      question: "失败的问题",
-      session_id: "session-1",
-    });
+    expect(api.queryStream).toHaveBeenLastCalledWith(
+      {
+        database_id: "demo",
+        question: "失败的问题",
+        session_id: "session-1",
+      },
+      expect.any(Function),
+      expect.any(AbortSignal),
+    );
   });
 
-  it("treats an HTTP 200 response with an error field as a failed turn", async () => {
-    const responseWithError: QueryResponse = {
-      ...successfulResponse,
-      answer: "查询失败，请稍后重试。",
-      error: "SQL execution failed",
-      trace: ["[trace][+0.10s] 查询失败: SQL execution failed"],
+  it("treats a stable streamed error response as a failed turn", async () => {
+    const responseWithError: ErrorResponse = {
+      kind: "error",
+      session_id: "session-1",
+      turn_id: "backend-turn-1",
+      code: "query_failed",
+      message: "SQL execution failed",
+      retryable: true,
+      suggestions: [],
+      trace: [],
     };
     const store = createQueryStore(
-      createApi({ queryData: vi.fn().mockResolvedValue(responseWithError) }),
+      createApi({ queryStream: vi.fn().mockResolvedValue(responseWithError) }),
     );
     await store.getState().loadDatabases();
 

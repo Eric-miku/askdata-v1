@@ -31,6 +31,8 @@ export function QueryResultDemo({ theme, onToggleTheme }: QueryResultDemoProps) 
     newChat,
     sendMessage,
     retryTurn,
+    resolveClarification,
+    cancelActiveQuery,
   } = useQueryStore();
   const endRef = useRef<HTMLDivElement>(null);
   const selectedDatabase = useMemo(
@@ -116,7 +118,13 @@ export function QueryResultDemo({ theme, onToggleTheme }: QueryResultDemoProps) 
           <>
             <section className="conversation" aria-live="polite">
               {turns.map((turn) => (
-                <QueryResultView key={turn.id} turn={turn} onRetry={retryTurn} />
+                <QueryResultView
+                  key={turn.id}
+                  turn={turn}
+                  onRetry={retryTurn}
+                  onCancel={cancelActiveQuery}
+                  onResolveClarification={resolveClarification}
+                />
               ))}
               <div ref={endRef} />
             </section>

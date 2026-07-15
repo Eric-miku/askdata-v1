@@ -9,9 +9,11 @@ const apiMocks = vi.hoisted(() => ({
   listSessions: vi.fn(),
   getSession: vi.fn(),
   queryData: vi.fn(),
+  queryStream: vi.fn(),
 }));
 
 vi.mock("../api/query", () => apiMocks);
+vi.mock("../api/queryStream", () => ({ queryStream: apiMocks.queryStream }));
 
 import { QueryResultDemo } from "./QueryResultDemo";
 import { useQueryStore } from "../store/queryStore";
@@ -31,16 +33,25 @@ describe("QueryResultDemo", () => {
     apiMocks.deleteSession.mockReset().mockResolvedValue(undefined);
     apiMocks.listSessions.mockReset().mockResolvedValue([]);
     apiMocks.getSession.mockReset();
-    apiMocks.queryData.mockReset().mockResolvedValue({
+    apiMocks.queryData.mockReset();
+    apiMocks.queryStream.mockReset().mockResolvedValue({
+      kind: "answer",
+      session_id: "session-1",
+      turn_id: "turn-1",
       answer: "Demo 中共有 3 条记录。",
       sql: "SELECT COUNT(id) AS count FROM items",
       columns: ["count"],
       rows: [{ count: 3 }],
       chart: null,
       trace: [
-        { step: "RetrieveSchema", status: "success", message: "Schema matched." },
+        {
+          step: "RetrieveSchema",
+          status: "success",
+          message: "Schema matched.",
+          sequence: 1,
+        },
       ],
-      error: null,
+      confidence: "high",
     });
     useQueryStore.setState({
       database: "",
@@ -82,10 +93,10 @@ describe("QueryResultDemo", () => {
       "有多少条记录？{enter}",
     );
 
-    await waitFor(() => expect(apiMocks.queryData).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(apiMocks.queryStream).toHaveBeenCalledTimes(1));
     expect(await screen.findByText("Demo 中共有 3 条记录。")).toBeVisible();
     expect(screen.getByText("SELECT COUNT(id) AS count FROM items")).toBeVisible();
-    expect(screen.getByText("思考过程")).toBeVisible();
+    expect(screen.getByText("执行过程")).toBeVisible();
     expect(screen.getByRole("columnheader", { name: "count" })).toBeVisible();
     expect(screen.queryByText("图表配置已返回")).not.toBeInTheDocument();
   });

@@ -1,14 +1,20 @@
 import { create } from "zustand";
 import * as apiClient from "../api/query";
+import { queryStream as streamQuery } from "../api/queryStream";
 import type { QueryRequest } from "../api/query";
 import type {
   ChatTurn,
+  ClarificationResolution,
   DatabaseInfo,
+  QueryStreamEvent,
   QueryResponse,
   RestoredSession,
   RestoredTurn,
   SessionInfo,
   SessionSummary,
+  TraceEvent,
+  V2QueryRequest,
+  V2QueryResponse,
 } from "../types/query";
 
 export interface QueryApi {
@@ -18,6 +24,11 @@ export interface QueryApi {
   listSessions: () => Promise<SessionSummary[]>;
   getSession: (sessionId: string) => Promise<RestoredSession>;
   queryData: (data: QueryRequest) => Promise<QueryResponse>;
+  queryStream: (
+    data: V2QueryRequest,
+    onEvent: (event: QueryStreamEvent) => void,
+    signal?: AbortSignal,
+  ) => Promise<V2QueryResponse>;
 }
 
 export interface QueryState {
@@ -39,6 +50,12 @@ export interface QueryState {
   newChat: () => Promise<void>;
   sendMessage: (question: string) => Promise<void>;
   retryTurn: (turnId: string) => Promise<void>;
+  resolveClarification: (
+    turnId: string,
+    clarificationId: string,
+    resolution: Omit<ClarificationResolution, "clarification_id">,
+  ) => Promise<void>;
+  cancelActiveQuery: () => void;
 }
 
 function errorMessage(error: unknown): string {
@@ -148,9 +165,36 @@ function restoredChatTurn(
   };
 }
 
-export function createQueryStore(api: QueryApi = apiClient) {
+const defaultApi: QueryApi = {
+  ...apiClient,
+  queryStream: (request, onEvent, signal) =>
+    streamQuery(request, onEvent, undefined, signal),
+};
+
+function finalStatus(response: V2QueryResponse): ChatTurn["status"] {
+  if (response.kind === "clarification") return "awaiting_clarification";
+  if (response.kind === "partial") return "partial";
+  if (response.kind === "error") return "error";
+  return "success";
+}
+
+function mergeTrace(...sources: TraceEvent[][]): TraceEvent[] {
+  const bySequence = new Map<number, TraceEvent>();
+  for (const source of sources) {
+    for (const event of source) bySequence.set(event.sequence, event);
+  }
+  return [...bySequence.values()].sort((a, b) => a.sequence - b.sequence);
+}
+
+export function createQueryStore(api: QueryApi = defaultApi) {
   let turnSequence = 0;
   let historyRequestGeneration = 0;
+  let operationSequence = 0;
+  let activeOperation: {
+    id: number;
+    turnId: string;
+    controller: AbortController;
+  } | null = null;
 
   return create<QueryState>((set, get) => {
     const invalidateHistoryRequest = () => {
@@ -177,29 +221,75 @@ export function createQueryStore(api: QueryApi = apiClient) {
       return session.session_id;
     };
 
-    const runTurn = async (turnId: string, question: string) => {
+    const runTurn = async (
+      turnId: string,
+      requestForSession: (sessionId: string) => V2QueryRequest,
+    ) => {
+      const operation = {
+        id: ++operationSequence,
+        turnId,
+        controller: new AbortController(),
+      };
+      activeOperation = operation;
+      const isCurrent = () => activeOperation?.id === operation.id;
+      let lastSequence = -1;
+      const streamedTrace: TraceEvent[] = [];
+
+      const onEvent = (event: QueryStreamEvent) => {
+        if (!isCurrent() || event.type !== "trace") return;
+        if (event.data.sequence <= lastSequence) return;
+        lastSequence = event.data.sequence;
+        streamedTrace.push(event.data);
+        set((state) => ({
+          turns: state.turns.map((turn) => {
+            if (turn.id !== turnId) return turn;
+            const existingTrace = turn.response?.trace ?? [];
+            return {
+              ...turn,
+              response: {
+                answer: "",
+                trace: [...existingTrace, event.data],
+              },
+            };
+          }),
+        }));
+      };
+
       try {
         const sessionId = await ensureSession();
-        const response = await api.queryData({
-          database_id: get().database,
-          question,
-          session_id: sessionId,
-        });
+        if (!isCurrent() || operation.controller.signal.aborted) return;
+        const response = await api.queryStream(
+          requestForSession(sessionId),
+          onEvent,
+          operation.controller.signal,
+        );
+        if (!isCurrent()) return;
+        const normalizedResponse = {
+          ...response,
+          trace: mergeTrace(streamedTrace, response.trace),
+        } as V2QueryResponse;
         updateTurn(turnId, {
-          status: response.error ? "error" : "success",
-          response,
-          error: response.error || undefined,
+          status: finalStatus(response),
+          response: normalizedResponse,
+          error: response.kind === "error" ? response.message : undefined,
         });
-        if (!response.error) {
-          await get().loadSessions();
-        }
+        activeOperation = null;
+        set({ loading: false });
+        await get().loadSessions();
       } catch (error) {
+        if (!isCurrent()) return;
         updateTurn(turnId, {
           status: "error",
-          error: errorMessage(error),
+          error:
+            error instanceof DOMException && error.name === "AbortError"
+              ? "查询已取消。"
+              : errorMessage(error),
         });
       } finally {
-        set({ loading: false });
+        if (isCurrent()) {
+          activeOperation = null;
+          set({ loading: false });
+        }
       }
     };
 
@@ -331,7 +421,11 @@ export function createQueryStore(api: QueryApi = apiClient) {
           loading: true,
           validationError: null,
         }));
-        await runTurn(turn.id, question);
+        await runTurn(turn.id, (sessionId) => ({
+          database_id: state.database,
+          question,
+          session_id: sessionId,
+        }));
       },
 
       retryTurn: async (turnId) => {
@@ -349,7 +443,54 @@ export function createQueryStore(api: QueryApi = apiClient) {
           error: undefined,
         });
         set({ loading: true, validationError: null });
-        await runTurn(turnId, turn.question);
+        await runTurn(turnId, (sessionId) => ({
+          database_id: turn.databaseId,
+          question: turn.question,
+          session_id: sessionId,
+        }));
+      },
+
+      resolveClarification: async (turnId, clarificationId, resolution) => {
+        const state = get();
+        if (state.loading) return;
+        const turn = state.turns.find((item) => item.id === turnId);
+        const response = turn?.response;
+        if (
+          !turn ||
+          turn.status !== "awaiting_clarification" ||
+          !response ||
+          !("kind" in response) ||
+          response.kind !== "clarification" ||
+          response.clarification_id !== clarificationId ||
+          !state.sessionId
+        ) {
+          return;
+        }
+
+        invalidateHistoryRequest();
+        updateTurn(turnId, {
+          status: "loading",
+          response: { answer: "", trace: response.trace },
+          error: undefined,
+        });
+        set({ loading: true, validationError: null });
+        await runTurn(turnId, (sessionId) => ({
+          database_id: turn.databaseId,
+          session_id: sessionId,
+          clarification: { clarification_id: clarificationId, ...resolution },
+        }));
+      },
+
+      cancelActiveQuery: () => {
+        const operation = activeOperation;
+        if (!operation) return;
+        activeOperation = null;
+        operation.controller.abort();
+        updateTurn(operation.turnId, {
+          status: "error",
+          error: "查询已取消。",
+        });
+        set({ loading: false });
       },
     };
   });

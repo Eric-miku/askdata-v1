@@ -19,11 +19,12 @@ describe("AgentTrace", () => {
       />,
     );
 
-    expect(screen.getByText("思考过程")).toBeInTheDocument();
+    expect(screen.getByText("执行过程")).toBeInTheDocument();
+    expect(screen.queryByText("思考过程")).not.toBeInTheDocument();
     expect(screen.getByText("2 个步骤")).toBeInTheDocument();
     expect(screen.queryByText("检索数据库结构")).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "展开思考过程" }));
+    await user.click(screen.getByRole("button", { name: "展开执行过程" }));
 
     expect(screen.getByText("检索数据库结构")).toBeVisible();
     expect(screen.getByText(/SQL execution failed/)).toBeVisible();
@@ -43,7 +44,7 @@ describe("AgentTrace", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "展开思考过程" }));
+    await user.click(screen.getByRole("button", { name: "展开执行过程" }));
 
     expect(screen.getByText("SELECT COUNT(id) FROM items").tagName).toBe("CODE");
   });
