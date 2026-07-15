@@ -1,6 +1,7 @@
 """AgentGraph — minimal NL2SQL orchestration chain. Delegates to ReActSqlAgent or falls back to a one-shot SQL pipeline with repair."""
 
 import asyncio
+from collections.abc import Mapping
 
 from askdata.agent.prompts import BuildRepairPrompt, BuildSqlPrompt
 from askdata.agent.pipeline import StagedSqlPipeline
@@ -9,6 +10,9 @@ from askdata.core.llm import LLMClient
 from askdata.tools.analyzer import ResultAnalyzer
 from askdata.tools.retriever import SemanticRetriever
 from askdata.tools.skill_loader import SkillLoader
+
+
+_VECTOR_FALLBACK_MESSAGE = "Semantic retrieval unavailable; lexical schema matched."
 
 
 class AgentGraph:
@@ -39,7 +43,16 @@ class AgentGraph:
         retriever = self.retriever or SemanticRetriever(processed_dir=self.processed_dir).Build()
         context = retriever.index.Retrieve(database_id, question)
         schema_prompt = context["schema_prompt"]
-        retrieval_event = self._TraceStep("RetrieveSchema", "success", "Schema matched.")
+        retrieval_trace = context.get("retrieval_trace")
+        has_retrieval_warning = isinstance(retrieval_trace, list) and any(
+            isinstance(event, Mapping) and event.get("status") == "warning"
+            for event in retrieval_trace
+        )
+        retrieval_event = self._TraceStep(
+            "RetrieveSchema",
+            "warning" if has_retrieval_warning else "success",
+            _VECTOR_FALLBACK_MESSAGE if has_retrieval_warning else "Schema matched.",
+        )
         trace.append(retrieval_event)
         if emit:
             emit(dict(retrieval_event))

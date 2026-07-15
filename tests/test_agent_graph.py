@@ -166,6 +166,37 @@ def test_agent_graph_uses_staged_pipeline_for_chat_llm(tmp_path):
     }
 
 
+def test_agent_graph_surfaces_sanitized_vector_fallback_warning(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE items(id INTEGER)")
+        connection.executemany("INSERT INTO items(id) VALUES (?)", [(1,), (2,), (3,)])
+    retriever = TrackingRetriever({
+        "database_id": "demo",
+        "database_path": str(database_path),
+        "schema_prompt": "Database: demo\nTable items(id integer)",
+        "retrieval_trace": [{
+            "status": "warning",
+            "message": "secret-token embedding service exploded",
+        }],
+    })
+    events = []
+
+    result = AgentGraph(
+        retriever=retriever,
+        react_agent=FakeReactAgent(),
+        analyzer=FakeAnalyzer(),
+    ).Run(question="How many items?", database_id="demo", emit=events.append)
+
+    assert result["trace"][0] == {
+        "step": "RetrieveSchema",
+        "status": "warning",
+        "message": "Semantic retrieval unavailable; lexical schema matched.",
+    }
+    assert events[0] == result["trace"][0]
+    assert "secret-token" not in str(result["trace"])
+
+
 def test_agent_graph_keeps_one_shot_fallback_for_llm_without_chat(tmp_path):
     database_path = tmp_path / "demo.sqlite"
     with sqlite3.connect(database_path) as connection:
