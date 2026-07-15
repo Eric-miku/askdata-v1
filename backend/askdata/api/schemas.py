@@ -1,6 +1,6 @@
-from typing import Any, Dict, List, Optional, Self
+from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def _strip_optional(value: Optional[str]) -> Optional[str]:
@@ -13,8 +13,16 @@ class ClarificationResolution(BaseModel):
     option_id: Optional[str] = None
     text: Optional[str] = None
 
+    @field_validator("clarification_id")
+    @classmethod
+    def require_nonblank_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("clarification_id must not be blank")
+        return value
+
     @model_validator(mode="after")
-    def require_exactly_one_resolution(self) -> Self:
+    def require_exactly_one_resolution(self) -> "ClarificationResolution":
         self.option_id = _strip_optional(self.option_id)
         self.text = _strip_optional(self.text)
 
@@ -30,7 +38,7 @@ class QueryRequest(BaseModel):
     clarification: Optional[ClarificationResolution] = None
 
     @model_validator(mode="after")
-    def require_exactly_one_input(self) -> Self:
+    def require_exactly_one_input(self) -> "QueryRequest":
         self.question = _strip_optional(self.question)
 
         if bool(self.question) == (self.clarification is not None):

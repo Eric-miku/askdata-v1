@@ -6,7 +6,15 @@ from pydantic import TypeAdapter, ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from askdata.api.response_models import AnswerResponse, QueryResponse
+from askdata.api.response_models import (
+    AnswerResponse,
+    ChartSpec,
+    ClarificationResponse,
+    ErrorResponse,
+    PartialResponse,
+    QueryResponse,
+    TraceEvent,
+)
 from askdata.api.schemas import ClarificationResolution, QueryRequest
 
 
@@ -125,6 +133,22 @@ def test_clarification_resolution_accepts_exactly_one_resolution(
     assert resolution.text == expected_text
 
 
+def test_clarification_resolution_strips_nonblank_id():
+    resolution = ClarificationResolution(
+        clarification_id="  clarification-1  ", option_id="option-1"
+    )
+
+    assert resolution.clarification_id == "clarification-1"
+
+
+@pytest.mark.parametrize("clarification_id", ["", "   "])
+def test_clarification_resolution_rejects_blank_id(clarification_id):
+    with pytest.raises(ValidationError):
+        ClarificationResolution(
+            clarification_id=clarification_id, option_id="option-1"
+        )
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -162,3 +186,147 @@ def test_query_response_rejects_invalid_confidence():
                 "confidence": "certain",
             }
         )
+
+
+def test_query_response_parses_clarification_variant_and_strips_id():
+    response = TypeAdapter(QueryResponse).validate_python(
+        {
+            "kind": "clarification",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "clarification_id": "  clarification-1  ",
+            "question": "Which year should be used?",
+            "options": [
+                {
+                    "id": "latest",
+                    "label": "Latest year",
+                    "description": "Use the newest available year.",
+                }
+            ],
+            "recommended_option_id": "latest",
+        }
+    )
+
+    assert isinstance(response, ClarificationResponse)
+    assert response.clarification_id == "clarification-1"
+    assert response.options[0].id == "latest"
+    assert response.trace == []
+
+
+@pytest.mark.parametrize("clarification_id", ["", "   "])
+def test_clarification_response_rejects_blank_id(clarification_id):
+    with pytest.raises(ValidationError):
+        TypeAdapter(QueryResponse).validate_python(
+            {
+                "kind": "clarification",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "clarification_id": clarification_id,
+                "question": "Which year should be used?",
+                "options": [],
+            }
+        )
+
+
+def test_query_response_parses_partial_variant_with_defaults():
+    response = TypeAdapter(QueryResponse).validate_python(
+        {
+            "kind": "partial",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "answer": "Only recent data was available.",
+            "limitations": ["Historical rows are missing."],
+            "suggestions": ["Try a narrower date range."],
+            "confidence": "low",
+        }
+    )
+
+    assert isinstance(response, PartialResponse)
+    assert response.columns == []
+    assert response.rows == []
+    assert response.chart is None
+    assert response.sql is None
+
+
+def test_partial_response_rejects_invalid_confidence():
+    with pytest.raises(ValidationError):
+        TypeAdapter(QueryResponse).validate_python(
+            {
+                "kind": "partial",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "answer": "Only recent data was available.",
+                "limitations": [],
+                "suggestions": [],
+                "confidence": "certain",
+            }
+        )
+
+
+def test_query_response_parses_error_variant_with_isolated_defaults():
+    adapter = TypeAdapter(QueryResponse)
+    first = adapter.validate_python(
+        {
+            "kind": "error",
+            "session_id": "session-1",
+            "turn_id": "turn-1",
+            "code": "query_failed",
+            "message": "The query failed.",
+            "retryable": True,
+        }
+    )
+    second = adapter.validate_python(
+        {
+            "kind": "error",
+            "session_id": "session-1",
+            "turn_id": "turn-2",
+            "code": "query_failed",
+            "message": "The query failed again.",
+            "retryable": False,
+        }
+    )
+
+    assert isinstance(first, ErrorResponse)
+    first.suggestions.append("Try again later.")
+    assert second.suggestions == []
+
+
+def test_error_response_rejects_missing_retryable_flag():
+    with pytest.raises(ValidationError):
+        TypeAdapter(QueryResponse).validate_python(
+            {
+                "kind": "error",
+                "session_id": "session-1",
+                "turn_id": "turn-1",
+                "code": "query_failed",
+                "message": "The query failed.",
+            }
+        )
+
+
+def test_chart_spec_accepts_enums_and_has_isolated_defaults():
+    first = ChartSpec(type="scatter", title="Correlation", reason="correlation")
+    second = ChartSpec(type="pie", title="Share", reason="proportion")
+
+    first.value_fields.append("revenue")
+    first.value_labels["revenue"] = "Revenue"
+
+    assert second.value_fields == []
+    assert second.value_labels == {}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "area", "title": "Trend", "reason": "time_series"},
+        {"type": "line", "title": "Trend", "reason": "forecast"},
+    ],
+)
+def test_chart_spec_rejects_invalid_enums(payload):
+    with pytest.raises(ValidationError):
+        ChartSpec(**payload)
+
+
+def test_trace_event_rejects_invalid_status():
+    with pytest.raises(ValidationError):
+        TraceEvent(step="execute_sql", status="complete", message="Done.")

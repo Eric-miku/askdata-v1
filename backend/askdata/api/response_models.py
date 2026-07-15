@@ -1,6 +1,6 @@
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 Confidence = Literal["high", "medium", "low"]
@@ -53,6 +53,14 @@ class ClarificationResponse(ResponseBase):
     question: str
     options: list[ClarificationOption]
     recommended_option_id: str | None = None
+
+    @field_validator("clarification_id")
+    @classmethod
+    def require_nonblank_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("clarification_id must not be blank")
+        return value
 
 
 class PartialResponse(ResponseBase):
