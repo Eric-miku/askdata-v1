@@ -5,11 +5,11 @@ import base64
 import json
 import logging
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime, time
 from decimal import Decimal
 from enum import Enum
-from typing import Any, AsyncIterator, Callable, Mapping
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping
 
 from pydantic import BaseModel
 
@@ -47,6 +47,14 @@ _OPERATIONAL_TRACE_MESSAGES = {
 
 class QueryClarificationUnsupported(ValueError):
     """Compatibility exception retained for callers from before V2 clarification support."""
+
+
+def EncodeSse(event_name: str, payload: Mapping[str, Any]) -> str:
+    """Encode one compact server-sent event frame."""
+    if "\r" in event_name or "\n" in event_name:
+        raise ValueError("SSE event name must not contain a newline")
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event_name}\ndata: {data}\n\n"
 
 
 def _JsonSafe(value: Any) -> Any:
@@ -127,7 +135,53 @@ class QueryService:
         self._graph_factory = graph_factory
         self._locks = _KeyedLockManager()
 
-    async def Run(self, request: QueryRequest) -> QueryResponse:
+    async def Run(
+        self,
+        request: QueryRequest,
+        emit: Callable[[TraceEvent], Awaitable[None]] | None = None,
+    ) -> QueryResponse:
+        response = await self._Run(request)
+        if emit is not None:
+            for event in response.trace:
+                await emit(event)
+        return response
+
+    async def Stream(self, request: QueryRequest) -> AsyncIterator[str]:
+        """Stream sanitized operational events followed by exactly one final response."""
+        queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue(
+            maxsize=100
+        )
+
+        async def emit(event: TraceEvent) -> None:
+            await queue.put(("trace", event.model_dump(mode="json")))
+
+        async def produce() -> None:
+            try:
+                response = await self.Run(request, emit=emit)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Streaming query execution failed")
+                response = self._QueryFailed(
+                    request.session_id or "", str(uuid.uuid4())
+                )
+            await queue.put(("final", response.model_dump(mode="json")))
+            await queue.put(None)
+
+        task = asyncio.create_task(produce())
+        try:
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                yield EncodeSse(event[0], event[1])
+        finally:
+            if not task.done():
+                task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    async def _Run(self, request: QueryRequest) -> QueryResponse:
         if request.clarification is not None:
             return await self._ContinueClarification(request)
         if not request.question:

@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from askdata.api.query_service import QueryClarificationUnsupported, QueryService
 from askdata.api.response_models import QueryResponse
 from askdata.api.schemas import QueryRequest
@@ -325,3 +326,15 @@ async def execute_query(query_request: QueryRequest, request: Request):
         return await _QueryService(request).Run(query_request)
     except QueryClarificationUnsupported as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@router.post("/query/stream")
+async def stream_query(query_request: QueryRequest, request: Request):
+    return StreamingResponse(
+        _QueryService(request).Stream(query_request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
