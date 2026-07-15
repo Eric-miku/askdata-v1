@@ -39,7 +39,7 @@ class DemoSuite:
         clarification_expected = clarification_predicted = clarification_true = 0
         false_clarifications = clear_cases = 0
         unanswerable_expected = unanswerable_predicted = unanswerable_true = 0
-        proxy_queries = 0
+        proxy_queries = proxy_scope_total = 0
         chart_total = chart_valid = 0
         table_only_total = table_only_passed = 0
         empty_total = empty_passed = 0
@@ -61,7 +61,12 @@ class DemoSuite:
             if expected_kind is not None:
                 checks.append(predicted_kind == expected_kind)
 
-            checks.append(self._Present(prediction, "sql", missing_fields))
+            if predicted_kind in {"answer", "partial"}:
+                sql_present = self._Present(prediction, "sql", missing_fields)
+                sql = prediction.get("sql")
+                checks.append(
+                    sql_present and isinstance(sql, str) and bool(sql.strip())
+                )
             for field in _RUNTIME_FIELDS:
                 present = self._Present(prediction, field, missing_fields)
                 checks.append(present and self._NonnegativeNumber(prediction.get(field)))
@@ -86,7 +91,13 @@ class DemoSuite:
             unanswerable_expected += int(expected_unanswerable)
             unanswerable_predicted += int(predicted_unanswerable)
             unanswerable_true += int(expected_unanswerable and predicted_unanswerable)
-            if expected_unanswerable:
+            proxy_scope = (
+                expected_unanswerable
+                or expected_kind == "error"
+                or predicted_kind == "error"
+            )
+            if proxy_scope:
+                proxy_scope_total += 1
                 has_proxy_query = bool(str(prediction.get("sql") or "").strip())
                 proxy_queries += int(has_proxy_query)
                 checks.append(not has_proxy_query)
@@ -258,7 +269,7 @@ class DemoSuite:
             "false_clarification_rate": self._Rate(false_clarifications, clear_cases),
             "unanswerable_precision": self._Rate(unanswerable_true, unanswerable_predicted),
             "unanswerable_recall": self._Rate(unanswerable_true, unanswerable_expected),
-            "proxy_query_rate": self._Rate(proxy_queries, unanswerable_expected),
+            "proxy_query_rate": self._Rate(proxy_queries, proxy_scope_total),
             "chart_spec_validity": self._Rate(chart_valid, chart_total),
             "table_only_correctness": self._Rate(
                 table_only_passed, table_only_total
@@ -347,12 +358,12 @@ class DemoSuite:
 
     @staticmethod
     def _ColumnMatches(gold: set[str], retrieved: set[str]) -> int:
-        """Match canonical columns with either qualified or bare captured names."""
+        """Only bare gold names may use conservative terminal-name matching."""
         retrieved_bare = {value.rsplit(".", 1)[-1] for value in retrieved}
         return sum(
             1
             for value in gold
-            if value in retrieved or value.rsplit(".", 1)[-1] in retrieved_bare
+            if value in retrieved or ("." not in value and value in retrieved_bare)
         )
 
     @staticmethod

@@ -1,6 +1,7 @@
 {
   "version": 1,
   "name": "askdata-v2.1-golden-journeys",
+  "embedded_predictions_usage": "test-only examples; never accepted as evaluation evidence",
   "cases": [
     {
       "id": "ranking",

@@ -83,6 +83,42 @@ def test_missing_prediction_fields_never_pass_and_are_reported():
     }
 
 
+def test_sql_requirement_depends_on_response_kind():
+    cases = [
+        {"id": "answer", "category": "clear", "expected_kind": "answer"},
+        {"id": "partial", "category": "partial", "expected_kind": "partial"},
+        {"id": "clarify", "category": "ambiguous", "expected_kind": "clarification"},
+        {
+            "id": "error",
+            "category": "unanswerable",
+            "expected_kind": "error",
+            "expected_error_code": "unanswerable_from_schema",
+        },
+    ]
+    runtime = {"latency_ms": 1, "llm_calls": 0, "sql_executions": 0, "token_usage": 0}
+    predictions = [
+        {"id": "answer", "kind": "answer", "sql": None, **runtime},
+        {"id": "partial", "kind": "partial", "sql": "   ", **runtime},
+        {"id": "clarify", "kind": "clarification", **runtime},
+        {
+            "id": "error",
+            "kind": "error",
+            "code": "unanswerable_from_schema",
+            **runtime,
+        },
+    ]
+
+    report = DemoSuite(cases).Compare(predictions)
+
+    assert {item["id"]: item["passed"] for item in report["cases"]} == {
+        "answer": False,
+        "partial": False,
+        "clarify": True,
+        "error": True,
+    }
+    assert report["missing_fields"] == {}
+
+
 def test_zero_denominator_rates_are_zero_not_vacuous_passes():
     cases = [{"id": "clear", "category": "clear", "expected_kind": "answer"}]
     predictions = [{
@@ -229,11 +265,43 @@ def test_retrieval_recall_is_case_insensitive_and_missing_retrieval_fails_case()
     assert missing["summary"]["passed"] == 0
 
 
+def test_qualified_gold_columns_do_not_match_same_named_columns_from_other_tables():
+    cases = [{
+        "id": "join",
+        "category": "clear",
+        "expected_kind": "answer",
+        "gold_columns": ["schools.id", "districts.id"],
+    }]
+    prediction = {
+        "id": "join",
+        "kind": "answer",
+        "sql": "SELECT schools.id FROM schools",
+        "retrieved_columns": ["schools.id", "other.id"],
+        "latency_ms": 1,
+        "llm_calls": 0,
+        "sql_executions": 1,
+        "token_usage": 0,
+    }
+
+    report = DemoSuite(cases).Compare([prediction])
+
+    assert report["retrieval_column_recall_at_k"] == 0.5
+    assert report["summary"]["passed"] == 0
+
+
 def test_eval_demo_cli_writes_report_atomically_and_prints_category_table(tmp_path):
     out = tmp_path / "reports" / "demo.json"
+    _, predictions = load_fixture()
+    predictions_path = tmp_path / "predictions.json"
+    predictions_path.write_text(
+        json.dumps({"version": 1, "predictions": predictions}), encoding="utf-8"
+    )
 
     result = CliRunner().invoke(cli.app, [
-        "eval-demo", "--cases", str(FIXTURE), "--out", str(out)
+        "eval-demo",
+        "--cases", str(FIXTURE),
+        "--predictions", str(predictions_path),
+        "--out", str(out),
     ])
 
     assert result.exit_code == 0
@@ -242,6 +310,48 @@ def test_eval_demo_cli_writes_report_atomically_and_prints_category_table(tmp_pa
     assert "13/13" in result.output
     assert json.loads(out.read_text(encoding="utf-8"))["summary"]["passed"] == 13
     assert list(out.parent.glob("*.tmp")) == []
+
+
+def test_eval_demo_cli_requires_explicit_prediction_capture(tmp_path):
+    out = tmp_path / "report.json"
+
+    result = CliRunner().invoke(cli.app, [
+        "eval-demo", "--cases", str(FIXTURE), "--out", str(out)
+    ])
+
+    assert result.exit_code != 0
+    assert "--predictions" in result.output
+    assert not out.exists()
+
+
+def test_eval_demo_rejects_output_collision_before_overwriting_inputs(tmp_path):
+    cases, predictions = load_fixture()
+    cases_path = tmp_path / "cases.json"
+    predictions_path = tmp_path / "predictions.json"
+    cases_payload = json.dumps({"version": 1, "cases": cases})
+    prediction_payload = json.dumps({"version": 1, "predictions": predictions})
+    cases_path.write_text(cases_payload, encoding="utf-8")
+    predictions_path.write_text(prediction_payload, encoding="utf-8")
+
+    cases_collision = CliRunner().invoke(cli.app, [
+        "eval-demo",
+        "--cases", str(cases_path),
+        "--predictions", str(predictions_path),
+        "--out", str(cases_path.parent / "." / cases_path.name),
+    ])
+    predictions_collision = CliRunner().invoke(cli.app, [
+        "eval-demo",
+        "--cases", str(cases_path),
+        "--predictions", str(predictions_path),
+        "--out", str(predictions_path),
+    ])
+
+    assert cases_collision.exit_code != 0
+    assert predictions_collision.exit_code != 0
+    assert "must differ" in cases_collision.output
+    assert "must differ" in predictions_collision.output
+    assert cases_path.read_text(encoding="utf-8") == cases_payload
+    assert predictions_path.read_text(encoding="utf-8") == prediction_payload
 
 
 def test_eval_demo_cli_accepts_separate_predictions_and_fails_on_golden_failure(tmp_path):

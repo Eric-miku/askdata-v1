@@ -7,10 +7,11 @@
 ```bash
 uv run askdata eval-demo \
   --cases tests/fixtures/v2_demo_cases.json \
+  --predictions reports/v2-demo-predictions.json \
   --out reports/v2-demo.json
 ```
 
-也可以用 `--predictions captured-predictions.json` 比较单独捕获的预测。命令只做确定性离线比较，不调用 LLM、数据库或向量服务；任一黄金旅程失败时退出码为非零。报告包含按类别通过率、澄清与不可回答检测、代理查询率、ChartSpec、检索 recall@K、流式一致性、重启持久性、延迟分位数和调用/执行/token 计数。
+`--predictions` 是必填项，必须指向从待评系统捕获的输出；case 文件内的示例 prediction 只供自动化测试，不能作为发布证据。比较命令本身不调用 LLM、数据库或向量服务；任一黄金旅程失败时退出码为非零。报告包含按类别通过率、澄清与不可回答检测、代理查询率、ChartSpec、检索 recall@K、流式一致性、重启持久性、延迟分位数和调用/执行/token 计数。
 
 ## BIRD Mini-Dev 固定基线
 

@@ -170,26 +170,26 @@ def EvalBird(
 @app.command("eval-demo")
 def EvalDemo(
     cases: Path = typer.Option(..., "--cases", help="Versioned demo case JSON"),
-    predictions: Path | None = typer.Option(
-        None,
+    predictions: Path = typer.Option(
+        ...,
         "--predictions",
-        help="Captured prediction JSON; defaults to embedded case predictions",
+        help="Captured prediction JSON from the system under evaluation",
     ),
     out: Path = typer.Option(
         Path("reports/v2-demo.json"), "--out", "-o", help="JSON report output path"
     ),
 ):
     """Compare offline V2 demo predictions and write a deterministic report."""
+    resolved_cases = cases.resolve()
+    resolved_predictions = predictions.resolve()
+    resolved_out = out.resolve()
+    if resolved_out in {resolved_cases, resolved_predictions}:
+        raise typer.BadParameter(
+            "--out must differ from --cases and --predictions"
+        )
     try:
         loaded_cases = DemoSuite.Load(cases, "cases")
-        if predictions is not None:
-            loaded_predictions = DemoSuite.Load(predictions, "predictions")
-        else:
-            loaded_predictions = []
-            for item in loaded_cases:
-                prediction = item.pop("prediction", None)
-                if isinstance(prediction, dict):
-                    loaded_predictions.append({"id": item["id"], **prediction})
+        loaded_predictions = DemoSuite.Load(predictions, "predictions")
         report = DemoSuite(loaded_cases).Compare(loaded_predictions)
         DemoSuite.WriteReport(report, out)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
