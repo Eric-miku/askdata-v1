@@ -14,7 +14,7 @@
 | Frontend production build | Verified | TypeScript and Vite build exit 0; bundle-size warning remains |
 | Restart persistence | Verified locally | API-created session listed and reopened after a new application lifespan; one turn persisted |
 | Vector outage fallback | Verified locally | Outage, disabled-vector, and restart-focused tests: `3 passed`; remote exception details suppressed by the tested contract |
-| Live vector retrieval | Blocked | The application requires `MILVUS_URI`; the available environment provides only `MILVUS_HOST` |
+| Live vector retrieval | Blocked | `MILVUS_URI` is absent and the optional `pymilvus` dependency is not installed |
 | Golden demo predictions | Blocked | No supported capture command or separate captured prediction artifact exists in the repository |
 | Fixed 100-question BIRD baseline | Not run | Data and manifest exist, but processed database paths target another checkout; after an interrupted escalation wait, long/live runs were intentionally not restarted |
 
@@ -62,10 +62,10 @@ Observed: exit 0; `3 passed in 0.04s`.
 
 This verifies two degraded paths:
 
-1. A vector startup/search failure falls back once to lexical retrieval, returns a fixed safe warning, and does not expose the remote failure text.
-2. `VECTOR_RETRIEVAL_ENABLED=false` does not construct the embedding client and still returns lexical schema context.
+1. A fully configured vector startup/search failure falls back once to lexical retrieval, returns a fixed safe warning, and does not expose the remote failure text.
+2. `VECTOR_RETRIEVAL_ENABLED=false` does not construct the embedding client, silently uses lexical retrieval, and still returns lexical schema context. Incomplete vector configuration follows the same silent lexical path.
 
-Live semantic retrieval was not exercised. `EMBEDDING_API_URL` is present, but the runtime setting `MILVUS_URI` is not; a differently named `MILVUS_HOST` entry is not consumed by AskData.
+Live semantic retrieval was not exercised. `EMBEDDING_API_URL` is present, but the runtime setting `MILVUS_URI` is not; a differently named `MILVUS_HOST` entry is not consumed by AskData. The optional `pymilvus` package is also absent, so both `MILVUS_URI` and `uv sync --extra vector` are required before a live check.
 
 ### Restart persistence through the API
 
@@ -143,13 +143,13 @@ The resulting evidence must report relaxed execution accuracy, strict execution 
 | ChartSpec contains no executable options | Backend and frontend suites passed |
 | Existing frontend shell/tokens/accessibility remain intact | Frontend suite and production build passed |
 | Sessions survive restart and reopen | Verified through real local API routes with one persisted turn |
-| Streaming and non-streaming terminal parity | Covered by deterministic tests; not live-demo captured |
+| Streaming and non-streaming final-payload parity | Covered by deterministic tests; not live-demo captured. A completed stream ends in one `final`; clarification/error may also have a preceding lifecycle frame |
 | Fixed-manifest strict and relaxed BIRD accuracy | Blocked; no V2.1 report generated |
 
 ## Known limitations and follow-ups
 
 1. Add a first-class demo prediction capture command or documented harness; `eval-demo` intentionally compares only.
-2. Provide `MILVUS_URI` and install `uv sync --extra vector` before claiming live semantic retrieval.
+2. Provide `MILVUS_URI` and install `pymilvus` with `uv sync --extra vector` before claiming live semantic retrieval.
 3. Regenerate or relocate the BIRD processed metadata so database paths are portable across worktrees.
 4. Run the fixed 100-question baseline once the data path and live LLM preconditions are satisfied.
 5. Split the frontend bundle to address Vite's greater-than-500-kB chunk warning.

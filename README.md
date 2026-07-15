@@ -87,7 +87,7 @@ uv run askdata index-schema \
 
 When the semantic retriever is built, AskData validates the embedding response and performs a Milvus probe. Runtime retrieval embeds the original question (and resolved conversational wording when different), searches attributable schema/value/evidence/example chunks, and fuses lexical and dense rankings with reciprocal-rank fusion. Foreign-key neighbors are added for join coverage.
 
-If vector configuration is disabled, incomplete, or the remote service fails validation/search, AskData continues with lexical retrieval and emits a safe warning. It never forwards remote exception details to the response. Low schema coverage may lead to a schema-supported clarification; when the requested entity is absent, the response is `unanswerable_from_schema` and no proxy SQL is executed.
+If vector retrieval is disabled or its configuration is incomplete, AskData silently uses lexical retrieval. If a fully configured remote embedding or Milvus service fails validation or search, AskData falls back to lexical retrieval and emits a fixed safe warning. It never forwards remote exception details to the response. Low schema coverage may lead to a schema-supported clarification; when the requested entity is absent, the response is `unanswerable_from_schema` and no proxy SQL is executed.
 
 ## Query API
 
@@ -99,9 +99,9 @@ curl -sS http://127.0.0.1:8000/api/query \
   -d '{"question":"top five schools by enrollment","database_id":"california_schools"}'
 ```
 
-`POST /api/query` returns one discriminated response with `kind` equal to `answer`, `clarification`, `partial`, or `error`. Every response includes `session_id`, `turn_id`, and a curated operational `trace`. Answer and partial responses may include SQL, columns, at most 100 preview rows, confidence, and a chart.
+`POST /api/query` uses a discriminated contract whose reserved `kind` values are `answer`, `clarification`, `partial`, and `error`. The current `QueryService` emits `answer`, `clarification`, or `error`; `partial` is reserved for compatible future producers and is already supported by the frontend and evaluation tooling. Every emitted response includes `session_id`, `turn_id`, and a curated operational `trace`. Answer responses may include SQL, columns, at most 100 preview rows, confidence, and a chart.
 
-For live progress, send the same request to `POST /api/query/stream`. The response is `text/event-stream`: ordered `trace` events are followed by exactly one terminal event (`final`, `clarification`, `partial`, or `error`). The terminal payload uses the same response contract as `/api/query`; clients should use the terminal event as the source of truth and close or abort the stream when navigating away.
+For live progress, send the same request to `POST /api/query/stream`. The response is `text/event-stream`: zero or more ordered `trace` frames may be followed by an optional `clarification` or `error` lifecycle frame, and every normally completed stream ends with exactly one `final` frame. There is no `partial` lifecycle frame. The `final` payload uses the same response contract as `/api/query`; clients should use it as the source of truth and close or abort the stream when navigating away.
 
 Clarification responses contain a `clarification_id` and 2–4 schema-supported options. Resolve one with the existing session:
 
@@ -134,7 +134,7 @@ Charts are declarative data contracts, not executable ECharts options:
 }
 ```
 
-The frontend reads values only from returned row fields named by the validated specification. Unsupported shapes remain table-only. Empty results remain successful answers with an empty table; incomplete but useful results use `partial` with explicit limitations and suggestions. Execution errors use stable safe error payloads and never expose database or model internals.
+The frontend reads values only from returned row fields named by the validated specification. Unsupported shapes remain table-only, and empty results remain successful answers with an empty table. The reserved `partial` contract carries explicit limitations and suggestions when a compatible producer supplies it, but the current `QueryService` does not emit that state. Execution errors use stable safe error payloads and never expose database or model internals.
 
 ## Sessions and metadata
 
