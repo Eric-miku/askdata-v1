@@ -46,6 +46,21 @@ class FailingAnalyzer:
         raise AssertionError("analyzer must not run without a trustworthy candidate")
 
 
+class RecordingChartBuilder:
+    def __init__(self):
+        self.calls = []
+
+    def Build(self, question, intent, columns, rows):
+        self.calls.append((question, intent, columns, rows))
+        return {
+            "type": "horizontal_bar",
+            "title": "Top items",
+            "category_field": "name",
+            "value_fields": ["count"],
+            "reason": "ranking",
+        }
+
+
 class MappingRunner:
     def __init__(self, results):
         self.results = results
@@ -95,6 +110,52 @@ def test_pipeline_synthesizes_answer_after_selecting_final_candidate():
     assert analyzer.sql_seen == result["sql"]
     assert analyzer.rows_seen == result["rows"]
     assert result["answer"] == f"answer from {count_sql}"
+
+
+def test_pipeline_builds_chart_from_the_analyzed_selected_candidate():
+    sql = "SELECT name, count FROM items ORDER BY count DESC LIMIT 5"
+    rows = [{"name": "A", "count": 3}]
+    intent = IntentContract(shape="ranking", expected_max_rows=5)
+    analyzer = RecordingAnalyzer()
+    chart_builder = RecordingChartBuilder()
+    runner = MappingRunner({
+        sql: {"success": True, "columns": ["name", "count"], "rows": rows},
+    })
+    chart_retrieval = retrieval(intent)
+    chart_retrieval["schema"] = {"items": ["name", "count"]}
+    chart_retrieval["schema_prompt"] = "Database: demo\nTable items(name text, count integer)"
+
+    result = StagedSqlPipeline(
+        react=FakeReact([[SqlCandidateDraft(sql=sql)]]),
+        analyzer=analyzer,
+        chart_builder=chart_builder,
+        runner=runner,
+    ).Run(question="top five items by count", retrieval=chart_retrieval)
+
+    assert analyzer.sql_seen == sql
+    assert analyzer.rows_seen == rows
+    assert chart_builder.calls == [
+        ("top five items by count", intent, ["name", "count"], rows)
+    ]
+    assert result["chart"]["type"] == "horizontal_bar"
+
+
+def test_pipeline_does_not_build_chart_for_an_error():
+    chart_builder = RecordingChartBuilder()
+
+    result = StagedSqlPipeline(
+        react=FakeReact([[SqlCandidateDraft(sql="SELECT missing FROM items")]]),
+        analyzer=FailingAnalyzer(),
+        chart_builder=chart_builder,
+        runner=AlwaysFailingRunner(),
+    ).Run(
+        question="top items",
+        retrieval=retrieval(IntentContract(shape="ranking", expected_max_rows=5)),
+    )
+
+    assert result["kind"] == "error"
+    assert result["chart"] is None
+    assert chart_builder.calls == []
 
 
 def test_pipeline_never_executes_more_than_six_candidates():

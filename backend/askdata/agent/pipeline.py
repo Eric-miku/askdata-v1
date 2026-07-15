@@ -16,6 +16,7 @@ from askdata.agent.sql_quality import (
     SqlCandidate,
 )
 from askdata.tools.analyzer import ResultAnalyzer
+from askdata.tools.chart_builder import ChartBuilder
 
 
 _STAGES = (
@@ -70,6 +71,7 @@ class StagedSqlPipeline:
         retrieval_expander: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
         max_executions: int = 6,
         ambiguity_gate=None,
+        chart_builder=None,
     ) -> None:
         self.react = react
         self.analyzer = analyzer or ResultAnalyzer()
@@ -77,6 +79,7 @@ class StagedSqlPipeline:
         self.retrieval_expander = retrieval_expander
         self.max_executions = min(max(1, max_executions), 6)
         self.ambiguity_gate = ambiguity_gate
+        self.chart_builder = chart_builder or ChartBuilder()
 
     def Run(
         self,
@@ -241,7 +244,15 @@ class StagedSqlPipeline:
                         failure_class="repeated_no_progress",
                     )
                     return self._Finish(
-                        question, ledger, attempts, trace, last_failure, executions, expanded, emit
+                        question,
+                        ledger,
+                        attempts,
+                        trace,
+                        last_failure,
+                        executions,
+                        expanded,
+                        emit,
+                        intent,
                     )
                 seen_sql.add(normalized_key)
 
@@ -290,6 +301,7 @@ class StagedSqlPipeline:
                             executions,
                             expanded,
                             emit,
+                            intent,
                         )
                     previous_failure, previous_progress = static_class, progress
                     continue
@@ -341,6 +353,7 @@ class StagedSqlPipeline:
                             executions,
                             expanded,
                             emit,
+                            intent,
                         )
                     previous_failure, previous_progress = failure_class, progress
                     continue
@@ -375,7 +388,15 @@ class StagedSqlPipeline:
                 self._Emit(trace, emit, "ExecuteSql", "success" if failure_class is None else "retry")
                 if failure_class is None:
                     return self._Finish(
-                        question, ledger, attempts, trace, None, executions, expanded, emit
+                        question,
+                        ledger,
+                        attempts,
+                        trace,
+                        None,
+                        executions,
+                        expanded,
+                        emit,
+                        intent,
                     )
                 self._Emit(trace, emit, "RepairSql", "retry")
                 progress = self._Progress(static_report, result_report)
@@ -399,6 +420,7 @@ class StagedSqlPipeline:
                         executions,
                         expanded,
                         emit,
+                        intent,
                     )
                 previous_failure, previous_progress = failure_class, progress
 
@@ -406,10 +428,29 @@ class StagedSqlPipeline:
                 self._Emit(trace, emit, "RepairSql", "retry")
 
         return self._Finish(
-            question, ledger, attempts, trace, last_failure, executions, expanded, emit
+            question,
+            ledger,
+            attempts,
+            trace,
+            last_failure,
+            executions,
+            expanded,
+            emit,
+            intent,
         )
 
-    def _Finish(self, question, ledger, attempts, trace, failure_class, executions, expanded, emit):
+    def _Finish(
+        self,
+        question,
+        ledger,
+        attempts,
+        trace,
+        failure_class,
+        executions,
+        expanded,
+        emit,
+        intent,
+    ):
         verified_ledger = CandidateLedger()
         for candidate in ledger.candidates:
             if (
@@ -447,6 +488,9 @@ class StagedSqlPipeline:
         answer = self.analyzer.Analyze(
             question, selected.sql, selected.columns, selected.rows
         )
+        chart = self.chart_builder.Build(
+            question, intent, selected.columns, selected.rows
+        )
         self._Emit(trace, emit, "AnalyzeResult", "success")
         verified = bool(
             selected.static_report.passed
@@ -459,7 +503,7 @@ class StagedSqlPipeline:
             "sql": selected.sql,
             "columns": selected.columns,
             "rows": selected.rows,
-            "chart": None,
+            "chart": chart,
             "trace": trace,
             "error": None,
             "confidence": "high" if verified else "low",
