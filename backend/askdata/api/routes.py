@@ -17,12 +17,13 @@ API 路由定义 —— 所有 HTTP 接口的入口
 import os
 import glob
 import sqlite3
+import uuid
 from typing import List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query, Request
 from askdata.api.schemas import QueryRequest, QueryResponse
+from askdata.api.session_store import SessionStore
 from askdata.api.trace import TraceLogger
-from askdata.api.session_manager import session_manager
 from askdata.agent.graph import AgentGraph
 from askdata.core.config import settings
 from askdata.core.paths import project_path
@@ -35,6 +36,13 @@ router = APIRouter()
 # ============================================================
 # 辅助函数
 # ============================================================
+
+def _Store(request: Request) -> SessionStore:
+    store = getattr(request.app.state, "session_store", None)
+    if not isinstance(store, SessionStore):
+        raise RuntimeError("app.state.session_store must be an initialized SessionStore")
+    return store
+
 
 def _CountTables(db_path: str) -> int:
     try:
@@ -205,8 +213,13 @@ async def get_tables(database_id: str):
     }
 
 
+@router.get("/sessions")
+async def list_sessions(request: Request, limit: int = Query(50, ge=1, le=100)):
+    return await _Store(request).ListSessions(limit=limit)
+
+
 @router.post("/sessions")
-async def create_session(database_id: Optional[str] = None):
+async def create_session(request: Request, database_id: Optional[str] = None):
     """
     创建新的对话会话
 
@@ -226,17 +239,27 @@ async def create_session(database_id: Optional[str] = None):
     trace = TraceLogger()
     trace.log("创建会话", f"database_id={database_id}")
 
-    session_id = await session_manager.create_session(database_id)
+    store = _Store(request)
+    session_id = await store.CreateSession(database_id or "")
+    session = await store.GetSession(session_id)
 
     trace.log("会话创建成功", f"session_id={session_id}")
     return {
         "session_id": session_id,
-        "created_at": (await session_manager.get_session(session_id))["created_at"],
+        "created_at": session["created_at"],
     }
 
 
+@router.get("/sessions/{session_id}")
+async def get_session(session_id: str, request: Request):
+    session = await _Store(request).GetSession(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"会话 '{session_id}' 未找到")
+    return session
+
+
 @router.delete("/sessions/{session_id}")
-async def delete_session(session_id: str):
+async def delete_session(session_id: str, request: Request):
     """
     删除指定的对话会话
 
@@ -251,7 +274,7 @@ async def delete_session(session_id: str):
     trace = TraceLogger()
     trace.log("删除会话", f"session_id={session_id}")
 
-    success = await session_manager.delete_session(session_id)
+    success = await _Store(request).DeleteSession(session_id)
     if not success:
         trace.log("会话未找到", f"session_id={session_id}")
         raise HTTPException(
@@ -267,7 +290,7 @@ async def delete_session(session_id: str):
 
 
 @router.post("/query", response_model=QueryResponse)
-async def execute_query(request: QueryRequest):
+async def execute_query(query_request: QueryRequest, request: Request):
     """
     核心接口：自然语言查询转 SQL
 
@@ -291,27 +314,32 @@ async def execute_query(request: QueryRequest):
         调用 AgentGraph → ReActSqlAgent 完成 NL2SQL 全链路。
     """
     trace = TraceLogger()
-    trace.log("收到查询请求", f"question='{request.question}', database_id='{request.database_id}'")
+    if query_request.clarification is not None or not query_request.question:
+        raise HTTPException(status_code=422, detail="Only question queries are supported")
+
+    trace.log(
+        "收到查询请求",
+        f"question='{query_request.question}', database_id='{query_request.database_id}'",
+    )
 
     # ---------- 会话管理 ----------
-    session_id = request.session_id
+    store = _Store(request)
+    session_id = query_request.session_id
+    session = None
     if session_id:
         # 如果前端传了 session_id，查找是否存在
-        session = await session_manager.get_session(session_id)
-        if session is None:
+        session = await store.GetSession(session_id)
+        if session is None or session["database_id"] != query_request.database_id:
             trace.log("会话未找到，创建新会话", f"session_id={session_id}")
-            session_id = await session_manager.create_session(request.database_id)
-        else:
-            # 如果会话关联的数据库不同，更新它
-            if session["database_id"] != request.database_id:
-                await session_manager.update_database(session_id, request.database_id)
-                trace.log("更新会话数据库", f"new_database_id={request.database_id}")
+            session_id = await store.CreateSession(query_request.database_id)
+            session = await store.GetSession(session_id)
     else:
         # 没有 session_id，创建一个新会话
-        session_id = await session_manager.create_session(request.database_id)
+        session_id = await store.CreateSession(query_request.database_id)
+        session = await store.GetSession(session_id)
         trace.log("创建新会话", f"session_id={session_id}")
 
-    history = await session_manager.get_history(session_id) or []
+    history = session["turns"] if session else []
     session_context = {}
     if history:
         last_item = history[-1]
@@ -322,8 +350,8 @@ async def execute_query(request: QueryRequest):
 
     try:
         result = await AgentGraph().ARun(
-            question=request.question,
-            database_id=request.database_id,
+            question=query_request.question,
+            database_id=query_request.database_id,
             session_context=session_context,
         )
         response = QueryResponse(
@@ -348,11 +376,19 @@ async def execute_query(request: QueryRequest):
         )
 
     # ---------- 保存会话历史 ----------
-    await session_manager.append_history(
-        session_id=session_id,
-        question=request.question,
-        sql=response.sql,
-        answer=response.answer,
+    await store.SaveTurn(
+        session_id,
+        {
+            "id": str(uuid.uuid4()),
+            "question": query_request.question,
+            "response_kind": "error" if response.error else "answer",
+            "answer": response.answer,
+            "sql": response.sql,
+            "result_preview": response.rows,
+            "chart": response.chart,
+            "error": response.error,
+            "trace": response.trace,
+        },
     )
 
     trace.log("查询完成")
