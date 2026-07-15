@@ -817,7 +817,9 @@ def _source_filter_scope_groups(
     elif isinstance(source, exp.Subquery):
         query = source.this
     if query is None or (cte_name is not None and cte_name in visiting):
-        return []
+        # A contributing base relation (or unresolved recursive source) is a
+        # real path through the result even when it contributes no predicate.
+        return [[]]
 
     next_visiting = {*visiting, cte_name} if cte_name is not None else set(visiting)
     groups: list[list[exp.Where]] = []

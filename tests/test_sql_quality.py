@@ -353,6 +353,36 @@ def test_time_scope_traces_through_contributing_derived_table():
     assert "time" in report.covered_elements
 
 
+def test_filter_requires_every_contributing_path_to_be_filtered():
+    schema = {**SCHEMA, "items": {*SCHEMA["items"], "status"}}
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", entities=["items"], filters=["status = open"]),
+        "WITH filtered AS (SELECT name FROM items WHERE status = 'open') "
+        "SELECT filtered.name, raw.name FROM filtered "
+        "CROSS JOIN items AS raw",
+        schema,
+    )
+
+    assert "filter" not in report.covered_elements
+    assert "missing_filter" in report.failures
+    assert "unresolved_filter_alignment" in report.warnings
+
+
+def test_time_requires_every_contributing_path_to_be_filtered():
+    schema = {**SCHEMA, "items": {*SCHEMA["items"], "year"}}
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", entities=["items"], time_condition="year = 2025"),
+        "SELECT filtered.name, raw.name FROM "
+        "(SELECT name FROM items WHERE year = 2025) AS filtered "
+        "CROSS JOIN items AS raw",
+        schema,
+    )
+
+    assert "time" not in report.covered_elements
+    assert "missing_time_condition" in report.failures
+    assert "unresolved_time_alignment" in report.warnings
+
+
 def test_static_check_requires_every_requested_entity():
     report = EvaluateStaticSql(
         IntentContract(shape="listing", entities=["items", "schools"]),
