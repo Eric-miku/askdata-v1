@@ -168,6 +168,21 @@ def test_static_check_accepts_connected_alias_join_and_cte_join():
     assert "unconnected_join" not in with_cte.failures
 
 
+def test_static_check_allows_explicit_cross_join_to_scalar_subquery():
+    report = EvaluateStaticSql(
+        IntentContract(
+            shape="listing",
+            output_attributes=["name", "total_count"],
+            entities=["schools", "items"],
+        ),
+        "SELECT s.name, totals.total_count FROM schools AS s "
+        "CROSS JOIN (SELECT COUNT(*) AS total_count FROM items) AS totals",
+        SCHEMA,
+    )
+
+    assert "unconnected_join" not in report.failures
+
+
 def test_static_check_maps_existing_answer_shape_messages_to_codes():
     report = EvaluateStaticSql(
         IntentContract(shape="listing", output_attributes=["name"]),
@@ -226,6 +241,18 @@ def test_static_check_accepts_ordering_by_aggregate_projection_alias():
     assert "unknown_column" not in report.failures
 
 
+def test_static_check_treats_count_aggregate_aliases_as_requested_metric():
+    for alias in ("count", "total", "total_count"):
+        report = EvaluateStaticSql(
+            IntentContract(shape="scalar", metrics=["count"], expected_max_rows=1),
+            f"SELECT COUNT(*) AS {alias} FROM items",
+            SCHEMA,
+        )
+
+        assert "unrequested_projection" not in report.warnings
+        assert report.directness == 1.0
+
+
 def test_static_check_rejects_raw_ratio_projection():
     report = EvaluateStaticSql(
         IntentContract(shape="ratio", metrics=["ratio"]),
@@ -234,6 +261,39 @@ def test_static_check_rejects_raw_ratio_projection():
     )
 
     assert "missing_ratio_computation" in report.failures
+
+
+def test_static_check_rejects_aggregate_that_is_not_a_ratio():
+    static_report = EvaluateStaticSql(
+        IntentContract(shape="ratio", metrics=["ratio"]),
+        "SELECT SUM(price) AS ratio FROM items",
+        SCHEMA,
+    )
+    result_report = EvaluateResult(
+        IntentContract(shape="ratio", metrics=["ratio"]),
+        ["ratio"],
+        [{"ratio": 12.5}],
+        static_report=static_report,
+    )
+
+    assert "missing_ratio_computation" in static_report.failures
+    assert "ratio_raw_output" in result_report.failures
+
+
+def test_static_check_accepts_division_and_percentage_transformation():
+    ratio = EvaluateStaticSql(
+        IntentContract(shape="ratio", metrics=["ratio"]),
+        "SELECT SUM(price) / COUNT(*) AS ratio FROM items",
+        SCHEMA,
+    )
+    percentage = EvaluateStaticSql(
+        IntentContract(shape="ratio", metrics=["percentage"]),
+        "SELECT SUM(price) * 100.0 / COUNT(*) AS percentage FROM items",
+        SCHEMA,
+    )
+
+    assert "missing_ratio_computation" not in ratio.failures
+    assert "missing_ratio_computation" not in percentage.failures
 
 
 def test_result_check_distinguishes_legitimate_empty_result():

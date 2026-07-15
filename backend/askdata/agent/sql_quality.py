@@ -393,10 +393,9 @@ def _aggregate_names(projections: list[exp.Expression]) -> set[str]:
 def _is_computed_ratio(projections: list[exp.Expression]) -> bool:
     if len(projections) != 1:
         return False
-    return any(
-        projections[0].find(kind) is not None
-        for kind in (exp.Div, exp.Mul, exp.Sub, exp.Add, exp.AggFunc)
-    )
+    # Aggregation alone (for example SUM(price)) is not a ratio. Requiring a
+    # division also accepts rate/percentage forms whose numerator is scaled.
+    return projections[0].find(exp.Div) is not None
 
 
 def _unrequested_projection_count(
@@ -422,6 +421,8 @@ def _unrequested_projection_count(
             continue
         output_name = projection.output_name.casefold() if projection.output_name else ""
         if output_name in allowed:
+            continue
+        if "count" in {metric.casefold() for metric in intent.metrics} and projection.find(exp.Count) is not None:
             continue
         underlying = {column.name.casefold() for column in projection.find_all(exp.Column)}
         if projection.find(exp.AggFunc) is not None and underlying & allowed:
@@ -449,6 +450,9 @@ def _has_unconnected_join(parsed: exp.Expression) -> bool:
             joined = _source_names(join.this)
             if not introduced or not joined:
                 return True
+            if str(join.args.get("kind") or "").casefold() == "cross":
+                introduced.update(joined)
+                continue
             if join.args.get("using"):
                 introduced.update(joined)
                 continue
