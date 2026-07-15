@@ -299,6 +299,60 @@ def test_compound_filter_only_checks_branches_for_requested_entity():
     assert "filter" in report.covered_elements
 
 
+def test_filter_scope_traces_through_contributing_cte():
+    schema = {**SCHEMA, "items": {*SCHEMA["items"], "status"}}
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", entities=["items"], filters=["status = open"]),
+        "WITH filtered AS (SELECT name FROM items WHERE status = 'open') "
+        "SELECT name FROM filtered",
+        schema,
+    )
+
+    assert "missing_filter" not in report.failures
+    assert "unresolved_filter_alignment" not in report.warnings
+    assert "filter" in report.covered_elements
+
+
+def test_time_scope_traces_through_contributing_cte():
+    schema = {**SCHEMA, "items": {*SCHEMA["items"], "year"}}
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", entities=["items"], time_condition="year = 2025"),
+        "WITH filtered AS (SELECT name FROM items WHERE year = 2025) "
+        "SELECT name FROM filtered",
+        schema,
+    )
+
+    assert "missing_time_condition" not in report.failures
+    assert "unresolved_time_alignment" not in report.warnings
+    assert "time" in report.covered_elements
+
+
+def test_filter_scope_traces_through_contributing_derived_table():
+    schema = {**SCHEMA, "items": {*SCHEMA["items"], "status"}}
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", entities=["items"], filters=["status = open"]),
+        "SELECT name FROM (SELECT name FROM items WHERE status = 'open') AS filtered",
+        schema,
+    )
+
+    assert "missing_filter" not in report.failures
+    assert "unresolved_filter_alignment" not in report.warnings
+    assert "filter" in report.covered_elements
+
+
+def test_time_scope_traces_through_contributing_derived_table():
+    schema = {**SCHEMA, "items": {*SCHEMA["items"], "year"}}
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", entities=["items"], time_condition="year = 2025"),
+        "SELECT name FROM (SELECT name FROM items WHERE year = 2025) AS filtered",
+        schema,
+    )
+
+    assert "missing_time_condition" not in report.failures
+    assert "unresolved_time_alignment" not in report.warnings
+    assert "time" in report.covered_elements
+
+
 def test_static_check_requires_every_requested_entity():
     report = EvaluateStaticSql(
         IntentContract(shape="listing", entities=["items", "schools"]),

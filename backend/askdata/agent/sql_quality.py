@@ -202,22 +202,22 @@ def EvaluateStaticSql(
     if intent.expected_max_rows is not None and limit_value is not None and limit_value > intent.expected_max_rows:
         failures.append("excessive_limit")
 
-    where_scopes, unresolved_filter_scope = _applicable_filter_scopes(parsed, intent)
-    if intent.filters and where_scopes and any(where is None for where in where_scopes):
+    where_scope_groups, unresolved_filter_scope = _applicable_filter_scopes(parsed, intent)
+    if intent.filters and where_scope_groups and any(not group for group in where_scope_groups):
         failures.append("missing_filter")
-    if intent.filters and not where_scopes and not unresolved_filter_scope:
+    if intent.filters and not where_scope_groups and not unresolved_filter_scope:
         failures.append("missing_filter")
-    if intent.time_condition and where_scopes and any(where is None for where in where_scopes):
+    if intent.time_condition and where_scope_groups and any(not group for group in where_scope_groups):
         failures.append("missing_time_condition")
-    if intent.time_condition and not where_scopes and not unresolved_filter_scope:
+    if intent.time_condition and not where_scope_groups and not unresolved_filter_scope:
         failures.append("missing_time_condition")
     grounded_filters = [
-        _requirement_is_grounded(requirement, where_scopes)
+        _requirement_is_grounded(requirement, where_scope_groups)
         for requirement in intent.filters
     ]
     grounded_time = bool(
         intent.time_condition
-        and _requirement_is_grounded(intent.time_condition, where_scopes)
+        and _requirement_is_grounded(intent.time_condition, where_scope_groups)
     )
     if intent.filters and (unresolved_filter_scope or any(not grounded for grounded in grounded_filters)):
         warnings.append("unresolved_filter_alignment")
@@ -566,9 +566,9 @@ def _expression_metric_candidates(expression: exp.Expression) -> set[str]:
 
 def _requirement_is_grounded(
     requirement: str,
-    where_clauses: list[exp.Where | None],
+    scope_groups: list[list[exp.Where]],
 ) -> bool:
-    if not where_clauses or any(where is None for where in where_clauses):
+    if not scope_groups or any(not group for group in scope_groups):
         return False
     stopwords = {
         "a", "an", "and", "at", "by", "during", "for", "from", "in",
@@ -582,14 +582,21 @@ def _requirement_is_grounded(
     required_operators = set(re.findall(r"<=|>=|<>|!=|=|<|>", requirement))
     if not required_tokens:
         return False
-    for where in where_clauses:
-        assert where is not None
-        where_sql = where.sql(dialect="sqlite").casefold()
-        sql_tokens = set(re.findall(r"[^\W_]+(?:_[^\W_]+)*", where_sql, flags=re.UNICODE))
-        sql_operators = set(re.findall(r"<=|>=|<>|!=|=|<|>", where_sql))
-        if not (required_tokens <= sql_tokens and required_operators <= sql_operators):
+    for group in scope_groups:
+        if not any(_where_matches_requirement(where, required_tokens, required_operators) for where in group):
             return False
     return True
+
+
+def _where_matches_requirement(
+    where: exp.Where,
+    required_tokens: set[str],
+    required_operators: set[str],
+) -> bool:
+    where_sql = where.sql(dialect="sqlite").casefold()
+    sql_tokens = set(re.findall(r"[^\W_]+(?:_[^\W_]+)*", where_sql, flags=re.UNICODE))
+    sql_operators = set(re.findall(r"<=|>=|<>|!=|=|<|>", where_sql))
+    return required_tokens <= sql_tokens and required_operators <= sql_operators
 
 
 def _classify_legacy_shape_codes(
@@ -747,26 +754,91 @@ def _contributing_relations(parsed: exp.Expression) -> set[str]:
 def _applicable_filter_scopes(
     parsed: exp.Expression,
     intent: IntentContract,
-) -> tuple[list[exp.Where | None], bool]:
+) -> tuple[list[list[exp.Where]], bool]:
     expected = {entity.casefold() for entity in intent.entities}
     ctes = {
         cte.alias_or_name.casefold(): cte.this
         for cte in parsed.find_all(exp.CTE)
     }
-    scopes: list[exp.Where | None] = []
+    groups: list[list[exp.Where]] = []
     unresolved = False
     for branch in _output_branches(parsed):
         branch_relations = _direct_branch_relations(branch, ctes)
         if expected:
             if branch_relations & expected:
-                scopes.append(branch.args.get("where"))
+                groups.extend(_branch_filter_scope_groups(branch, expected, ctes, set()))
             elif not branch_relations:
                 unresolved = True
         else:
-            scopes.append(branch.args.get("where"))
-    if expected and not scopes and not unresolved:
+            groups.extend(_branch_filter_scope_groups(branch, expected, ctes, set()))
+    if expected and not groups and not unresolved:
         return [], False
-    return scopes, unresolved
+    return groups, unresolved
+
+
+def _branch_filter_scope_groups(
+    branch: exp.Select,
+    expected: set[str],
+    ctes: Mapping[str, exp.Expression],
+    visiting: set[str],
+) -> list[list[exp.Where]]:
+    outer_where = branch.args.get("where")
+    source_groups: list[list[exp.Where]] = []
+    sources: list[exp.Expression] = []
+    from_clause = branch.args.get("from_")
+    if from_clause is not None:
+        sources.append(from_clause.this)
+    sources.extend(join.this for join in branch.args.get("joins") or [])
+
+    for source in sources:
+        relations = _relations_from_source(source, ctes)
+        if expected and not (relations & expected):
+            continue
+        source_groups.extend(_source_filter_scope_groups(source, expected, ctes, visiting))
+
+    if not source_groups:
+        return [[outer_where]] if outer_where is not None else [[]]
+    if outer_where is not None:
+        return [[outer_where, *group] for group in source_groups]
+    return source_groups
+
+
+def _source_filter_scope_groups(
+    source: exp.Expression,
+    expected: set[str],
+    ctes: Mapping[str, exp.Expression],
+    visiting: set[str],
+) -> list[list[exp.Where]]:
+    query: exp.Expression | None = None
+    cte_name: str | None = None
+    if isinstance(source, exp.Table):
+        cte_name = source.name.casefold()
+        query = ctes.get(cte_name)
+    elif isinstance(source, exp.Subquery):
+        query = source.this
+    if query is None or (cte_name is not None and cte_name in visiting):
+        return []
+
+    next_visiting = {*visiting, cte_name} if cte_name is not None else set(visiting)
+    groups: list[list[exp.Where]] = []
+    for branch in _output_branches(query):
+        relations = _direct_branch_relations(branch, ctes)
+        if expected and not (relations & expected):
+            continue
+        groups.extend(_branch_filter_scope_groups(branch, expected, ctes, next_visiting))
+    return groups
+
+
+def _relations_from_source(
+    source: exp.Expression,
+    ctes: Mapping[str, exp.Expression],
+) -> set[str]:
+    if isinstance(source, exp.Table):
+        name = source.name.casefold()
+        return _contributing_relations(ctes[name]) if name in ctes else {name}
+    if isinstance(source, exp.Subquery):
+        return _contributing_relations(source.this)
+    return set()
 
 
 def _output_branches(query: exp.Expression) -> list[exp.Select]:
