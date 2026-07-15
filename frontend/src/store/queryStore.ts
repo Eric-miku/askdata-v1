@@ -150,8 +150,14 @@ function restoredChatTurn(
 
 export function createQueryStore(api: QueryApi = apiClient) {
   let turnSequence = 0;
+  let historyRequestGeneration = 0;
 
   return create<QueryState>((set, get) => {
+    const invalidateHistoryRequest = () => {
+      historyRequestGeneration += 1;
+      set({ sessionsLoading: false });
+    };
+
     const updateTurn = (turnId: string, update: Partial<ChatTurn>) => {
       set((state) => ({
         turns: state.turns.map((turn) =>
@@ -184,6 +190,9 @@ export function createQueryStore(api: QueryApi = apiClient) {
           response,
           error: response.error || undefined,
         });
+        if (!response.error) {
+          await get().loadSessions();
+        }
       } catch (error) {
         updateTurn(turnId, {
           status: "error",
@@ -230,11 +239,18 @@ export function createQueryStore(api: QueryApi = apiClient) {
       },
 
       loadSessions: async () => {
+        const requestGeneration = ++historyRequestGeneration;
         set({ sessionsLoading: true, sessionsError: null });
         try {
           const sessions = await api.listSessions();
+          if (requestGeneration !== historyRequestGeneration) {
+            return;
+          }
           set({ sessions, sessionsLoading: false });
         } catch (error) {
+          if (requestGeneration !== historyRequestGeneration) {
+            return;
+          }
           set({ sessionsLoading: false, sessionsError: errorMessage(error) });
         }
       },
@@ -243,9 +259,13 @@ export function createQueryStore(api: QueryApi = apiClient) {
         if (get().loading) {
           return;
         }
+        const requestGeneration = ++historyRequestGeneration;
         set({ sessionsLoading: true, sessionsError: null });
         try {
           const session = await api.getSession(sessionId);
+          if (requestGeneration !== historyRequestGeneration) {
+            return;
+          }
           set({
             database: session.database_id,
             sessionId: session.id,
@@ -254,6 +274,9 @@ export function createQueryStore(api: QueryApi = apiClient) {
             sessionsLoading: false,
           });
         } catch (error) {
+          if (requestGeneration !== historyRequestGeneration) {
+            return;
+          }
           set({ sessionsLoading: false, sessionsError: errorMessage(error) });
         }
       },
@@ -263,6 +286,7 @@ export function createQueryStore(api: QueryApi = apiClient) {
         if (state.loading || databaseId === state.database) {
           return;
         }
+        invalidateHistoryRequest();
         set({
           database: databaseId,
           sessionId: null,
@@ -275,6 +299,7 @@ export function createQueryStore(api: QueryApi = apiClient) {
         if (get().loading) {
           return;
         }
+        invalidateHistoryRequest();
         set({ sessionId: null, turns: [], validationError: null });
       },
 
@@ -292,6 +317,8 @@ export function createQueryStore(api: QueryApi = apiClient) {
           set({ validationError: "请输入问题。" });
           return;
         }
+
+        invalidateHistoryRequest();
 
         const turn: ChatTurn = {
           id: `turn-${++turnSequence}`,
@@ -315,6 +342,7 @@ export function createQueryStore(api: QueryApi = apiClient) {
         if (!turn || turn.status !== "error") {
           return;
         }
+        invalidateHistoryRequest();
         updateTurn(turnId, {
           status: "loading",
           response: undefined,
