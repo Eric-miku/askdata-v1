@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Mapping
 
+from askdata.agent.ambiguity import AmbiguityGate, StructuredInterpreter
 from askdata.agent.intent import IntentContract
 from askdata.agent.react_sql_agent import SqlCandidateDraft
 from askdata.agent.sql_quality import (
@@ -68,12 +69,14 @@ class StagedSqlPipeline:
         runner: Callable[[str, str], dict[str, Any]] | None = None,
         retrieval_expander: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
         max_executions: int = 6,
+        ambiguity_gate=None,
     ) -> None:
         self.react = react
         self.analyzer = analyzer or ResultAnalyzer()
         self.runner = runner or self._ExecuteSql
         self.retrieval_expander = retrieval_expander
         self.max_executions = min(max(1, max_executions), 6)
+        self.ambiguity_gate = ambiguity_gate
 
     def Run(
         self,
@@ -92,6 +95,50 @@ class StagedSqlPipeline:
         current_retrieval = dict(retrieval or {})
         schema_prompt = str(current_retrieval.get("schema_prompt") or "")
         schema = current_retrieval.get("schema") or self._SchemaFromPrompt(schema_prompt)
+        ambiguity_gate = self.ambiguity_gate
+        if ambiguity_gate is None:
+            llm_client = getattr(self.react, "llm_client", None)
+            if llm_client is not None:
+                ambiguity_gate = AmbiguityGate(StructuredInterpreter(llm_client))
+        if ambiguity_gate is not None:
+            ambiguity = ambiguity_gate.Check(
+                question,
+                schema,
+                evidence=str(current_retrieval.get("evidence") or schema_prompt),
+                session_context=session_context,
+            )
+            if ambiguity.state == "unanswerable":
+                return {
+                    "kind": "error",
+                    "answer": "",
+                    "sql": "",
+                    "columns": [],
+                    "rows": [],
+                    "chart": None,
+                    "trace": [],
+                    "error": "unanswerable_from_schema",
+                    "missing_concepts": ambiguity.missing_concepts,
+                }
+            if ambiguity.state == "materially_ambiguous":
+                interpretations = {item.id: item for item in ambiguity.interpretations}
+                options = []
+                for option in ambiguity.options:
+                    payload = option.model_dump(mode="json")
+                    candidate = interpretations.get(option.id)
+                    if candidate is not None:
+                        payload["interpretation"] = candidate.model_dump(mode="json")
+                    options.append(payload)
+                return {
+                    "kind": "clarification",
+                    "question": ambiguity.question,
+                    "options": options,
+                    "interpretations": [
+                        item.model_dump(mode="json") for item in ambiguity.interpretations
+                    ],
+                    "trace": [],
+                    "error": None,
+                }
+            question = ambiguity.resolved_question or question
         intent = current_retrieval.get("intent") or self._InferIntent(question, schema)
         if not isinstance(intent, IntentContract):
             intent = IntentContract.model_validate(intent)

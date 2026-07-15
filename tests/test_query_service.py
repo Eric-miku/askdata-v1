@@ -12,8 +12,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from askdata.api.query_service import QueryClarificationUnsupported, QueryService
-from askdata.api.response_models import AnswerResponse, ErrorResponse
+from askdata.api.query_service import QueryService
+from askdata.api.response_models import AnswerResponse, ClarificationResponse, ErrorResponse
 from askdata.api.schemas import QueryRequest
 from askdata.api.session_store import SessionStore
 
@@ -504,14 +504,199 @@ async def test_response_kind_survives_get_session(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_clarification_raises_stable_domain_error(tmp_path):
+async def test_material_clarification_persists_original_turn_and_pending_options(tmp_path):
     store = await initialized_store(tmp_path)
-    service = QueryService(store, graph_factory=lambda: RecordingGraph())
-    request = QueryRequest(
-        database_id="demo",
-        clarification={"clarification_id": "clarify-1", "option_id": "2024"},
+    graph = RecordingGraph(
+        {
+            "kind": "clarification",
+            "question": "Which revenue definition should I use?",
+            "options": [
+                {
+                    "id": "gross",
+                    "label": "Gross revenue",
+                    "description": "Before deductions",
+                    "interpretation": {"metric": "gross_revenue"},
+                },
+                {
+                    "id": "net",
+                    "label": "Net revenue",
+                    "description": "After deductions",
+                    "interpretation": {"metric": "net_revenue"},
+                },
+            ],
+            "trace": [{"step": "RetrieveSchema", "status": "success"}],
+        }
+    )
+    service = QueryService(store, graph_factory=lambda: graph)
+
+    response = await service.Run(QueryRequest(database_id="demo", question="show revenue"))
+
+    assert isinstance(response, ClarificationResponse)
+    assert response.question == "Which revenue definition should I use?"
+    assert [option.id for option in response.options] == ["gross", "net"]
+    session = await store.GetSession(response.session_id)
+    assert len(session["turns"]) == 1
+    turn = session["turns"][0]
+    assert turn["id"] == response.turn_id
+    assert turn["question"] == "show revenue"
+    assert turn["response_kind"] == "clarification"
+    assert turn["clarification"]["id"] == response.clarification_id
+    assert turn["clarification"]["status"] == "pending"
+    assert turn["clarification"]["options"][1]["interpretation"] == {
+        "metric": "net_revenue"
+    }
+    await store.Close()
+
+
+@pytest.mark.asyncio
+async def test_unanswerable_schema_result_is_nonretryable_and_persisted(tmp_path):
+    store = await initialized_store(tmp_path)
+    graph = RecordingGraph(
+        {
+            "kind": "error",
+            "error": "unanswerable_from_schema",
+            "missing_concepts": ["students"],
+            "trace": [],
+        }
+    )
+    service = QueryService(store, graph_factory=lambda: graph)
+
+    response = await service.Run(
+        QueryRequest(database_id="demo", question="list student names")
     )
 
-    with pytest.raises(QueryClarificationUnsupported, match="Only question queries are supported"):
-        await service.Run(request)
+    assert isinstance(response, ErrorResponse)
+    assert response.code == "unanswerable_from_schema"
+    assert response.retryable is False
+    assert "students" in response.message
+    turn = (await store.GetSession(response.session_id))["turns"][0]
+    assert turn["response_kind"] == "error"
+    assert turn["error"]["code"] == "unanswerable_from_schema"
+    await store.Close()
+
+
+@pytest.mark.asyncio
+async def test_option_continuation_resolves_and_updates_same_analytical_turn(tmp_path):
+    store = await initialized_store(tmp_path)
+    graph = RecordingGraph(
+        {
+            "kind": "clarification",
+            "question": "Gross or net?",
+            "options": [
+                {"id": "gross", "label": "Gross revenue", "interpretation": {"metric": "gross_revenue"}},
+                {"id": "net", "label": "Net revenue", "interpretation": {"metric": "net_revenue"}},
+            ],
+            "trace": [],
+        }
+    )
+    service = QueryService(store, graph_factory=lambda: graph)
+    pending = await service.Run(QueryRequest(database_id="demo", question="show revenue"))
+    graph.result = successful_result(answer="Net is 8", sql="SELECT net_revenue FROM sales")
+
+    response = await service.Run(
+        QueryRequest(
+            database_id="demo",
+            session_id=pending.session_id,
+            clarification={"clarification_id": pending.clarification_id, "option_id": "net"},
+        )
+    )
+
+    assert isinstance(response, AnswerResponse)
+    assert response.turn_id == pending.turn_id
+    assert graph.calls[-1][0] == (
+        "show revenue\nSelected interpretation: Net revenue. metric: net_revenue"
+    )
+    session = await store.GetSession(pending.session_id)
+    assert len(session["turns"]) == 1
+    turn = session["turns"][0]
+    assert turn["id"] == pending.turn_id
+    assert turn["question"] == "show revenue"
+    assert turn["response_kind"] == "answer"
+    assert turn["clarification"]["status"] == "resolved"
+    assert turn["clarification"]["resolution"] == {"option_id": "net"}
+    await store.Close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["missing", "resolved", "wrong-session", "bad-option"])
+async def test_invalid_or_nonpending_clarification_is_stable_nonretryable_error(tmp_path, case):
+    store = await initialized_store(tmp_path)
+    graph = RecordingGraph(
+        {
+            "kind": "clarification",
+            "question": "Gross or net?",
+            "options": [
+                {"id": "gross", "label": "Gross revenue", "interpretation": {"metric": "gross_revenue"}},
+                {"id": "net", "label": "Net revenue", "interpretation": {"metric": "net_revenue"}},
+            ],
+            "trace": [],
+        }
+    )
+    service = QueryService(store, graph_factory=lambda: graph)
+    pending = await service.Run(QueryRequest(database_id="demo", question="show revenue"))
+    session_id = pending.session_id
+    clarification_id = pending.clarification_id
+    option_id = "gross"
+    if case == "missing":
+        clarification_id = "missing"
+    elif case == "wrong-session":
+        session_id = await store.CreateSession("demo")
+    elif case == "bad-option":
+        option_id = "unknown"
+    elif case == "resolved":
+        await store.ResolveClarification(
+            pending.session_id, pending.clarification_id, {"option_id": "gross"}
+        )
+    calls_before = len(graph.calls)
+
+    response = await service.Run(
+        QueryRequest(
+            database_id="demo",
+            session_id=session_id,
+            clarification={"clarification_id": clarification_id, "option_id": option_id},
+        )
+    )
+
+    assert isinstance(response, ErrorResponse)
+    assert response.code == "invalid_clarification"
+    assert response.retryable is False
+    assert len(graph.calls) == calls_before
+    owner = await store.GetSession(pending.session_id)
+    if case != "resolved":
+        assert owner["turns"][0]["clarification"]["status"] == "pending"
+    await store.Close()
+
+
+@pytest.mark.asyncio
+async def test_free_text_continuation_combines_original_question_and_reuses_turn(tmp_path):
+    store = await initialized_store(tmp_path)
+    graph = RecordingGraph(
+        {
+            "kind": "clarification",
+            "question": "Which period?",
+            "options": [
+                {"id": "recent", "label": "Most recent year"},
+                {"id": "all", "label": "All years"},
+            ],
+            "trace": [],
+        }
+    )
+    service = QueryService(store, graph_factory=lambda: graph)
+    pending = await service.Run(QueryRequest(database_id="demo", question="show revenue"))
+    graph.result = successful_result()
+
+    response = await service.Run(
+        QueryRequest(
+            database_id="demo",
+            session_id=pending.session_id,
+            clarification={
+                "clarification_id": pending.clarification_id,
+                "text": "Use fiscal year 2025",
+            },
+        )
+    )
+
+    assert response.turn_id == pending.turn_id
+    assert graph.calls[-1][0] == "show revenue\nUser clarification: Use fiscal year 2025"
+    assert len((await store.GetSession(pending.session_id))["turns"]) == 1
     await store.Close()

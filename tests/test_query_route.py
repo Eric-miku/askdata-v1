@@ -248,7 +248,7 @@ def test_query_with_session_for_other_database_preserves_old_history(api):
     assert FakeGraph.calls[-1]["session_context"] == {}
 
 
-def test_query_rejects_clarification_until_continuations_are_supported(api):
+def test_query_returns_stable_error_for_clarification_without_session(api):
     client, _, _ = api
 
     response = client.post(
@@ -259,8 +259,10 @@ def test_query_rejects_clarification_until_continuations_are_supported(api):
         },
     )
 
-    assert response.status_code == 422
-    assert response.json() == {"detail": "Only question queries are supported"}
+    assert response.status_code == 200
+    assert response.json()["kind"] == "error"
+    assert response.json()["code"] == "invalid_clarification"
+    assert response.json()["retryable"] is False
 
 
 def test_query_failure_sanitizes_public_response_and_persisted_turn(api, caplog):

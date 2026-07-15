@@ -16,6 +16,8 @@ from pydantic import BaseModel
 from askdata.agent.graph import AgentGraph
 from askdata.api.response_models import (
     AnswerResponse,
+    ClarificationOption,
+    ClarificationResponse,
     ErrorResponse,
     QueryResponse,
     TraceEvent,
@@ -44,7 +46,7 @@ _OPERATIONAL_TRACE_MESSAGES = {
 
 
 class QueryClarificationUnsupported(ValueError):
-    """Raised when a continuation is sent before Task 7 support exists."""
+    """Compatibility exception retained for callers from before V2 clarification support."""
 
 
 def _JsonSafe(value: Any) -> Any:
@@ -126,8 +128,10 @@ class QueryService:
         self._locks = _KeyedLockManager()
 
     async def Run(self, request: QueryRequest) -> QueryResponse:
-        if request.clarification is not None or not request.question:
-            raise QueryClarificationUnsupported("Only question queries are supported")
+        if request.clarification is not None:
+            return await self._ContinueClarification(request)
+        if not request.question:
+            return self._InvalidClarification(request.session_id or "", "")
 
         session_id = request.session_id
         if not session_id:
@@ -149,9 +153,18 @@ class QueryService:
             return await self._store.DeleteSession(session_id)
 
     async def _RunInSession(
-        self, request: QueryRequest, session_id: str, session: Mapping[str, Any]
+        self,
+        request: QueryRequest,
+        session_id: str,
+        session: Mapping[str, Any],
+        *,
+        turn_id: str | None = None,
+        graph_question: str | None = None,
+        stored_question: str | None = None,
     ) -> QueryResponse:
-        turn_id = str(uuid.uuid4())
+        turn_id = turn_id or str(uuid.uuid4())
+        question = graph_question or request.question or ""
+        original_question = stored_question or request.question or ""
         history = session.get("turns") or []
         context: dict[str, Any] = {}
         if history:
@@ -162,12 +175,20 @@ class QueryService:
 
         try:
             result = await self._graph_factory().ARun(
-                question=request.question,
+                question=question,
                 database_id=request.database_id,
                 session_context=context,
             )
             if not isinstance(result, Mapping):
                 response = self._QueryFailed(session_id, turn_id)
+            elif result.get("kind") == "clarification":
+                return await self._SaveClarification(
+                    session_id, turn_id, original_question, result
+                )
+            elif result.get("error") == "unanswerable_from_schema":
+                response = self._Unanswerable(
+                    session_id, turn_id, result.get("missing_concepts")
+                )
             elif "error" in result and result["error"] is not None:
                 response = self._QueryFailed(session_id, turn_id)
             else:
@@ -197,9 +218,163 @@ class QueryService:
 
         await self._store.SaveTurn(
             session_id,
-            self._TurnForStorage(request.question, response),
+            self._TurnForStorage(original_question, response),
         )
         return response
+
+    async def _SaveClarification(
+        self,
+        session_id: str,
+        turn_id: str,
+        original_question: str,
+        result: Mapping[str, Any],
+    ) -> QueryResponse:
+        prompt = result.get("question")
+        raw_options = result.get("options")
+        if not isinstance(prompt, str) or not prompt.strip() or not isinstance(raw_options, list):
+            response = self._QueryFailed(session_id, turn_id)
+            await self._store.SaveTurn(
+                session_id, self._TurnForStorage(original_question, response)
+            )
+            return response
+        try:
+            stored_options = _JsonSafe(raw_options)
+            public_options = [
+                ClarificationOption.model_validate(
+                    {
+                        "id": option.get("id"),
+                        "label": option.get("label"),
+                        "description": option.get("description"),
+                    }
+                )
+                for option in stored_options
+                if isinstance(option, Mapping)
+            ]
+            if len(public_options) < 2:
+                raise ValueError("Clarification requires two supported options")
+        except (TypeError, ValueError):
+            response = self._QueryFailed(session_id, turn_id)
+            await self._store.SaveTurn(
+                session_id, self._TurnForStorage(original_question, response)
+            )
+            return response
+
+        trace = self._NormalizeTrace(result.get("trace"))
+        await self._store.SaveTurn(
+            session_id,
+            {
+                "id": turn_id,
+                "question": original_question,
+                "response_kind": "clarification",
+                "result_preview": [],
+                "trace": [event.model_dump(mode="json") for event in trace],
+            },
+        )
+        pending = await self._store.CreateClarification(
+            turn_id, prompt.strip(), stored_options
+        )
+        return ClarificationResponse(
+            session_id=session_id,
+            turn_id=turn_id,
+            clarification_id=pending["id"],
+            question=prompt.strip(),
+            options=public_options,
+            recommended_option_id=result.get("recommended_option_id"),
+            trace=trace,
+        )
+
+    async def _ContinueClarification(self, request: QueryRequest) -> QueryResponse:
+        resolution = request.clarification
+        session_id = request.session_id or ""
+        if resolution is None or not session_id:
+            return self._InvalidClarification(session_id, "")
+
+        async with self._locks.Hold(session_id):
+            session = await self._store.GetSession(session_id)
+            if session is None or session.get("database_id") != request.database_id:
+                return self._InvalidClarification(session_id, "")
+            owner_turn = next(
+                (
+                    turn
+                    for turn in session.get("turns") or []
+                    if (turn.get("clarification") or {}).get("id")
+                    == resolution.clarification_id
+                ),
+                None,
+            )
+            if owner_turn is None:
+                return self._InvalidClarification(session_id, "")
+            pending = owner_turn.get("clarification") or {}
+            if pending.get("status") != "pending":
+                return self._InvalidClarification(session_id, str(owner_turn.get("id") or ""))
+
+            selected_option = None
+            if resolution.option_id:
+                selected_option = next(
+                    (
+                        option
+                        for option in pending.get("options") or []
+                        if isinstance(option, Mapping)
+                        and option.get("id") == resolution.option_id
+                    ),
+                    None,
+                )
+                if selected_option is None:
+                    return self._InvalidClarification(
+                        session_id, str(owner_turn.get("id") or "")
+                    )
+
+            resolution_payload = (
+                {"option_id": resolution.option_id}
+                if resolution.option_id
+                else {"text": resolution.text}
+            )
+            resolved = await self._store.ResolveClarification(
+                session_id, resolution.clarification_id, resolution_payload
+            )
+            if resolved is None:
+                return self._InvalidClarification(
+                    session_id, str(owner_turn.get("id") or "")
+                )
+
+            original_question = str(owner_turn.get("question") or "")
+            combined_question = self._CombinedQuestion(
+                original_question, selected_option, resolution.text
+            )
+            return await self._RunInSession(
+                request,
+                session_id,
+                session,
+                turn_id=str(owner_turn["id"]),
+                graph_question=combined_question,
+                stored_question=original_question,
+            )
+
+    @staticmethod
+    def _CombinedQuestion(
+        original_question: str,
+        option: Mapping[str, Any] | None,
+        text: str | None,
+    ) -> str:
+        if text:
+            return f"{original_question}\nUser clarification: {text}"
+        option = option or {}
+        detail_parts = []
+        interpretation = option.get("interpretation")
+        if isinstance(interpretation, Mapping):
+            for key in (
+                "metric", "filters", "aggregation", "grouping", "time_range", "ranking"
+            ):
+                value = interpretation.get(key)
+                if value not in (None, "", []):
+                    rendered = ", ".join(value) if isinstance(value, list) else str(value)
+                    detail_parts.append(f"{key}: {rendered}")
+        detail = "; ".join(detail_parts)
+        suffix = f" {detail}" if detail else ""
+        return (
+            f"{original_question}\nSelected interpretation: "
+            f"{option.get('label', option.get('id', ''))}.{suffix}"
+        ).rstrip()
 
     @staticmethod
     def _NormalizeTrace(value: Any) -> list[TraceEvent]:
@@ -267,6 +442,50 @@ class QueryService:
                     step="query",
                     status="error",
                     message=message,
+                    sequence=1,
+                )
+            ],
+        )
+
+    @staticmethod
+    def _InvalidClarification(session_id: str, turn_id: str) -> ErrorResponse:
+        message = "该澄清请求不存在、已处理或不属于当前会话。"
+        return ErrorResponse(
+            session_id=session_id,
+            turn_id=turn_id,
+            code="invalid_clarification",
+            message=message,
+            retryable=False,
+            suggestions=[],
+            trace=[
+                TraceEvent(
+                    step="clarification",
+                    status="error",
+                    message=message,
+                    sequence=1,
+                )
+            ],
+        )
+
+    @staticmethod
+    def _Unanswerable(
+        session_id: str, turn_id: str, missing_concepts: Any
+    ) -> ErrorResponse:
+        concepts = [str(item) for item in missing_concepts or []][:5]
+        suffix = f" 缺少：{', '.join(concepts)}。" if concepts else ""
+        message = f"当前数据库结构无法回答这个问题。{suffix}".strip()
+        return ErrorResponse(
+            session_id=session_id,
+            turn_id=turn_id,
+            code="unanswerable_from_schema",
+            message=message,
+            retryable=False,
+            suggestions=["选择其他数据库", "询问当前数据库中已有的字段"],
+            trace=[
+                TraceEvent(
+                    step="RetrieveSchema",
+                    status="warning",
+                    message="当前数据库缺少所需数据",
                     sequence=1,
                 )
             ],
