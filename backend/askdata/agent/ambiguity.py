@@ -148,7 +148,11 @@ class AmbiguityGate:
         ]
         supported_by_id = {}
         for item in candidates:
-            if item.id.strip() and item.label.strip() and self._IsSupported(item, schema, evidence):
+            if (
+                item.id.strip()
+                and item.label.strip()
+                and self._IsSupported(item, schema, evidence, question)
+            ):
                 supported_by_id.setdefault(item.id, item)
         supported = list(supported_by_id.values())
         if not supported:
@@ -204,6 +208,7 @@ class AmbiguityGate:
         item: Interpretation,
         schema: Mapping[str, list[str]],
         evidence: str,
+        question: str,
     ) -> bool:
         table_names = {cls._Normalize(name) for name in schema}
         column_names = {
@@ -215,6 +220,8 @@ class AmbiguityGate:
             for column in columns
         }
         evidence_normalized = cls._Normalize(evidence)
+        question_tokens = set(cls._Tokens(question))
+        evidence_tokens = set(cls._Tokens(evidence))
 
         def concept_supported(value: str) -> bool:
             normalized = cls._Normalize(value)
@@ -244,9 +251,50 @@ class AmbiguityGate:
             if identifiers and not concept_supported(identifiers[0]):
                 return False
             literals = re.findall(r"['\"]([^'\"]+)['\"]", condition)
-            if literals and any(cls._Normalize(value) not in evidence_normalized for value in literals):
+            condition_without_quoted_values = re.sub(
+                r"(['\"])(?:\\.|(?!\1).)*\1", "", condition
+            )
+            for bare_value in re.findall(
+                r"(?:=|!=|<>|>=|<=|>|<)\s*([A-Za-z0-9_.+-]+)",
+                condition_without_quoted_values,
+            ):
+                if not concept_supported(bare_value):
+                    literals.append(bare_value)
+            if literals and any(
+                not cls._LiteralSupported(
+                    value,
+                    question,
+                    evidence,
+                    question_tokens,
+                    evidence_tokens,
+                    evidence_normalized,
+                )
+                for value in literals
+            ):
                 return False
         return True
+
+    @classmethod
+    def _LiteralSupported(
+        cls,
+        value: str,
+        question: str,
+        evidence: str,
+        question_tokens: set[str],
+        evidence_tokens: set[str],
+        evidence_normalized: str,
+    ) -> bool:
+        tokens = cls._Tokens(value)
+        if len(tokens) == 1:
+            return tokens[0] in question_tokens or tokens[0] in evidence_tokens
+        if tokens:
+            normalized = "".join(tokens)
+            return normalized in cls._Normalize(question) or normalized in evidence_normalized
+        literal = value.strip().casefold()
+        return bool(
+            literal
+            and (literal in question.casefold() or literal in evidence.casefold())
+        )
 
     @staticmethod
     def _MaterialSignature(item: Interpretation) -> tuple[Any, ...]:

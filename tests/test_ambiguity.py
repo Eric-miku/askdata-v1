@@ -3,6 +3,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 
+import pytest
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
@@ -99,12 +101,13 @@ def test_hallucinated_interpretation_is_not_counted_as_supported():
     assert result.resolved_question is not None
 
 
-def test_business_evidence_can_support_nonlexical_semantic_mapping():
+@pytest.mark.parametrize("condition", ["EdOpsCode = 'SSS'", "EdOpsCode = SSS"])
+def test_business_evidence_can_support_nonlexical_semantic_mapping(condition):
     special = Interpretation(
         id="state_special",
         label="State special schools",
         entities=["schools"],
-        filters=["EdOpsCode = 'SSS'"],
+        filters=[condition],
         supported_by=["schools.EdOpsCode", "evidence:State Special School means SSS"],
     )
     result = AmbiguityGate(FakeInterpreter([special])).Check(
@@ -114,6 +117,58 @@ def test_business_evidence_can_support_nonlexical_semantic_mapping():
     )
 
     assert result.state == "clear"
+
+
+def test_city_literal_explicitly_supplied_by_user_is_schema_grounded():
+    boston = Interpretation(
+        id="boston",
+        label="Customers in Boston",
+        entities=["customers"],
+        filters=["city = 'Boston'"],
+        supported_by=["customers.city"],
+    )
+
+    result = AmbiguityGate(FakeInterpreter([boston])).Check(
+        "list customers in Boston",
+        {"customers": ["id", "name", "city"]},
+    )
+
+    assert result.state == "clear"
+
+
+def test_year_literal_explicitly_supplied_by_user_is_schema_grounded():
+    year = Interpretation(
+        id="year_2025",
+        label="Revenue for 2025",
+        entities=["sales"],
+        filters=["fiscal_year = '2025'"],
+        supported_by=["sales.fiscal_year"],
+    )
+
+    result = AmbiguityGate(FakeInterpreter([year])).Check(
+        "show revenue for 2025",
+        {"sales": ["revenue", "fiscal_year"]},
+    )
+
+    assert result.state == "clear"
+
+
+@pytest.mark.parametrize("condition", ["EdOpsCode = 'SSS'", "EdOpsCode = SSS"])
+def test_inferred_coded_literal_without_business_evidence_is_rejected(condition):
+    inferred = Interpretation(
+        id="state_special",
+        label="State special schools",
+        entities=["schools"],
+        filters=[condition],
+        supported_by=["schools.EdOpsCode"],
+    )
+
+    result = AmbiguityGate(FakeInterpreter([inferred])).Check(
+        "list state special schools",
+        {"schools": ["School", "EdOpsCode"]},
+    )
+
+    assert result.state == "unanswerable"
 
 
 def test_equivalent_supported_interpretations_do_not_trigger_clarification():
