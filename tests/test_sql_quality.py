@@ -1,3 +1,9 @@
+from pathlib import Path
+import sys
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+
 from askdata.agent.intent import IntentContract
 from askdata.agent.sql_quality import (
     CandidateLedger,
@@ -194,6 +200,87 @@ def test_static_check_maps_existing_answer_shape_messages_to_codes():
     assert "listing_returns_only_aggregates" in report.failures
 
 
+def test_legacy_show_and_give_words_do_not_override_structured_scalar_intent():
+    average = EvaluateStaticSql(
+        IntentContract(shape="scalar", metrics=["avg_price"], expected_max_rows=1),
+        "SELECT AVG(price) AS avg_price FROM items",
+        SCHEMA,
+        question="Show average price",
+    )
+    count = EvaluateStaticSql(
+        IntentContract(shape="scalar", metrics=["count"], expected_max_rows=1),
+        "SELECT COUNT(*) AS total FROM items",
+        SCHEMA,
+        question="Give count of items",
+    )
+
+    assert "listing_returns_only_aggregates" not in average.failures
+    assert "listing_returns_only_aggregates" not in count.failures
+
+
+def test_static_check_does_not_credit_where_one_equals_one_for_filter():
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", filters=["status = open"]),
+        "SELECT name FROM items WHERE 1 = 1",
+        {**SCHEMA, "items": {*SCHEMA["items"], "status"}},
+    )
+
+    assert report.coverage == 0.0
+    assert "unresolved_filter_alignment" in report.warnings
+
+
+def test_static_check_credits_grounded_filter_and_time_condition():
+    schema = {**SCHEMA, "items": {*SCHEMA["items"], "status", "year"}}
+    report = EvaluateStaticSql(
+        IntentContract(
+            shape="listing",
+            filters=["status = open"],
+            time_condition="year = 2025",
+        ),
+        "SELECT name FROM items WHERE status = 'open' AND year = 2025",
+        schema,
+    )
+
+    assert report.coverage == 1.0
+    assert "unresolved_filter_alignment" not in report.warnings
+    assert "unresolved_time_alignment" not in report.warnings
+
+
+def test_static_check_does_not_credit_unresolved_natural_language_filter():
+    schema = {**SCHEMA, "items": {*SCHEMA["items"], "status"}}
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", filters=["open school items"]),
+        "SELECT name FROM items WHERE status = 'open'",
+        schema,
+    )
+
+    assert report.coverage == 0.0
+    assert "unresolved_filter_alignment" in report.warnings
+
+
+def test_compound_query_requires_filter_grounding_in_every_branch():
+    schema = {**SCHEMA, "items": {*SCHEMA["items"], "status"}}
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", filters=["status = open"]),
+        "SELECT name FROM items WHERE status = 'open' "
+        "UNION ALL SELECT name FROM items WHERE status = 'closed'",
+        schema,
+    )
+
+    assert report.coverage == 0.0
+    assert "unresolved_filter_alignment" in report.warnings
+
+
+def test_static_check_requires_every_requested_entity():
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", entities=["items", "schools"]),
+        "SELECT name FROM items",
+        SCHEMA,
+    )
+
+    assert "missing_entity" in report.failures
+
+
 def test_static_check_marks_unrequested_projection_and_reduces_directness():
     report = EvaluateStaticSql(
         IntentContract(shape="listing", output_attributes=["name"]),
@@ -241,6 +328,40 @@ def test_static_check_accepts_ordering_by_aggregate_projection_alias():
     assert "unknown_column" not in report.failures
 
 
+def test_ranking_order_must_target_requested_metric():
+    report = EvaluateStaticSql(
+        IntentContract(
+            shape="ranking",
+            output_attributes=["name"],
+            metrics=["score"],
+            order="descending",
+            expected_max_rows=5,
+        ),
+        "SELECT name, score FROM schools ORDER BY name DESC LIMIT 5",
+        SCHEMA,
+    )
+
+    assert "wrong_order_target" in report.failures
+
+
+def test_ranking_order_accepts_semantic_aggregate_alias():
+    report = EvaluateStaticSql(
+        IntentContract(
+            shape="ranking",
+            output_attributes=["category"],
+            metrics=["count"],
+            grouping=["category"],
+            order="descending",
+            expected_max_rows=5,
+        ),
+        "SELECT category, COUNT(*) AS total_count FROM items "
+        "GROUP BY category ORDER BY total_count DESC LIMIT 5",
+        SCHEMA,
+    )
+
+    assert "wrong_order_target" not in report.failures
+
+
 def test_static_check_treats_count_aggregate_aliases_as_requested_metric():
     for alias in ("count", "total", "total_count"):
         report = EvaluateStaticSql(
@@ -251,6 +372,91 @@ def test_static_check_treats_count_aggregate_aliases_as_requested_metric():
 
         assert "unrequested_projection" not in report.warnings
         assert report.directness == 1.0
+
+
+def test_projection_lineage_allows_result_aliases_to_cover_metrics():
+    count_intent = IntentContract(shape="grouped", grouping=["category"], metrics=["count"])
+    count_static = EvaluateStaticSql(
+        count_intent,
+        "SELECT category, COUNT(*) AS total FROM items GROUP BY category",
+        SCHEMA,
+    )
+    count_result = EvaluateResult(
+        count_intent,
+        ["category", "total"],
+        [{"category": "A", "total": 2}],
+        static_report=count_static,
+    )
+    average_intent = IntentContract(shape="scalar", metrics=["average_price"])
+    average_static = EvaluateStaticSql(
+        average_intent,
+        "SELECT AVG(price) AS avg_price FROM items",
+        SCHEMA,
+    )
+    average_result = EvaluateResult(
+        average_intent,
+        ["avg_price"],
+        [{"avg_price": 4.5}],
+        static_report=average_static,
+    )
+
+    assert count_result.coverage == 1.0
+    assert "missing_result_metric" not in count_result.failures
+    assert average_static.coverage == 1.0
+    assert "unrequested_projection" not in average_static.warnings
+    assert average_static.directness == 1.0
+    assert average_result.coverage == 1.0
+    assert "missing_result_metric" not in average_result.failures
+
+
+def test_compound_query_uses_root_order_limit_and_output_projection():
+    report = EvaluateStaticSql(
+        IntentContract(
+            shape="ranking",
+            output_attributes=["name"],
+            metrics=["score"],
+            order="descending",
+            expected_max_rows=5,
+        ),
+        "SELECT name, score FROM schools WHERE score >= 10 "
+        "UNION ALL SELECT name, score FROM schools WHERE score < 10 "
+        "ORDER BY score DESC LIMIT 5",
+        SCHEMA,
+    )
+
+    assert not ({"missing_order", "missing_limit", "wrong_order_target"} & set(report.failures))
+    assert "missing_output_attribute" not in report.failures
+
+
+def test_explicit_cte_column_alias_is_grounded():
+    report = EvaluateStaticSql(
+        IntentContract(shape="listing", output_attributes=["label"]),
+        "WITH named(label) AS (SELECT name FROM items) SELECT label FROM named",
+        SCHEMA,
+    )
+
+    assert "unknown_column" not in report.failures
+    assert "missing_output_attribute" not in report.failures
+
+
+def test_join_using_column_must_exist_on_both_sides():
+    invalid = EvaluateStaticSql(
+        IntentContract(shape="listing", entities=["schools", "districts"]),
+        "SELECT schools.name FROM schools JOIN districts USING (district_id)",
+        SCHEMA,
+    )
+    valid_schema = {
+        **SCHEMA,
+        "districts": {*SCHEMA["districts"], "district_id"},
+    }
+    valid = EvaluateStaticSql(
+        IntentContract(shape="listing", entities=["schools", "districts"]),
+        "SELECT schools.name FROM schools JOIN districts USING (district_id)",
+        valid_schema,
+    )
+
+    assert "invalid_join_using" in invalid.failures
+    assert "invalid_join_using" not in valid.failures
 
 
 def test_static_check_rejects_raw_ratio_projection():
@@ -503,6 +709,28 @@ def test_candidate_ledger_uses_static_projection_directness():
             sequence=2,
             coverage=1.0,
             static_directness=1.0,
+        )
+    )
+
+    assert ledger.SelectBest().sql == "SELECT name FROM items"
+
+
+def test_candidate_ledger_prefers_fewer_failures_when_coverage_matches():
+    ledger = CandidateLedger()
+    ledger.Add(
+        candidate(
+            "SELECT id FROM items",
+            sequence=1,
+            coverage=1.0,
+            static_failures=["missing_output_attribute", "missing_metric"],
+        )
+    )
+    ledger.Add(
+        candidate(
+            "SELECT name FROM items",
+            sequence=2,
+            coverage=1.0,
+            static_failures=["missing_metric"],
         )
     )
 

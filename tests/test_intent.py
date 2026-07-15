@@ -1,5 +1,11 @@
+from pathlib import Path
+import sys
+
 from pydantic import ValidationError
 import pytest
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from askdata.agent.intent import IntentContract
 

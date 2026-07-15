@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable, Mapping
 
 from pydantic import BaseModel, Field
@@ -20,6 +21,7 @@ class QualityReport(BaseModel):
     coverage: float = Field(default=0.0, ge=0.0, le=1.0)
     covered_elements: list[str] = Field(default_factory=list)
     directness: float = Field(default=1.0, ge=0.0, le=1.0)
+    semantic_outputs: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class SqlCandidate(BaseModel):
@@ -58,7 +60,7 @@ class CandidateLedger:
         if not eligible:
             return None
 
-        def rank(candidate: SqlCandidate) -> tuple[float, bool, int, float, int]:
+        def rank(candidate: SqlCandidate) -> tuple[float, int, int, float, int]:
             reports = [candidate.static_report]
             if candidate.result_report is not None:
                 reports.append(candidate.result_report)
@@ -70,7 +72,7 @@ class CandidateLedger:
             directness = min(candidate.directness, candidate.static_report.directness)
             return (
                 coverage,
-                failures == 0,
+                -failures,
                 -warnings,
                 directness,
                 -candidate.sequence,
@@ -101,7 +103,7 @@ def EvaluateStaticSql(
 
     parsed = statements[0]
 
-    select = parsed if isinstance(parsed, exp.Select) else parsed.find(exp.Select)
+    select = parsed if isinstance(parsed, exp.Select) else next(parsed.find_all(exp.Select), None)
     if select is None:
         return QualityReport(passed=False, failures=["invalid_sql"], coverage=0.0)
 
@@ -136,12 +138,23 @@ def EvaluateStaticSql(
         projection_aliases,
     ):
         failures.append("unknown_column")
+    if _has_invalid_join_using(parsed, column_schema, alias_to_table):
+        failures.append("invalid_join_using")
 
     projections = list(select.expressions)
     projection_names = _projection_names(projections, column_schema, table_names, virtual_schema)
     aggregate_names = _aggregate_names(projections)
     group_names = _column_names(select.args.get("group"))
-    order_names = _column_names(select.args.get("order"))
+    semantic_outputs = _projection_semantic_outputs(intent, projections)
+    semantically_covered_metrics = {
+        tag.partition(":")[2]
+        for tags in semantic_outputs.values()
+        for tag in tags
+        if tag.startswith("metric:")
+    }
+    query_order = parsed.args.get("order") or select.args.get("order")
+    query_limit = parsed.args.get("limit") or select.args.get("limit")
+    order_names = _column_names(query_order)
 
     asks_count = any(metric.casefold() == "count" for metric in intent.metrics)
     has_count = any(projection.find(exp.Count) is not None for projection in projections)
@@ -162,6 +175,7 @@ def EvaluateStaticSql(
         if metric.casefold() != "count"
         and metric.casefold() not in projection_names
         and metric.casefold() not in aggregate_names
+        and _normalize_concept(metric) not in semantically_covered_metrics
     ]
     if missing_metrics:
         failures.append("missing_metric")
@@ -172,39 +186,66 @@ def EvaluateStaticSql(
     if intent.shape == "ratio" and not _is_computed_ratio(projections):
         failures.append("missing_ratio_computation")
 
-    order = select.args.get("order")
+    order = query_order
     if intent.shape == "ranking" or intent.order:
         if order is None or not order.expressions:
             failures.append("missing_order")
         elif intent.order and not _order_matches(order, intent.order):
             failures.append("wrong_order_direction")
+        if intent.metrics and not _order_targets_metric(order, intent, semantic_outputs):
+            failures.append("wrong_order_target")
 
-    limit_value = _literal_limit(select.args.get("limit"))
+    limit_value = _literal_limit(query_limit)
     if intent.shape == "ranking" and limit_value is None:
         failures.append("missing_limit")
     if intent.expected_max_rows is not None and limit_value is not None and limit_value > intent.expected_max_rows:
         failures.append("excessive_limit")
 
-    if intent.filters and select.args.get("where") is None:
+    where_clauses = list(parsed.find_all(exp.Where))
+    if intent.filters and not where_clauses:
         failures.append("missing_filter")
-    if intent.time_condition and select.args.get("where") is None:
+    if intent.time_condition and not where_clauses:
         failures.append("missing_time_condition")
+    grounded_filters = [
+        _requirement_is_grounded(requirement, where_clauses)
+        for requirement in intent.filters
+    ]
+    grounded_time = bool(
+        intent.time_condition
+        and _requirement_is_grounded(intent.time_condition, where_clauses)
+    )
+    if where_clauses and any(not grounded for grounded in grounded_filters):
+        warnings.append("unresolved_filter_alignment")
+    if where_clauses and intent.time_condition and not grounded_time:
+        warnings.append("unresolved_time_alignment")
 
     if _has_unconnected_join(parsed):
         failures.append("unconnected_join")
 
     expected_entities = {entity.casefold() for entity in intent.entities}
+    if expected_entities - set(table_names):
+        failures.append("missing_entity")
     if expected_entities and set(table_names) - expected_entities:
         warnings.append("unnecessary_join")
 
-    extra_count = _unrequested_projection_count(intent, projections, order_names)
+    extra_count = _unrequested_projection_count(
+        intent,
+        projections,
+        order_names,
+        semantic_outputs,
+    )
     directness = 1.0
     if extra_count:
         warnings.append("unrequested_projection")
         directness = max(0.0, 1.0 - extra_count / max(len(projections), 1))
 
     if question:
-        failures.extend(AnswerShapeFailureCodes(question, sql))
+        legacy_failures, legacy_warnings = _classify_legacy_shape_codes(
+            intent,
+            AnswerShapeFailureCodes(question, sql),
+        )
+        failures.extend(legacy_failures)
+        warnings.extend(legacy_warnings)
 
     covered, required = _static_coverage(
         intent,
@@ -213,8 +254,10 @@ def EvaluateStaticSql(
         aggregate_names,
         group_names,
         order is not None,
-        select.args.get("where") is not None,
+        grounded_filters,
+        grounded_time,
         has_count,
+        semantically_covered_metrics,
     )
     failures = _unique(failures)
     warnings = _unique(warnings)
@@ -226,6 +269,7 @@ def EvaluateStaticSql(
         coverage=coverage,
         covered_elements=covered,
         directness=directness,
+        semantic_outputs=semantic_outputs,
     )
 
 
@@ -305,6 +349,11 @@ def EvaluateResult(
         for element in required
         if element.partition(":")[2] in normalized_columns
     ]
+    if static_report is not None:
+        for column in columns:
+            for semantic_element in static_report.semantic_outputs.get(_normalize_concept(column), []):
+                if semantic_element in required and semantic_element not in covered:
+                    covered.append(semantic_element)
     if (
         "metric:count" in required
         and "metric:count" not in covered
@@ -390,6 +439,43 @@ def _aggregate_names(projections: list[exp.Expression]) -> set[str]:
     return names
 
 
+def _projection_semantic_outputs(
+    intent: IntentContract,
+    projections: list[exp.Expression],
+) -> dict[str, list[str]]:
+    requested = {_normalize_concept(metric): metric for metric in intent.metrics}
+    outputs: dict[str, list[str]] = {}
+    for projection in projections:
+        output_name = projection.output_name.casefold() if projection.output_name else ""
+        if not output_name:
+            continue
+        candidates = {_normalize_concept(output_name)}
+        columns = [column.name for column in projection.find_all(exp.Column)]
+        if projection.find(exp.Count) is not None:
+            candidates.add("count")
+        for column in columns:
+            normalized_column = _normalize_concept(column)
+            candidates.add(normalized_column)
+            if projection.find(exp.Avg) is not None:
+                candidates.update(
+                    {
+                        f"avg_{normalized_column}",
+                        f"average_{normalized_column}",
+                        f"mean_{normalized_column}",
+                    }
+                )
+            if projection.find(exp.Sum) is not None:
+                candidates.update({f"sum_{normalized_column}", f"total_{normalized_column}"})
+        matched = [
+            f"metric:{normalized_metric}"
+            for normalized_metric in requested
+            if normalized_metric in candidates
+        ]
+        if matched:
+            outputs[_normalize_concept(output_name)] = matched
+    return outputs
+
+
 def _is_computed_ratio(projections: list[exp.Expression]) -> bool:
     if len(projections) != 1:
         return False
@@ -402,6 +488,7 @@ def _unrequested_projection_count(
     intent: IntentContract,
     projections: list[exp.Expression],
     order_names: set[str],
+    semantic_outputs: Mapping[str, list[str]],
 ) -> int:
     allowed = {
         *(item.casefold() for item in intent.output_attributes),
@@ -422,6 +509,8 @@ def _unrequested_projection_count(
         output_name = projection.output_name.casefold() if projection.output_name else ""
         if output_name in allowed:
             continue
+        if _normalize_concept(output_name) in semantic_outputs:
+            continue
         if "count" in {metric.casefold() for metric in intent.metrics} and projection.find(exp.Count) is not None:
             continue
         underlying = {column.name.casefold() for column in projection.find_all(exp.Column)}
@@ -429,6 +518,80 @@ def _unrequested_projection_count(
             continue
         extras += 1
     return extras
+
+
+def _order_targets_metric(
+    order: exp.Order | None,
+    intent: IntentContract,
+    semantic_outputs: Mapping[str, list[str]],
+) -> bool:
+    if order is None or not order.expressions:
+        return False
+    ordered_expression = order.expressions[0].this
+    requested = {_normalize_concept(metric) for metric in intent.metrics}
+    names = {
+        _normalize_concept(column.name)
+        for column in ordered_expression.find_all(exp.Column)
+    }
+    if isinstance(ordered_expression, exp.Column):
+        names.add(_normalize_concept(ordered_expression.name))
+    if names & requested:
+        return True
+    return any(
+        tag.partition(":")[2] in requested
+        for name in names
+        for tag in semantic_outputs.get(name, [])
+    )
+
+
+def _normalize_concept(value: str) -> str:
+    return re.sub(r"[^\w]+", "_", value.casefold()).strip("_")
+
+
+def _requirement_is_grounded(
+    requirement: str,
+    where_clauses: list[exp.Where],
+) -> bool:
+    if not where_clauses:
+        return False
+    stopwords = {
+        "a", "an", "and", "at", "by", "during", "for", "from", "in",
+        "is", "of", "on", "or", "the", "to", "where", "with",
+    }
+    required_tokens = {
+        token.casefold()
+        for token in re.findall(r"[^\W_]+(?:_[^\W_]+)*", requirement, flags=re.UNICODE)
+        if token.casefold() not in stopwords
+    }
+    required_operators = set(re.findall(r"<=|>=|<>|!=|=|<|>", requirement))
+    if not required_tokens:
+        return False
+    for where in where_clauses:
+        where_sql = where.sql(dialect="sqlite").casefold()
+        sql_tokens = set(re.findall(r"[^\W_]+(?:_[^\W_]+)*", where_sql, flags=re.UNICODE))
+        sql_operators = set(re.findall(r"<=|>=|<>|!=|=|<|>", where_sql))
+        if not (required_tokens <= sql_tokens and required_operators <= sql_operators):
+            return False
+    return True
+
+
+def _classify_legacy_shape_codes(
+    intent: IntentContract,
+    codes: list[str],
+) -> tuple[list[str], list[str]]:
+    failures: list[str] = []
+    warnings: list[str] = []
+    for code in codes:
+        aligned = (
+            (code == "missing_count_aggregation" and "count" in {_normalize_concept(item) for item in intent.metrics})
+            or (code in {"computed_value_has_extra_projections", "missing_ratio_computation"} and intent.shape == "ratio")
+            or (code == "listing_returns_only_aggregates" and intent.shape == "listing")
+        )
+        if aligned:
+            failures.append(code)
+        elif code != "invalid_sql":
+            warnings.append(f"legacy_{code}")
+    return failures, warnings
 
 
 def _column_names(expression: exp.Expression | None) -> set[str]:
@@ -468,6 +631,41 @@ def _has_unconnected_join(parsed: exp.Expression) -> bool:
     return False
 
 
+def _has_invalid_join_using(
+    parsed: exp.Expression,
+    schema: Mapping[str, set[str]],
+    alias_to_table: Mapping[str, str],
+) -> bool:
+    for select in parsed.find_all(exp.Select):
+        from_clause = select.args.get("from_")
+        introduced = _source_names(from_clause.this) if from_clause is not None else set()
+        for join in select.args.get("joins") or []:
+            joined = _source_names(join.this)
+            using_columns = {
+                identifier.name.casefold()
+                for identifier in join.args.get("using") or []
+            }
+            if using_columns:
+                left_columns = _columns_for_sources(introduced, schema, alias_to_table)
+                right_columns = _columns_for_sources(joined, schema, alias_to_table)
+                if not using_columns <= left_columns or not using_columns <= right_columns:
+                    return True
+            introduced.update(joined)
+    return False
+
+
+def _columns_for_sources(
+    sources: set[str],
+    schema: Mapping[str, set[str]],
+    alias_to_table: Mapping[str, str],
+) -> set[str]:
+    return {
+        column
+        for source in sources
+        for column in schema.get(alias_to_table.get(source, source), set())
+    }
+
+
 def _source_names(source: exp.Expression | None) -> set[str]:
     if source is None:
         return set()
@@ -480,8 +678,15 @@ def _virtual_schema(parsed: exp.Expression) -> dict[str, set[str]]:
     for cte in parsed.find_all(exp.CTE):
         select = cte.this if isinstance(cte.this, exp.Select) else cte.this.find(exp.Select)
         if select is not None:
+            alias_expression = cte.args.get("alias")
+            explicit_columns = alias_expression.args.get("columns") if alias_expression is not None else None
+            names = (
+                [column.name for column in explicit_columns]
+                if explicit_columns
+                else select.named_selects
+            )
             virtual[cte.alias_or_name.casefold()] = {
-                name.casefold() for name in select.named_selects if name and name != "*"
+                name.casefold() for name in names if name and name != "*"
             }
     for subquery in parsed.find_all(exp.Subquery):
         if not subquery.alias_or_name:
@@ -536,8 +741,10 @@ def _static_coverage(
     aggregates: set[str],
     groups: set[str],
     has_order: bool,
-    has_where: bool,
+    grounded_filters: list[bool],
+    grounded_time: bool,
     has_count: bool,
+    semantically_covered_metrics: set[str],
 ) -> tuple[list[str], list[str]]:
     required = [
         *(f"entity:{item.casefold()}" for item in intent.entities),
@@ -549,17 +756,26 @@ def _static_coverage(
         *(("time",) if intent.time_condition else ()),
     ]
     covered: list[str] = []
+    filter_results = iter(grounded_filters)
     for element in required:
         kind, _, value = element.partition(":")
         if kind == "entity" and value in tables:
             covered.append(element)
         elif kind == "output" and value in projections:
             covered.append(element)
-        elif kind == "metric" and (value in projections or value in aggregates or (value == "count" and has_count)):
+        elif kind == "metric" and (
+            value in projections
+            or value in aggregates
+            or value in semantically_covered_metrics
+            or (value == "count" and has_count)
+        ):
             covered.append(element)
         elif kind == "group" and value in groups:
             covered.append(element)
-        elif kind in {"filter", "time"} and has_where:
+        elif kind == "filter":
+            if next(filter_results, False):
+                covered.append(element)
+        elif kind == "time" and grounded_time:
             covered.append(element)
         elif kind == "order" and has_order:
             covered.append(element)
