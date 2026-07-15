@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from askdata.agent.intent import IntentContract
 from askdata.agent.pipeline import StagedSqlPipeline
 from askdata.agent.react_sql_agent import SqlCandidateDraft
+from askdata.tools.retriever import BirdSchemaIndex
 
 
 def retrieval(intent=None):
@@ -292,3 +293,62 @@ def test_pipeline_runs_alternate_plan_only_after_empty_or_suspicious_result():
     assert [context["pipeline_stage"] for context in react.contexts] == [
         "initial", "targeted_repair_1", "targeted_repair_2", "alternate_plan"
     ]
+
+
+def ten_table_retrieval_context():
+    database = {
+        "databaseId": "wide_demo",
+        "databasePath": "/tmp/wide-demo.sqlite",
+        "tables": [
+            {
+                "tableName": f"t{index}",
+                "columns": [{"columnName": "id", "columnType": "integer"}],
+            }
+            for index in range(1, 10)
+        ],
+        "foreignKeys": [],
+    }
+    context = BirdSchemaIndex().Build([database]).Retrieve(
+        "wide_demo", "show ninth records"
+    )
+    context["intent"] = IntentContract(shape="listing", output_attributes=["id"])
+    return context
+
+
+def test_pipeline_quality_gate_uses_authoritative_schema_beyond_compact_prompt():
+    context = ten_table_retrieval_context()
+    sql = "SELECT id FROM t9"
+    runner = MappingRunner({
+        sql: {
+            "success": True,
+            "columns": ["id"],
+            "rows": [{"id": 9}, {"id": 90}],
+        },
+    })
+
+    result = StagedSqlPipeline(
+        react=FakeReact([[SqlCandidateDraft(sql=sql)]]),
+        analyzer=RecordingAnalyzer(),
+        runner=runner,
+    ).Run(question="show ninth records", retrieval=context)
+
+    assert "Table t9" not in context["schema_prompt"]
+    assert result["sql"] == sql
+    assert runner.sql_seen == [sql]
+
+
+def test_pipeline_authoritative_schema_still_rejects_nonexistent_table():
+    context = ten_table_retrieval_context()
+    sql = "SELECT id FROM t10"
+    runner = MappingRunner({
+        sql: {"success": False, "error": "no such table: t10"},
+    })
+
+    result = StagedSqlPipeline(
+        react=FakeReact([[SqlCandidateDraft(sql=sql)]]),
+        analyzer=FailingAnalyzer(),
+        runner=runner,
+    ).Run(question="show tenth records", retrieval=context)
+
+    assert result["kind"] == "error"
+    assert runner.sql_seen == [sql]

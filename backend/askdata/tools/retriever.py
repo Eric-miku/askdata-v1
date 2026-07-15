@@ -228,6 +228,19 @@ class BirdSchemaIndex:
             lines.append(f"- {left_table}.{left_column} -> {right_table}.{right_column}")
         return "\n".join(lines)
 
+    def StructuredSchema(self, database_id: str) -> dict[str, list[str]]:
+        """Return the complete authoritative table/column map for quality gates."""
+        database = self.GetDatabase(database_id)
+        return {
+            GetValue(table, "tableName", "table_name", default=""): [
+                GetValue(column, "columnName", "column_name", default="")
+                for column in GetValue(table, "columns", default=[])
+                if GetValue(column, "columnName", "column_name", default="")
+            ]
+            for table in GetValue(database, "tables", default=[])
+            if GetValue(table, "tableName", "table_name", default="")
+        }
+
     def Retrieve(self, database_id: str, question: str) -> dict[str, Any]:
         database = self.GetDatabase(database_id)
 
@@ -303,6 +316,7 @@ class BirdSchemaIndex:
         return {
             "database_id": database_id,
             "database_path": GetValue(database, "databasePath", "database_path", default=""),
+            "schema": self.StructuredSchema(database_id),
             "matched_tables": matched_tables,
             "matched_columns": matched_columns,
             "matched_joins": matched_joins,
