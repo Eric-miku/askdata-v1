@@ -19,6 +19,7 @@ class QualityReport(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     coverage: float = Field(default=0.0, ge=0.0, le=1.0)
     covered_elements: list[str] = Field(default_factory=list)
+    directness: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 class SqlCandidate(BaseModel):
@@ -51,6 +52,7 @@ class CandidateLedger:
             candidate
             for candidate in self._candidates
             if candidate.execution_error is None
+            and candidate.result_report is not None
             and "unsafe_sql" not in candidate.static_report.failures
         ]
         if not eligible:
@@ -60,14 +62,17 @@ class CandidateLedger:
             reports = [candidate.static_report]
             if candidate.result_report is not None:
                 reports.append(candidate.result_report)
-            coverage = candidate.result_report.coverage if candidate.result_report else candidate.static_report.coverage
+            # Static and returned-result coverage describe separate halves of
+            # correctness, so neither is allowed to hide a gap in the other.
+            coverage = (candidate.static_report.coverage + candidate.result_report.coverage) / 2
             failures = sum(len(report.failures) for report in reports)
             warnings = sum(len(report.warnings) for report in reports)
+            directness = min(candidate.directness, candidate.static_report.directness)
             return (
                 coverage,
                 failures == 0,
                 -warnings,
-                candidate.directness,
+                directness,
                 -candidate.sequence,
             )
 
@@ -110,6 +115,12 @@ def EvaluateStaticSql(
     column_schema = {**normalized_schema, **virtual_schema}
     table_names = [table.name.casefold() for table in tables if table.name.casefold() not in cte_names]
     alias_to_table = {table.alias_or_name.casefold(): table.name.casefold() for table in tables}
+    projection_aliases = {
+        projection.alias.casefold()
+        for candidate_select in parsed.find_all(exp.Select)
+        for projection in candidate_select.expressions
+        if projection.alias
+    }
     failures: list[str] = []
     warnings: list[str] = []
 
@@ -117,13 +128,20 @@ def EvaluateStaticSql(
     if unknown_tables:
         failures.append("unknown_table")
 
-    if _has_unknown_columns(parsed, column_schema, alias_to_table, [*table_names, *virtual_schema]):
+    if _has_unknown_columns(
+        parsed,
+        column_schema,
+        alias_to_table,
+        [*table_names, *virtual_schema],
+        projection_aliases,
+    ):
         failures.append("unknown_column")
 
     projections = list(select.expressions)
     projection_names = _projection_names(projections, column_schema, table_names, virtual_schema)
     aggregate_names = _aggregate_names(projections)
     group_names = _column_names(select.args.get("group"))
+    order_names = _column_names(select.args.get("order"))
 
     asks_count = any(metric.casefold() == "count" for metric in intent.metrics)
     has_count = any(projection.find(exp.Count) is not None for projection in projections)
@@ -151,6 +169,9 @@ def EvaluateStaticSql(
     if intent.grouping and any(item.casefold() not in group_names for item in intent.grouping):
         failures.append("missing_grouping")
 
+    if intent.shape == "ratio" and not _is_computed_ratio(projections):
+        failures.append("missing_ratio_computation")
+
     order = select.args.get("order")
     if intent.shape == "ranking" or intent.order:
         if order is None or not order.expressions:
@@ -169,13 +190,18 @@ def EvaluateStaticSql(
     if intent.time_condition and select.args.get("where") is None:
         failures.append("missing_time_condition")
 
-    joins = list(parsed.find_all(exp.Join))
-    if any(_join_is_unconnected(join) for join in joins):
+    if _has_unconnected_join(parsed):
         failures.append("unconnected_join")
 
     expected_entities = {entity.casefold() for entity in intent.entities}
     if expected_entities and set(table_names) - expected_entities:
         warnings.append("unnecessary_join")
+
+    extra_count = _unrequested_projection_count(intent, projections, order_names)
+    directness = 1.0
+    if extra_count:
+        warnings.append("unrequested_projection")
+        directness = max(0.0, 1.0 - extra_count / max(len(projections), 1))
 
     if question:
         failures.extend(AnswerShapeFailureCodes(question, sql))
@@ -199,6 +225,7 @@ def EvaluateStaticSql(
         warnings=warnings,
         coverage=coverage,
         covered_elements=covered,
+        directness=directness,
     )
 
 
@@ -208,6 +235,7 @@ def EvaluateResult(
     rows: list[dict[str, Any]],
     *,
     empty_is_legitimate: bool = False,
+    static_report: QualityReport | None = None,
 ) -> QualityReport:
     """Verify cardinality, non-null content, and returned intent coverage."""
 
@@ -229,15 +257,61 @@ def EvaluateResult(
     if expected_max is not None and len(rows) > expected_max:
         failures.append("too_many_rows")
 
+    if intent.shape == "scalar" and len(columns) != 1:
+        failures.append("scalar_multiple_outputs")
+    if intent.shape == "ratio":
+        if len(columns) != 1:
+            failures.append("ratio_multiple_outputs")
+        elif rows and not all(_is_number(row.get(columns[0])) for row in rows):
+            failures.append("ratio_non_numeric")
+        if static_report and "missing_ratio_computation" in static_report.failures:
+            failures.append("ratio_raw_output")
+
+    if any(metric.casefold() == "count" for metric in intent.metrics) and rows:
+        count_column = next((column for column in columns if column.casefold() == "count"), None)
+        if count_column is None and intent.shape == "scalar" and len(columns) == 1:
+            count_column = columns[0]
+        if count_column is not None and any(
+            not _is_non_negative_integer(row.get(count_column)) for row in rows
+        ):
+            failures.append("suspicious_count")
+
+    missing_groups = {
+        group.casefold() for group in intent.grouping
+    } - normalized_columns
+    if intent.shape == "grouped" and missing_groups:
+        failures.append("missing_result_grouping")
+
+    if intent.shape == "ranking" and intent.order and len(rows) > 1:
+        order_column = next(
+            (column for column in columns if column.casefold() in {metric.casefold() for metric in intent.metrics}),
+            None,
+        )
+        if order_column and not _rows_match_order(rows, order_column, intent.order):
+            failures.append("ranking_order_mismatch")
+
+    if intent.shape == "listing" and columns and all(_is_inspection_column(column) for column in columns):
+        requested = {item.casefold() for item in intent.output_attributes}
+        if not requested or not requested.issubset(normalized_columns):
+            failures.append("inspection_query_result")
+
     required = [
         *(f"output:{name.casefold()}" for name in intent.output_attributes),
         *(f"metric:{name.casefold()}" for name in intent.metrics),
+        *(f"group:{name.casefold()}" for name in intent.grouping),
     ]
     covered = [
         element
         for element in required
         if element.partition(":")[2] in normalized_columns
     ]
+    if (
+        "metric:count" in required
+        and "metric:count" not in covered
+        and len(columns) == 1
+        and intent.shape == "scalar"
+    ):
+        covered.append("metric:count")
     if any(element.startswith("output:") for element in set(required) - set(covered)):
         failures.append("missing_result_attribute")
     if any(element.startswith("metric:") for element in set(required) - set(covered)):
@@ -259,6 +333,7 @@ def _has_unknown_columns(
     schema: Mapping[str, set[str]],
     alias_to_table: Mapping[str, str],
     table_names: list[str],
+    projection_aliases: set[str],
 ) -> bool:
     known_tables = [name for name in table_names if name in schema]
     for column in parsed.find_all(exp.Column):
@@ -270,9 +345,18 @@ def _has_unknown_columns(
             table = alias_to_table.get(qualifier, qualifier)
             if table not in schema or name not in schema[table]:
                 return True
+        elif name in projection_aliases and _is_projection_alias_reference(column):
+            continue
         elif not any(name in schema[table] for table in known_tables):
             return True
     return False
+
+
+def _is_projection_alias_reference(column: exp.Column) -> bool:
+    return any(
+        column.find_ancestor(kind) is not None
+        for kind in (exp.Order, exp.Group, exp.Having, exp.Qualify)
+    )
 
 
 def _projection_names(
@@ -306,6 +390,46 @@ def _aggregate_names(projections: list[exp.Expression]) -> set[str]:
     return names
 
 
+def _is_computed_ratio(projections: list[exp.Expression]) -> bool:
+    if len(projections) != 1:
+        return False
+    return any(
+        projections[0].find(kind) is not None
+        for kind in (exp.Div, exp.Mul, exp.Sub, exp.Add, exp.AggFunc)
+    )
+
+
+def _unrequested_projection_count(
+    intent: IntentContract,
+    projections: list[exp.Expression],
+    order_names: set[str],
+) -> int:
+    allowed = {
+        *(item.casefold() for item in intent.output_attributes),
+        *(item.casefold() for item in intent.metrics),
+        *(item.casefold() for item in intent.grouping),
+        *order_names,
+    }
+    if not allowed:
+        return 0
+
+    extras = 0
+    for projection in projections:
+        if isinstance(projection, exp.Star) or (
+            isinstance(projection, exp.Column) and projection.name == "*"
+        ):
+            extras += 1
+            continue
+        output_name = projection.output_name.casefold() if projection.output_name else ""
+        if output_name in allowed:
+            continue
+        underlying = {column.name.casefold() for column in projection.find_all(exp.Column)}
+        if projection.find(exp.AggFunc) is not None and underlying & allowed:
+            continue
+        extras += 1
+    return extras
+
+
 def _column_names(expression: exp.Expression | None) -> set[str]:
     if expression is None:
         return set()
@@ -317,18 +441,34 @@ def _order_matches(order: exp.Order, direction: str) -> bool:
     return all(bool(ordered.args.get("desc")) == wants_descending for ordered in order.expressions)
 
 
-def _join_is_unconnected(join: exp.Join) -> bool:
-    if str(join.args.get("kind") or "").upper() == "CROSS":
-        return False
-    on_clause = join.args.get("on")
-    normalized_missing_on = isinstance(on_clause, exp.Boolean) and on_clause.this is True
-    if (on_clause is None or normalized_missing_on) and not join.args.get("using"):
-        return True
-    if on_clause is None:
-        return False
-    qualifiers = {column.table.casefold() for column in on_clause.find_all(exp.Column) if column.table}
-    joined = join.this.alias_or_name.casefold()
-    return bool(qualifiers) and joined not in qualifiers
+def _has_unconnected_join(parsed: exp.Expression) -> bool:
+    for select in parsed.find_all(exp.Select):
+        from_clause = select.args.get("from_")
+        introduced = _source_names(from_clause.this) if from_clause is not None else set()
+        for join in select.args.get("joins") or []:
+            joined = _source_names(join.this)
+            if not introduced or not joined:
+                return True
+            if join.args.get("using"):
+                introduced.update(joined)
+                continue
+            on_clause = join.args.get("on")
+            qualifiers = {
+                column.table.casefold()
+                for column in on_clause.find_all(exp.Column)
+                if column.table
+            } if on_clause is not None else set()
+            if not (qualifiers & joined and qualifiers & introduced):
+                return True
+            introduced.update(joined)
+    return False
+
+
+def _source_names(source: exp.Expression | None) -> set[str]:
+    if source is None:
+        return set()
+    alias = source.alias_or_name
+    return {alias.casefold()} if alias else set()
 
 
 def _virtual_schema(parsed: exp.Expression) -> dict[str, set[str]]:
@@ -357,6 +497,32 @@ def _literal_limit(limit: exp.Limit | None) -> int | None:
     if isinstance(expression, exp.Literal) and expression.is_int:
         return int(expression.this)
     return None
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_non_negative_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _rows_match_order(rows: list[dict[str, Any]], column: str, direction: str) -> bool:
+    values = [row.get(column) for row in rows]
+    if any(value is None for value in values):
+        return False
+    try:
+        pairs = zip(values, values[1:])
+        if direction == "descending":
+            return all(left >= right for left, right in pairs)
+        return all(left <= right for left, right in pairs)
+    except TypeError:
+        return False
+
+
+def _is_inspection_column(column: str) -> bool:
+    normalized = column.casefold()
+    return normalized in {"id", "rowid", "key"} or normalized.endswith("_id")
 
 
 def _static_coverage(
