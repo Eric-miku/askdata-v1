@@ -14,13 +14,20 @@ API 路由定义 —— 所有 HTTP 接口的入口
   - 核心 /api/query 接口通过 AgentGraph → ReActSqlAgent 完成 NL2SQL 全链路
 """
 
+import asyncio
+import base64
 import os
 import glob
+import logging
 import sqlite3
 import uuid
-from typing import List, Optional
+from datetime import date, datetime, time
+from decimal import Decimal
+from enum import Enum
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
 from askdata.api.schemas import QueryRequest, QueryResponse
 from askdata.api.session_store import SessionStore
 from askdata.api.trace import TraceLogger
@@ -31,6 +38,9 @@ from askdata.core.paths import project_path
 # 创建 APIRouter 实例
 # 在 app.py 中通过 app.include_router(router, prefix="/api") 注册
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+_PUBLIC_QUERY_ERROR = "query_failed"
 
 
 # ============================================================
@@ -42,6 +52,39 @@ def _Store(request: Request) -> SessionStore:
     if not isinstance(store, SessionStore):
         raise RuntimeError("app.state.session_store must be an initialized SessionStore")
     return store
+
+
+def _JsonSafe(value: Any) -> Any:
+    """Normalize agent output for both HTTP responses and SQLite JSON storage.
+
+    Bytes use base64 so arbitrary binary values have one deterministic public form.
+    """
+    return jsonable_encoder(
+        value,
+        custom_encoder={
+            Decimal: str,
+            datetime: lambda item: item.isoformat(),
+            date: lambda item: item.isoformat(),
+            time: lambda item: item.isoformat(),
+            uuid.UUID: str,
+            Enum: lambda item: item.value,
+            bytes: lambda item: base64.b64encode(item).decode("ascii"),
+        },
+    )
+
+
+async def _SessionLock(request: Request, session_id: str) -> asyncio.Lock:
+    registry = getattr(request.app.state, "session_lock_registry", None)
+    if registry is None:
+        registry = {"guard": asyncio.Lock(), "locks": {}}
+        request.app.state.session_lock_registry = registry
+
+    async with registry["guard"]:
+        lock = registry["locks"].get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            registry["locks"][session_id] = lock
+        return lock
 
 
 def _CountTables(db_path: str) -> int:
@@ -246,7 +289,7 @@ async def create_session(request: Request, database_id: Optional[str] = None):
     trace.log("会话创建成功", f"session_id={session_id}")
     return {
         "session_id": session_id,
-        "created_at": session["created_at"],
+        "created_at": datetime.fromisoformat(session["created_at"]).timestamp(),
     }
 
 
@@ -274,7 +317,9 @@ async def delete_session(session_id: str, request: Request):
     trace = TraceLogger()
     trace.log("删除会话", f"session_id={session_id}")
 
-    success = await _Store(request).DeleteSession(session_id)
+    lock = await _SessionLock(request, session_id)
+    async with lock:
+        success = await _Store(request).DeleteSession(session_id)
     if not success:
         trace.log("会话未找到", f"session_id={session_id}")
         raise HTTPException(
@@ -325,71 +370,82 @@ async def execute_query(query_request: QueryRequest, request: Request):
     # ---------- 会话管理 ----------
     store = _Store(request)
     session_id = query_request.session_id
-    session = None
-    if session_id:
-        # 如果前端传了 session_id，查找是否存在
-        session = await store.GetSession(session_id)
-        if session is None or session["database_id"] != query_request.database_id:
-            trace.log("会话未找到，创建新会话", f"session_id={session_id}")
-            session_id = await store.CreateSession(query_request.database_id)
-            session = await store.GetSession(session_id)
-    else:
+    if not session_id:
         # 没有 session_id，创建一个新会话
         session_id = await store.CreateSession(query_request.database_id)
-        session = await store.GetSession(session_id)
         trace.log("创建新会话", f"session_id={session_id}")
 
-    history = session["turns"] if session else []
-    session_context = {}
-    if history:
-        last_item = history[-1]
-        session_context = {
-            "last_question": last_item.get("question"),
-            "last_sql": last_item.get("sql"),
-        }
+    while True:
+        lock = await _SessionLock(request, session_id)
+        await lock.acquire()
+        try:
+            session = await store.GetSession(session_id)
+        except BaseException:
+            lock.release()
+            raise
+        if session is not None and session["database_id"] == query_request.database_id:
+            break
+        lock.release()
+        trace.log("会话未找到，创建新会话", f"session_id={session_id}")
+        session_id = await store.CreateSession(query_request.database_id)
 
     try:
-        result = await AgentGraph().ARun(
-            question=query_request.question,
-            database_id=query_request.database_id,
-            session_context=session_context,
-        )
-        response = QueryResponse(
-            answer=result["answer"],
-            sql=result.get("sql"),
-            columns=result.get("columns"),
-            rows=result.get("rows"),
-            chart=result.get("chart"),
-            trace=result.get("trace", []),
-            error=result.get("error"),
-        )
-    except Exception as exc:
-        trace.log("查询失败", str(exc))
-        response = QueryResponse(
-            answer="查询失败，请稍后重试或换一种问法。",
-            sql=None,
-            columns=[],
-            rows=[],
-            chart=None,
-            trace=trace.get_logs(),
-            error=str(exc),
-        )
+        history = session["turns"] if session else []
+        session_context = {}
+        if history:
+            last_item = history[-1]
+            session_context = {
+                "last_question": last_item.get("question"),
+                "last_sql": last_item.get("sql"),
+            }
 
-    # ---------- 保存会话历史 ----------
-    await store.SaveTurn(
-        session_id,
-        {
-            "id": str(uuid.uuid4()),
-            "question": query_request.question,
-            "response_kind": "error" if response.error else "answer",
-            "answer": response.answer,
-            "sql": response.sql,
-            "result_preview": response.rows,
-            "chart": response.chart,
-            "error": response.error,
-            "trace": response.trace,
-        },
-    )
+        try:
+            result = _JsonSafe(
+                await AgentGraph().ARun(
+                    question=query_request.question,
+                    database_id=query_request.database_id,
+                    session_context=session_context,
+                )
+            )
+            response = QueryResponse(
+                answer=result["answer"],
+                sql=result.get("sql"),
+                columns=result.get("columns"),
+                rows=result.get("rows"),
+                chart=result.get("chart"),
+                trace=result.get("trace", []),
+                error=_PUBLIC_QUERY_ERROR if result.get("error") else None,
+            )
+        except Exception:
+            logger.exception("Query execution failed")
+            trace.log("查询失败", _PUBLIC_QUERY_ERROR)
+            response = QueryResponse(
+                answer="查询失败，请稍后重试或换一种问法。",
+                sql=None,
+                columns=[],
+                rows=[],
+                chart=None,
+                trace=_JsonSafe(trace.get_logs()),
+                error=_PUBLIC_QUERY_ERROR,
+            )
+
+        # ---------- 保存会话历史 ----------
+        await store.SaveTurn(
+            session_id,
+            {
+                "id": str(uuid.uuid4()),
+                "question": query_request.question,
+                "response_kind": "error" if response.error else "answer",
+                "answer": response.answer,
+                "sql": response.sql,
+                "result_preview": _JsonSafe(response.rows),
+                "chart": _JsonSafe(response.chart),
+                "error": _JsonSafe(response.error),
+                "trace": _JsonSafe(response.trace),
+            },
+        )
+    finally:
+        lock.release()
 
     trace.log("查询完成")
     return response

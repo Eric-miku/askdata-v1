@@ -1,7 +1,14 @@
+import asyncio
+import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 import sys
+from uuid import UUID
 
 import pytest
 from fastapi import FastAPI
@@ -75,7 +82,10 @@ def test_create_session_returns_id_and_created_at(api):
 
     assert response.status_code == 200
     assert response.json()["session_id"]
-    assert response.json()["created_at"].endswith("+00:00")
+    assert isinstance(response.json()["created_at"], float)
+    assert response.json()["created_at"] > 0
+    stored = client.get(f"/api/sessions/{response.json()['session_id']}").json()
+    assert stored["created_at"].endswith("+00:00")
 
 
 def test_list_sessions_orders_recent_first_and_respects_limit(api):
@@ -232,7 +242,9 @@ def test_query_rejects_clarification_until_continuations_are_supported(api):
     assert response.json() == {"detail": "Only question queries are supported"}
 
 
-def test_query_failure_keeps_answer_safe_and_persists_error(api, monkeypatch):
+def test_query_failure_sanitizes_public_response_and_persisted_turn(
+    api, monkeypatch, caplog
+):
     client, _, _ = api
 
     class FailingGraph:
@@ -246,9 +258,152 @@ def test_query_failure_keeps_answer_safe_and_persists_error(api, monkeypatch):
 
     assert response.status_code == 200
     assert "database password leaked" not in response.json()["answer"]
-    assert response.json()["error"] == "database password leaked"
+    assert response.json()["error"] == "query_failed"
+    assert "database password leaked" not in json.dumps(response.json()["trace"])
     session_id = client.get("/api/sessions").json()[0]["id"]
     turn = client.get(f"/api/sessions/{session_id}").json()["turns"][0]
     assert turn["question"] == "Fail safely"
     assert turn["response_kind"] == "error"
-    assert turn["error"] == "database password leaked"
+    assert turn["error"] == "query_failed"
+    assert "database password leaked" not in json.dumps(turn["trace"])
+    assert "database password leaked" in caplog.text
+
+
+def test_query_normalizes_non_json_graph_values_for_response_and_history(api, monkeypatch):
+    client, _, _ = api
+    item_id = UUID("12345678-1234-5678-1234-567812345678")
+    created_at = datetime(2026, 7, 15, 10, 30, tzinfo=timezone.utc)
+
+    class RichGraph:
+        async def ARun(self, **kwargs):
+            return {
+                "answer": "Normalized.",
+                "sql": "SELECT 1",
+                "columns": ["amount", "created_at", "id", "payload"],
+                "rows": [
+                    {
+                        "amount": Decimal("12.50"),
+                        "created_at": created_at,
+                        "id": item_id,
+                        "payload": b"\xff\x00",
+                    }
+                ],
+                "chart": {"generated_at": created_at},
+                "trace": [{"at": created_at}],
+                "error": None,
+            }
+
+    monkeypatch.setattr(routes, "AgentGraph", RichGraph)
+
+    response = client.post(
+        "/api/query", json={"question": "Rich values", "database_id": "demo"}
+    )
+
+    assert response.status_code == 200
+    expected_row = {
+        "amount": "12.50",
+        "created_at": "2026-07-15T10:30:00+00:00",
+        "id": str(item_id),
+        "payload": "/wA=",
+    }
+    assert response.json()["rows"] == [expected_row]
+    session_id = client.get("/api/sessions").json()[0]["id"]
+    turn = client.get(f"/api/sessions/{session_id}").json()["turns"][0]
+    assert turn["result_preview"] == [expected_row]
+    assert turn["chart"] == {"generated_at": "2026-07-15T10:30:00+00:00"}
+    assert turn["trace"] == [{"at": "2026-07-15T10:30:00+00:00"}]
+
+
+def test_concurrent_queries_for_one_session_serialize_and_share_context(api, monkeypatch):
+    client, _, _ = api
+    session_id = client.post("/api/sessions?database_id=demo").json()["session_id"]
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    calls = []
+
+    class BlockingGraph:
+        async def ARun(self, question, database_id, session_context=None):
+            calls.append((question, session_context))
+            if question == "First":
+                first_entered.set()
+                await asyncio.to_thread(release_first.wait)
+            else:
+                second_entered.set()
+            return {
+                "answer": question,
+                "sql": f"SELECT '{question}'",
+                "columns": [],
+                "rows": [],
+                "chart": None,
+                "trace": [],
+                "error": None,
+            }
+
+    monkeypatch.setattr(routes, "AgentGraph", BlockingGraph)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            client.post,
+            "/api/query",
+            json={"question": "First", "database_id": "demo", "session_id": session_id},
+        )
+        assert first_entered.wait(timeout=2)
+        second = executor.submit(
+            client.post,
+            "/api/query",
+            json={"question": "Second", "database_id": "demo", "session_id": session_id},
+        )
+        try:
+            assert not second_entered.wait(timeout=0.1)
+        finally:
+            release_first.set()
+        assert first.result(timeout=2).status_code == 200
+        assert second.result(timeout=2).status_code == 200
+
+    assert calls == [
+        ("First", {}),
+        (
+            "Second",
+            {"last_question": "First", "last_sql": "SELECT 'First'"},
+        ),
+    ]
+
+
+def test_delete_waits_for_in_flight_query_then_deletes_session(api, monkeypatch):
+    client, _, _ = api
+    session_id = client.post("/api/sessions?database_id=demo").json()["session_id"]
+    query_entered = threading.Event()
+    release_query = threading.Event()
+
+    class BlockingGraph:
+        async def ARun(self, **kwargs):
+            query_entered.set()
+            await asyncio.to_thread(release_query.wait)
+            return {
+                "answer": "Finished.",
+                "sql": "SELECT 1",
+                "columns": [],
+                "rows": [],
+                "chart": None,
+                "trace": [],
+                "error": None,
+            }
+
+    monkeypatch.setattr(routes, "AgentGraph", BlockingGraph)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        query = executor.submit(
+            client.post,
+            "/api/query",
+            json={"question": "Slow", "database_id": "demo", "session_id": session_id},
+        )
+        assert query_entered.wait(timeout=2)
+        delete = executor.submit(client.delete, f"/api/sessions/{session_id}")
+        try:
+            with pytest.raises(TimeoutError):
+                delete.result(timeout=0.1)
+        finally:
+            release_query.set()
+        assert query.result(timeout=2).status_code == 200
+        assert delete.result(timeout=2).status_code == 200
+
+    assert client.get(f"/api/sessions/{session_id}").status_code == 404
