@@ -95,6 +95,160 @@
         "sql_executions": 0,
         "token_usage": 130
       }
+    },
+    {
+      "id": "empty_result",
+      "category": "empty_result",
+      "question": "show schools opened next year",
+      "expected_kind": "answer",
+      "expected_empty_result": true,
+      "prediction": {
+        "kind": "answer",
+        "sql": "SELECT school_name FROM schools WHERE opened_year = 2099",
+        "rows": [],
+        "latency_ms": 50,
+        "llm_calls": 1,
+        "sql_executions": 1,
+        "token_usage": 100
+      }
+    },
+    {
+      "id": "partial_result",
+      "category": "partial",
+      "question": "compare enrollment and attendance where available",
+      "expected_kind": "partial",
+      "expected_partial": true,
+      "prediction": {
+        "kind": "partial",
+        "sql": "SELECT school_name, enrollment FROM schools",
+        "limitations": ["Attendance is not available in this schema."],
+        "suggestions": ["Compare enrollment only."],
+        "latency_ms": 160,
+        "llm_calls": 2,
+        "sql_executions": 2,
+        "token_usage": 300
+      }
+    },
+    {
+      "id": "time_series_chart",
+      "category": "chart",
+      "question": "monthly enrollment trend",
+      "expected_kind": "answer",
+      "expected_chart": "line",
+      "prediction": {
+        "kind": "answer",
+        "sql": "SELECT month, enrollment FROM monthly_enrollment ORDER BY month",
+        "chart": {
+          "type": "line",
+          "title": "Monthly enrollment",
+          "category_field": "month",
+          "value_fields": ["enrollment"],
+          "reason": "time_series"
+        },
+        "latency_ms": 90,
+        "llm_calls": 1,
+        "sql_executions": 1,
+        "token_usage": 210
+      }
+    },
+    {
+      "id": "comparison_chart",
+      "category": "chart",
+      "question": "compare enrollment by district",
+      "expected_kind": "answer",
+      "expected_chart": "vertical_bar",
+      "prediction": {
+        "kind": "answer",
+        "sql": "SELECT district, SUM(enrollment) AS enrollment FROM schools GROUP BY district",
+        "chart": {
+          "type": "vertical_bar",
+          "title": "Enrollment by district",
+          "category_field": "district",
+          "value_fields": ["enrollment"],
+          "reason": "comparison"
+        },
+        "latency_ms": 95,
+        "llm_calls": 1,
+        "sql_executions": 1,
+        "token_usage": 220
+      }
+    },
+    {
+      "id": "proportion_chart",
+      "category": "chart",
+      "question": "enrollment share by school type",
+      "expected_kind": "answer",
+      "expected_chart": "pie",
+      "prediction": {
+        "kind": "answer",
+        "sql": "SELECT school_type, SUM(enrollment) AS enrollment FROM schools GROUP BY school_type",
+        "chart": {
+          "type": "pie",
+          "title": "Enrollment share",
+          "category_field": "school_type",
+          "value_fields": ["enrollment"],
+          "reason": "proportion"
+        },
+        "latency_ms": 100,
+        "llm_calls": 1,
+        "sql_executions": 1,
+        "token_usage": 230
+      }
+    },
+    {
+      "id": "correlation_chart",
+      "category": "chart",
+      "question": "relationship between enrollment and attendance",
+      "expected_kind": "answer",
+      "expected_chart": "scatter",
+      "prediction": {
+        "kind": "answer",
+        "sql": "SELECT enrollment, attendance FROM schools",
+        "chart": {
+          "type": "scatter",
+          "title": "Enrollment and attendance",
+          "value_fields": ["enrollment", "attendance"],
+          "reason": "correlation"
+        },
+        "latency_ms": 105,
+        "llm_calls": 1,
+        "sql_executions": 1,
+        "token_usage": 240
+      }
+    },
+    {
+      "id": "table_only",
+      "category": "chart",
+      "question": "show the school contact record",
+      "expected_kind": "answer",
+      "expected_chart": null,
+      "prediction": {
+        "kind": "answer",
+        "sql": "SELECT school_name, phone FROM schools LIMIT 1",
+        "chart": null,
+        "latency_ms": 85,
+        "llm_calls": 1,
+        "sql_executions": 1,
+        "token_usage": 190
+      }
+    },
+    {
+      "id": "vector_outage",
+      "category": "retrieval_outage",
+      "question": "list schools by district",
+      "expected_kind": "answer",
+      "expected_vector_outage_fallback": true,
+      "prediction": {
+        "kind": "answer",
+        "sql": "SELECT school_name, district FROM schools",
+        "vector_outage": true,
+        "lexical_fallback": true,
+        "retrieval_warnings": ["Semantic retrieval is unavailable; lexical schema retrieval was used."],
+        "latency_ms": 110,
+        "llm_calls": 1,
+        "sql_executions": 1,
+        "token_usage": 260
+      }
     }
   ]
 }

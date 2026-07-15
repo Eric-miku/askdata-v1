@@ -27,9 +27,13 @@ def load_fixture():
 def test_demo_metrics_cover_all_v2_golden_journeys():
     cases, predictions = load_fixture()
 
+    assert {case.get("expected_chart") for case in cases if "expected_chart" in case} == {
+        "line", "vertical_bar", "horizontal_bar", "pie", "scatter", None
+    }
+
     report = DemoSuite(cases).Compare(predictions)
 
-    assert report["summary"] == {"total": 5, "passed": 5, "pass_rate": 1.0}
+    assert report["summary"] == {"total": 13, "passed": 13, "pass_rate": 1.0}
     assert report["by_category"]["clear"] == {
         "total": 1, "passed": 1, "pass_rate": 1.0
     }
@@ -40,14 +44,18 @@ def test_demo_metrics_cover_all_v2_golden_journeys():
     assert report["unanswerable_recall"] == 1.0
     assert report["proxy_query_rate"] == 0.0
     assert report["chart_spec_validity"] == 1.0
+    assert report["table_only_correctness"] == 1.0
+    assert report["empty_result_correctness"] == 1.0
+    assert report["partial_response_validity"] == 1.0
+    assert report["vector_outage_fallback"] == 1.0
     assert report["retrieval_table_recall_at_k"] == 1.0
     assert report["retrieval_column_recall_at_k"] == 1.0
     assert report["stream_parity"] == 1.0
     assert report["restart_persistence"] == 1.0
-    assert report["latency_ms"] == {"p50": 80.0, "p95": 136.0}
-    assert report["llm_calls"] == 5
-    assert report["sql_executions"] == 2
-    assert report["token_usage"] == 1340
+    assert report["latency_ms"] == {"p50": 95.0, "p95": 148.0}
+    assert report["llm_calls"] == 14
+    assert report["sql_executions"] == 11
+    assert report["token_usage"] == 3090
 
 
 def test_missing_prediction_fields_never_pass_and_are_reported():
@@ -99,6 +107,51 @@ def test_zero_denominator_rates_are_zero_not_vacuous_passes():
     assert report["retrieval_column_recall_at_k"] == 0.0
     assert report["stream_parity"] == 0.0
     assert report["restart_persistence"] == 0.0
+
+
+def test_missing_special_journey_evidence_never_passes():
+    cases = [
+        {"id": "empty", "category": "empty_result", "expected_kind": "answer", "expected_empty_result": True},
+        {"id": "partial", "category": "partial", "expected_kind": "partial", "expected_partial": True},
+        {"id": "table", "category": "chart", "expected_kind": "answer", "expected_chart": None},
+        {
+            "id": "outage",
+            "category": "retrieval_outage",
+            "expected_kind": "answer",
+            "expected_vector_outage_fallback": True,
+        },
+    ]
+    runtime = {
+        "kind": "answer",
+        "sql": "SELECT 1",
+        "latency_ms": 1,
+        "llm_calls": 0,
+        "sql_executions": 1,
+        "token_usage": 0,
+    }
+    predictions = [
+        {"id": "empty", **runtime},
+        {"id": "partial", **runtime, "kind": "partial"},
+        {"id": "table", **runtime},
+        {"id": "outage", **runtime},
+    ]
+
+    report = DemoSuite(cases).Compare(predictions)
+
+    assert report["summary"]["passed"] == 0
+    assert report["empty_result_correctness"] == 0.0
+    assert report["partial_response_validity"] == 0.0
+    assert report["table_only_correctness"] == 0.0
+    assert report["vector_outage_fallback"] == 0.0
+    assert report["missing_fields"] == {
+        "chart": 1,
+        "lexical_fallback": 1,
+        "limitations": 1,
+        "retrieval_warnings": 1,
+        "rows": 1,
+        "suggestions": 1,
+        "vector_outage": 1,
+    }
 
 
 def test_false_clarification_rate_uses_only_clear_question_denominator():
@@ -186,8 +239,8 @@ def test_eval_demo_cli_writes_report_atomically_and_prints_category_table(tmp_pa
     assert result.exit_code == 0
     assert "Category" in result.output
     assert "semantic_mapping" in result.output
-    assert "5/5" in result.output
-    assert json.loads(out.read_text(encoding="utf-8"))["summary"]["passed"] == 5
+    assert "13/13" in result.output
+    assert json.loads(out.read_text(encoding="utf-8"))["summary"]["passed"] == 13
     assert list(out.parent.glob("*.tmp")) == []
 
 
@@ -210,5 +263,5 @@ def test_eval_demo_cli_accepts_separate_predictions_and_fails_on_golden_failure(
     ])
 
     assert result.exit_code == 1
-    assert "4/5" in result.output
-    assert json.loads(out.read_text(encoding="utf-8"))["summary"]["passed"] == 4
+    assert "12/13" in result.output
+    assert json.loads(out.read_text(encoding="utf-8"))["summary"]["passed"] == 12

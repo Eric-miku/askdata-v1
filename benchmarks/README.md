@@ -2,7 +2,7 @@
 
 ## V2.1 演示回归套件
 
-版本化的演示题和离线预测保存在 `tests/fixtures/v2_demo_cases.json`。运行：
+版本化的 13 项演示题和离线预测保存在 `tests/fixtures/v2_demo_cases.json`。除五项核心旅程外，还固定覆盖合法空结果、partial 响应、五种图表、table-only 策略，以及远程向量服务中断后的 lexical fallback。运行：
 
 ```bash
 uv run askdata eval-demo \

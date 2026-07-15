@@ -41,6 +41,10 @@ class DemoSuite:
         unanswerable_expected = unanswerable_predicted = unanswerable_true = 0
         proxy_queries = 0
         chart_total = chart_valid = 0
+        table_only_total = table_only_passed = 0
+        empty_total = empty_passed = 0
+        partial_total = partial_passed = 0
+        outage_total = outage_passed = 0
         table_gold = table_hits = column_gold = column_hits = 0
         stream_total = stream_passed = restart_total = restart_passed = 0
         latencies: list[float] = []
@@ -93,7 +97,8 @@ class DemoSuite:
                     and prediction.get("code") == case["expected_error_code"]
                 )
 
-            chart_expected = "expected_chart" in case
+            chart_expected = "expected_chart" in case and case.get("expected_chart") is not None
+            table_only_expected = "expected_chart" in case and case.get("expected_chart") is None
             chart_present = prediction.get("chart") is not None
             if chart_expected or chart_present:
                 chart_total += 1
@@ -109,6 +114,71 @@ class DemoSuite:
                         isinstance(prediction.get("chart"), Mapping)
                         and prediction["chart"].get("type") == case["expected_chart"]
                     )
+            if table_only_expected:
+                table_only_total += 1
+                present = self._Present(prediction, "chart", missing_fields)
+                matched = present and prediction.get("chart") is None
+                table_only_passed += int(matched)
+                checks.append(matched)
+
+            if "expected_empty_result" in case:
+                empty_total += 1
+                present = self._Present(prediction, "rows", missing_fields)
+                rows = prediction.get("rows")
+                matched = (
+                    present
+                    and isinstance(rows, list)
+                    and (len(rows) == 0) is bool(case["expected_empty_result"])
+                )
+                empty_passed += int(matched)
+                checks.append(matched)
+
+            if case.get("expected_partial") is True:
+                partial_total += 1
+                limitations_present = self._Present(
+                    prediction, "limitations", missing_fields
+                )
+                suggestions_present = self._Present(
+                    prediction, "suggestions", missing_fields
+                )
+                limitations = prediction.get("limitations")
+                suggestions = prediction.get("suggestions")
+                matched = (
+                    limitations_present
+                    and suggestions_present
+                    and isinstance(limitations, list)
+                    and bool(limitations)
+                    and all(isinstance(item, str) and item.strip() for item in limitations)
+                    and isinstance(suggestions, list)
+                    and all(isinstance(item, str) and item.strip() for item in suggestions)
+                )
+                partial_passed += int(matched)
+                checks.append(matched)
+
+            if case.get("expected_vector_outage_fallback") is True:
+                outage_total += 1
+                outage_present = self._Present(
+                    prediction, "vector_outage", missing_fields
+                )
+                fallback_present = self._Present(
+                    prediction, "lexical_fallback", missing_fields
+                )
+                warnings_present = self._Present(
+                    prediction, "retrieval_warnings", missing_fields
+                )
+                warnings = prediction.get("retrieval_warnings")
+                matched = (
+                    outage_present
+                    and prediction.get("vector_outage") is True
+                    and fallback_present
+                    and prediction.get("lexical_fallback") is True
+                    and warnings_present
+                    and isinstance(warnings, list)
+                    and bool(warnings)
+                    and all(isinstance(item, str) and item.strip() for item in warnings)
+                )
+                outage_passed += int(matched)
+                checks.append(matched)
 
             if "expected_context" in case:
                 present = self._Present(prediction, "retrieved_context", missing_fields)
@@ -190,6 +260,12 @@ class DemoSuite:
             "unanswerable_recall": self._Rate(unanswerable_true, unanswerable_expected),
             "proxy_query_rate": self._Rate(proxy_queries, unanswerable_expected),
             "chart_spec_validity": self._Rate(chart_valid, chart_total),
+            "table_only_correctness": self._Rate(
+                table_only_passed, table_only_total
+            ),
+            "empty_result_correctness": self._Rate(empty_passed, empty_total),
+            "partial_response_validity": self._Rate(partial_passed, partial_total),
+            "vector_outage_fallback": self._Rate(outage_passed, outage_total),
             "retrieval_table_recall_at_k": self._Rate(table_hits, table_gold),
             "retrieval_column_recall_at_k": self._Rate(column_hits, column_gold),
             "stream_parity": self._Rate(stream_passed, stream_total),
