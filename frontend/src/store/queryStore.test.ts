@@ -8,6 +8,7 @@ import type {
   QueryResponse,
   QueryStreamEvent,
   RestoredSession,
+  SessionInfo,
   V2QueryRequest,
   V2QueryResponse,
 } from "../types/query";
@@ -299,6 +300,55 @@ describe("query store", () => {
       error: "查询已取消。",
     });
     expect(JSON.stringify(store.getState().turns[0])).not.toContain("Late");
+  });
+
+  it("never lets a cancelled session creation replace the newer conversation", async () => {
+    const firstSession = deferred<SessionInfo>();
+    const secondSession = deferred<SessionInfo>();
+    const createSession = vi
+      .fn()
+      .mockReturnValueOnce(firstSession.promise)
+      .mockReturnValueOnce(secondSession.promise);
+    const api = createApi({ createSession });
+    const store = createQueryStore(api);
+    store.setState({ database: "demo" });
+
+    const firstSend = store.getState().sendMessage("Old question");
+    await vi.waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    store.getState().cancelActiveQuery();
+    await store.getState().newChat();
+
+    const secondSend = store.getState().sendMessage("New question");
+    await vi.waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
+    secondSession.resolve({ session_id: "session-B", created_at: 2 });
+    await secondSend;
+
+    firstSession.resolve({ session_id: "session-A", created_at: 1 });
+    await firstSend;
+    await store.getState().sendMessage("Continue new conversation");
+
+    expect(store.getState().sessionId).toBe("session-B");
+    expect(store.getState().turns.map((turn) => turn.question)).toEqual([
+      "New question",
+      "Continue new conversation",
+    ]);
+    expect(createSession).toHaveBeenCalledTimes(2);
+    expect(api.queryStream).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ session_id: "session-B", question: "New question" }),
+      expect.any(Function),
+      expect.any(AbortSignal),
+    );
+    expect(api.queryStream).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        session_id: "session-B",
+        question: "Continue new conversation",
+      }),
+      expect.any(Function),
+      expect.any(AbortSignal),
+    );
+    expect(api.listSessions).toHaveBeenCalledTimes(2);
   });
   it("loads databases and selects the first available database", async () => {
     const store = createQueryStore(createApi());

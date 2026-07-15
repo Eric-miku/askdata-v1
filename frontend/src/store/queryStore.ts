@@ -210,13 +210,18 @@ export function createQueryStore(api: QueryApi = defaultApi) {
       }));
     };
 
-    const ensureSession = async (): Promise<string> => {
+    const ensureSession = async (
+      canCommit: () => boolean,
+    ): Promise<string | null> => {
       const currentSession = get().sessionId;
       if (currentSession) {
         return currentSession;
       }
 
       const session = await api.createSession(get().database);
+      if (!canCommit()) return null;
+      const newerSession = get().sessionId;
+      if (newerSession) return newerSession;
       set({ sessionId: session.session_id });
       return session.session_id;
     };
@@ -256,8 +261,8 @@ export function createQueryStore(api: QueryApi = defaultApi) {
       };
 
       try {
-        const sessionId = await ensureSession();
-        if (!isCurrent() || operation.controller.signal.aborted) return;
+        const sessionId = await ensureSession(isCurrent);
+        if (!sessionId || !isCurrent() || operation.controller.signal.aborted) return;
         const response = await api.queryStream(
           requestForSession(sessionId),
           onEvent,

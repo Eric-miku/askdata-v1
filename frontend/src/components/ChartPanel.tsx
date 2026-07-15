@@ -1,3 +1,4 @@
+import { useId } from "react";
 import ReactECharts from "echarts-for-react";
 import type { ChartSpec, QueryCellValue } from "../types/query";
 
@@ -46,9 +47,14 @@ function numericValue(value: QueryCellValue): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function sharedOption(spec: ChartSpec, theme: ChartTheme): ChartOption {
+function sharedOption(
+  spec: ChartSpec,
+  theme: ChartTheme,
+  reducedMotion: boolean,
+): ChartOption {
   return {
-    animationDuration: 240,
+    animation: !reducedMotion,
+    animationDuration: reducedMotion ? 0 : 240,
     backgroundColor: "transparent",
     color: [theme.accent],
     textStyle: { color: theme.text, fontFamily: "Inter, system-ui, sans-serif" },
@@ -81,8 +87,9 @@ export function buildChartOption(
   spec: ChartSpec,
   rows: ChartRow[],
   theme: ChartTheme = fallbackTheme,
+  reducedMotion = false,
 ): ChartOption {
-  const shared = sharedOption(spec, theme);
+  const shared = sharedOption(spec, theme, reducedMotion);
   const axisStyle = {
     axisLine: { lineStyle: { color: theme.border } },
     axisLabel: { color: theme.muted },
@@ -171,7 +178,18 @@ interface ChartPanelProps {
   rows: ChartRow[];
 }
 
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
+  );
+}
+
 export default function ChartPanel({ spec, rows }: ChartPanelProps) {
+  const id = useId();
+  const titleId = `${id}-title`;
+  const summaryId = `${id}-summary`;
   const summary = `${spec.title}，${rows.length} 个数据点，图表类型为${
     spec.type === "line"
       ? "折线图"
@@ -185,15 +203,19 @@ export default function ChartPanel({ spec, rows }: ChartPanelProps) {
   }。`;
 
   return (
-    <figure className="chart-panel" role="img" aria-label={spec.title}>
-      <figcaption>{spec.title}</figcaption>
-      <ReactECharts
-        option={buildChartOption(spec, rows, cssTheme())}
-        notMerge
-        lazyUpdate
-        style={{ width: "100%", height: "320px" }}
-      />
-      <span className="visually-hidden">{summary}</span>
+    <figure className="chart-panel">
+      <figcaption id={titleId}>{spec.title}</figcaption>
+      <div role="img" aria-labelledby={titleId} aria-describedby={summaryId}>
+        <ReactECharts
+          option={buildChartOption(spec, rows, cssTheme(), prefersReducedMotion())}
+          notMerge
+          lazyUpdate
+          style={{ width: "100%", height: "320px" }}
+        />
+      </div>
+      <span className="visually-hidden" id={summaryId}>
+        {summary}
+      </span>
     </figure>
   );
 }

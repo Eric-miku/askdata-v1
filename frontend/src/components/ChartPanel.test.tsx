@@ -1,5 +1,5 @@
 import { render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChartSpec, QueryCellValue } from "../types/query";
 
 const mockedReactECharts = vi.hoisted(() => vi.fn(() => <div data-testid="echart" />));
@@ -23,6 +23,7 @@ const rankingRows = [
 
 describe("ChartPanel", () => {
   beforeEach(() => mockedReactECharts.mockClear());
+  afterEach(() => vi.restoreAllMocks());
 
   it("maps a ranking spec to a horizontal bar using only named fields", () => {
     const option = buildChartOption(rankingSpec, rankingRows, {
@@ -54,8 +55,62 @@ describe("ChartPanel", () => {
       expect.any(Object),
     );
     expect(container.querySelector(".chart-panel")).toBeInTheDocument();
-    expect(screen.getByRole("img", { name: "Top schools by enrollment" })).toBeVisible();
-    expect(screen.getByText(/2 个数据点/)).toHaveClass("visually-hidden");
+    const chart = screen.getByRole("img", { name: "Top schools by enrollment" });
+    const summaryId = chart.getAttribute("aria-describedby");
+    expect(summaryId).toBeTruthy();
+    const summary = document.getElementById(summaryId!);
+    expect(summary).toHaveTextContent(/2 个数据点/);
+    expect(summary).toHaveClass("visually-hidden");
+  });
+
+  it("disables ECharts animation when reduced motion is requested", () => {
+    vi.spyOn(window, "matchMedia").mockImplementation(
+      (query) =>
+        ({
+          matches: query === "(prefers-reduced-motion: reduce)",
+          media: query,
+          onchange: null,
+          addListener: vi.fn(),
+          removeListener: vi.fn(),
+          addEventListener: vi.fn(),
+          removeEventListener: vi.fn(),
+          dispatchEvent: vi.fn(),
+        }) as MediaQueryList,
+    );
+
+    render(<ChartPanel spec={rankingSpec} rows={rankingRows} />);
+
+    expect(mockedReactECharts).toHaveBeenCalledWith(
+      expect.objectContaining({
+        option: expect.objectContaining({ animation: false, animationDuration: 0 }),
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it("keeps restrained animation when reduced motion is not requested", () => {
+    vi.spyOn(window, "matchMedia").mockImplementation(
+      (query) =>
+        ({
+          matches: false,
+          media: query,
+          onchange: null,
+          addListener: vi.fn(),
+          removeListener: vi.fn(),
+          addEventListener: vi.fn(),
+          removeEventListener: vi.fn(),
+          dispatchEvent: vi.fn(),
+        }) as MediaQueryList,
+    );
+
+    render(<ChartPanel spec={rankingSpec} rows={rankingRows} />);
+
+    expect(mockedReactECharts).toHaveBeenCalledWith(
+      expect.objectContaining({
+        option: expect.objectContaining({ animation: true, animationDuration: 240 }),
+      }),
+      expect.any(Object),
+    );
   });
 
   it("builds line, vertical bar, pie, and scatter options without executable formatters", () => {
