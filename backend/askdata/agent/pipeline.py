@@ -106,18 +106,38 @@ class StagedSqlPipeline:
         last_candidate_sql = ""
         grounding_failure_seen = False
         expanded = False
+        previous_failure: str | None = None
+        previous_progress = -1.0
+        new_state = getattr(self.react, "NewCandidateState", None)
+        generation_state = (
+            new_state(question, schema_prompt, session_context)
+            if callable(new_state)
+            else None
+        )
 
         for stage_index, stage in enumerate(_STAGES):
             if executions >= self.max_executions:
                 break
-            if stage == "retrieval_expansion" and grounding_failure_seen and self.retrieval_expander:
-                expanded_retrieval = self.retrieval_expander(question, current_retrieval)
-                if expanded_retrieval:
-                    current_retrieval = dict(expanded_retrieval)
-                    schema_prompt = str(current_retrieval.get("schema_prompt") or schema_prompt)
-                    schema = current_retrieval.get("schema") or self._SchemaFromPrompt(schema_prompt)
-                expanded = True
-                self._Emit(trace, emit, "RetrieveSchema", "retry")
+            if stage == "retrieval_expansion":
+                if not grounding_failure_seen:
+                    continue
+                if self.retrieval_expander:
+                    expanded_retrieval = self.retrieval_expander(question, current_retrieval)
+                    if expanded_retrieval:
+                        current_retrieval = dict(expanded_retrieval)
+                        schema_prompt = str(
+                            current_retrieval.get("schema_prompt") or schema_prompt
+                        )
+                        schema = current_retrieval.get("schema") or self._SchemaFromPrompt(
+                            schema_prompt
+                        )
+                    expanded = True
+                    self._Emit(trace, emit, "RetrieveSchema", "retry")
+                    record_context = getattr(self.react, "RecordRetrievalContext", None)
+                    if generation_state is not None and callable(record_context):
+                        record_context(generation_state, schema_prompt)
+            if stage == "alternate_plan" and last_failure != "empty_or_suspicious":
+                continue
 
             generation_context = dict(session_context or {})
             generation_context.update(
@@ -127,8 +147,32 @@ class StagedSqlPipeline:
                     "pipeline_previous_sql": last_candidate_sql,
                 }
             )
-            drafts = self.react.GenerateCandidates(question, schema_prompt, generation_context)
-            for raw_draft in drafts or []:
+            if generation_state is not None:
+                drafts = self.react.GenerateCandidates(
+                    question,
+                    schema_prompt,
+                    generation_context,
+                    state=generation_state,
+                )
+            else:
+                drafts = self.react.GenerateCandidates(
+                    question, schema_prompt, generation_context
+                )
+            drafts = list(drafts or [])
+            for ignored in drafts[1:]:
+                ignored_draft = (
+                    ignored
+                    if isinstance(ignored, SqlCandidateDraft)
+                    else SqlCandidateDraft.model_validate(ignored)
+                )
+                self._RecordFeedback(
+                    generation_state,
+                    ignored_draft,
+                    success=False,
+                    failure_class="not_selected",
+                    error="candidate_not_selected_for_this_stage",
+                )
+            for raw_draft in drafts[:1]:
                 if executions >= self.max_executions:
                     break
                 draft = (
@@ -137,14 +181,18 @@ class StagedSqlPipeline:
                     else SqlCandidateDraft.model_validate(raw_draft)
                 )
                 sql = draft.sql.strip().rstrip(";")
-                if not sql:
-                    continue
                 last_candidate_sql = sql
                 self._Emit(trace, emit, "GenerateSql", "success")
                 normalized_key = re.sub(r"\s+", " ", sql).casefold()
                 if normalized_key in seen_sql:
                     last_failure = "repeated_no_progress"
-                    self._Emit(trace, emit, "RepairSql", "warning")
+                    self._Emit(
+                        trace,
+                        emit,
+                        "RepairSql",
+                        "warning",
+                        failure_class="repeated_no_progress",
+                    )
                     return self._Finish(
                         question, ledger, attempts, trace, last_failure, executions, expanded, emit
                     )
@@ -166,7 +214,37 @@ class StagedSqlPipeline:
                     )
                     attempts.append(self._Attempt(sql, static_class, static_report, None, False))
                     last_failure = static_class
+                    self._RecordFeedback(
+                        generation_state,
+                        draft,
+                        success=False,
+                        failure_class=static_class,
+                        error=",".join(static_report.failures),
+                    )
                     self._Emit(trace, emit, "RepairSql", "retry")
+                    progress = self._Progress(static_report, None)
+                    if self._RepeatedWithoutProgress(
+                        previous_failure, previous_progress, static_class, progress
+                    ):
+                        last_failure = "repeated_no_progress"
+                        self._Emit(
+                            trace,
+                            emit,
+                            "RepairSql",
+                            "warning",
+                            failure_class="repeated_no_progress",
+                        )
+                        return self._Finish(
+                            question,
+                            ledger,
+                            attempts,
+                            trace,
+                            last_failure,
+                            executions,
+                            expanded,
+                            emit,
+                        )
+                    previous_failure, previous_progress = static_class, progress
                     continue
 
                 execution = self.runner(sql, database_path)
@@ -184,10 +262,40 @@ class StagedSqlPipeline:
                             sequence=len(attempts),
                         )
                     )
-                    attempts.append(self._Attempt(sql, failure_class, static_report, None, False))
+                    attempts.append(self._Attempt(sql, failure_class, static_report, None, True))
                     last_failure = failure_class
+                    self._RecordFeedback(
+                        generation_state,
+                        draft,
+                        success=False,
+                        failure_class=failure_class,
+                        error=str(execution.get("error") or "execution_failed"),
+                    )
                     self._Emit(trace, emit, "ExecuteSql", "retry")
                     self._Emit(trace, emit, "RepairSql", "retry")
+                    progress = self._Progress(static_report, None)
+                    if self._RepeatedWithoutProgress(
+                        previous_failure, previous_progress, failure_class, progress
+                    ):
+                        last_failure = "repeated_no_progress"
+                        self._Emit(
+                            trace,
+                            emit,
+                            "RepairSql",
+                            "warning",
+                            failure_class="repeated_no_progress",
+                        )
+                        return self._Finish(
+                            question,
+                            ledger,
+                            attempts,
+                            trace,
+                            last_failure,
+                            executions,
+                            expanded,
+                            emit,
+                        )
+                    previous_failure, previous_progress = failure_class, progress
                     continue
 
                 columns = list(execution.get("columns") or [])
@@ -208,12 +316,44 @@ class StagedSqlPipeline:
                 attempts.append(self._Attempt(sql, failure_class, static_report, result_report, True))
                 last_failure = failure_class
                 grounding_failure_seen = grounding_failure_seen or failure_class == "schema_grounding"
+                self._RecordFeedback(
+                    generation_state,
+                    draft,
+                    success=True,
+                    failure_class=failure_class,
+                    error=",".join(result_report.failures),
+                    columns=columns,
+                    rows=rows,
+                )
                 self._Emit(trace, emit, "ExecuteSql", "success" if failure_class is None else "retry")
                 if failure_class is None:
                     return self._Finish(
                         question, ledger, attempts, trace, None, executions, expanded, emit
                     )
                 self._Emit(trace, emit, "RepairSql", "retry")
+                progress = self._Progress(static_report, result_report)
+                if self._RepeatedWithoutProgress(
+                    previous_failure, previous_progress, failure_class, progress
+                ):
+                    last_failure = "repeated_no_progress"
+                    self._Emit(
+                        trace,
+                        emit,
+                        "RepairSql",
+                        "warning",
+                        failure_class="repeated_no_progress",
+                    )
+                    return self._Finish(
+                        question,
+                        ledger,
+                        attempts,
+                        trace,
+                        last_failure,
+                        executions,
+                        expanded,
+                        emit,
+                    )
+                previous_failure, previous_progress = failure_class, progress
 
             if not drafts and stage_index < len(_STAGES) - 1:
                 self._Emit(trace, emit, "RepairSql", "retry")
@@ -223,7 +363,16 @@ class StagedSqlPipeline:
         )
 
     def _Finish(self, question, ledger, attempts, trace, failure_class, executions, expanded, emit):
-        selected = ledger.SelectBest()
+        verified_ledger = CandidateLedger()
+        for candidate in ledger.candidates:
+            if (
+                candidate.execution_error is None
+                and candidate.static_report.passed
+                and candidate.result_report is not None
+                and candidate.result_report.passed
+            ):
+                verified_ledger.Add(candidate)
+        selected = verified_ledger.SelectBest()
         ledger_summary = [
             {
                 "sequence": index,
@@ -241,7 +390,7 @@ class StagedSqlPipeline:
                 "rows": [],
                 "chart": None,
                 "trace": trace,
-                "error": "sql_pipeline_failed",
+                "error": "no_trustworthy_candidate",
                 "failure_class": failure_class,
                 "executions": executions,
                 "retrieval_expanded": expanded,
@@ -307,6 +456,54 @@ class StagedSqlPipeline:
         return "empty_or_suspicious" if report.failures else None
 
     @staticmethod
+    def _Progress(
+        static_report: QualityReport,
+        result_report: QualityReport | None,
+    ) -> float:
+        if result_report is None:
+            return static_report.coverage
+        return (static_report.coverage + result_report.coverage) / 2
+
+    @staticmethod
+    def _RepeatedWithoutProgress(
+        previous_failure: str | None,
+        previous_progress: float,
+        failure_class: str | None,
+        progress: float,
+    ) -> bool:
+        return bool(
+            failure_class
+            and failure_class == previous_failure
+            and progress <= previous_progress
+        )
+
+    def _RecordFeedback(
+        self,
+        state,
+        draft: SqlCandidateDraft,
+        *,
+        success: bool,
+        failure_class: str | None,
+        error: str = "",
+        columns: list[str] | None = None,
+        rows: list[dict] | None = None,
+    ) -> None:
+        record = getattr(self.react, "RecordExecutionFeedback", None)
+        if state is None or not callable(record):
+            return
+        record(
+            state,
+            draft,
+            {
+                "success": success,
+                "failure_class": failure_class,
+                "error": error[:300],
+                "columns": columns or [],
+                "rows": rows or [],
+            },
+        )
+
+    @staticmethod
     def _Feedback(failure_class: str | None) -> str:
         return {
             "syntax_or_safety": "Correct SQL syntax or safety validation.",
@@ -355,8 +552,17 @@ class StagedSqlPipeline:
         return IntentContract(shape="listing", output_attributes=outputs)
 
     @staticmethod
-    def _Emit(trace, emit, step: str, status: str) -> None:
+    def _Emit(
+        trace,
+        emit,
+        step: str,
+        status: str,
+        *,
+        failure_class: str | None = None,
+    ) -> None:
         event = {"step": step, "status": status, "message": _SAFE_MESSAGES[step]}
+        if failure_class:
+            event["failure_class"] = failure_class
         trace.append(event)
         if emit:
             emit(dict(event))

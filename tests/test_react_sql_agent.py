@@ -276,5 +276,84 @@ def test_react_sql_agent_generate_candidates_returns_drafts_without_executing():
     )
 
     assert drafts == [
-        SqlCandidateDraft(sql="SELECT COUNT(*) AS count FROM items", reason="Count the rows.")
+        SqlCandidateDraft(
+            sql="SELECT COUNT(*) AS count FROM items",
+            reason="Count the rows.",
+            tool_call_id="call_1",
+        )
     ]
+
+
+def test_react_candidate_generation_retains_tool_messages_and_execution_feedback():
+    first_sql = "SELECT missing FROM items"
+    repaired_sql = "SELECT id FROM items"
+    llm = ScriptedToolCallingLLM([
+        {"sql": first_sql, "content": "Inspect."},
+        {"sql": repaired_sql, "content": "Repair."},
+    ])
+    agent = ReActSqlAgent(llm_client=llm)
+    state = agent.NewCandidateState(
+        question="List items",
+        schema_prompt="Database: demo\nTable items(id integer)",
+        session_context=None,
+    )
+
+    first = agent.GenerateCandidates(
+        "List items",
+        "Database: demo\nTable items(id integer)",
+        {"pipeline_stage": "initial"},
+        state=state,
+    )[0]
+    agent.RecordExecutionFeedback(
+        state,
+        first,
+        {
+            "success": False,
+            "failure_class": "schema_grounding",
+            "error": "no such column: missing",
+        },
+    )
+    agent.RecordRetrievalContext(
+        state,
+        "Database: demo\nTable items(id integer)\nTable labels(item_id integer, name text)",
+    )
+    second = agent.GenerateCandidates(
+        "List items",
+        "Database: demo\nTable items(id integer)",
+        {
+            "pipeline_stage": "targeted_repair_1",
+            "pipeline_feedback": "Use grounded columns.",
+            "pipeline_previous_sql": first_sql,
+        },
+        state=state,
+    )[0]
+
+    second_call_messages = llm.messages_seen[1]
+    assert second.sql == repaired_sql
+    assert any(message.get("role") == "assistant" and message.get("tool_calls") for message in second_call_messages)
+    assert any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == first.tool_call_id
+        and "schema_grounding" in message.get("content", "")
+        and "no such column: missing" in message.get("content", "")
+        for message in second_call_messages
+    )
+    assert any(
+        message.get("role") == "user" and "Table labels" in message.get("content", "")
+        for message in second_call_messages
+    )
+
+
+def test_react_candidate_generation_keeps_empty_tool_draft_for_validation_feedback():
+    agent = ReActSqlAgent(
+        llm_client=ScriptedToolCallingLLM([{"sql": "", "content": "Try."}])
+    )
+
+    drafts = agent.GenerateCandidates(
+        "List items",
+        "Database: demo\nTable items(id integer)",
+    )
+
+    assert len(drafts) == 1
+    assert drafts[0].sql == ""
+    assert drafts[0].tool_call_id == "call_1"

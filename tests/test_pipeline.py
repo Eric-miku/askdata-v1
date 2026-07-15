@@ -40,6 +40,11 @@ class RecordingAnalyzer:
         return f"answer from {sql}"
 
 
+class FailingAnalyzer:
+    def Analyze(self, question, sql, columns, rows):
+        raise AssertionError("analyzer must not run without a trustworthy candidate")
+
+
 class MappingRunner:
     def __init__(self, results):
         self.results = results
@@ -98,7 +103,7 @@ def test_pipeline_never_executes_more_than_six_candidates():
         question="How many items?", retrieval=retrieval()
     )
 
-    assert runner.call_count == 6
+    assert runner.call_count <= 6
     assert result["kind"] == "error"
 
 
@@ -116,7 +121,13 @@ def test_pipeline_stops_repeated_identical_sql_early():
 
 
 def test_pipeline_expands_retrieval_only_after_schema_grounding_failure():
-    generated = [f"SELECT missing_{index} FROM items" for index in range(1, 7)]
+    generated = [
+        "SELECT missing_1 FROM items",
+        "SELECT id FROM items WHERE id = 2",
+        "SELECT missing_3 FROM items",
+        "SELECT missing_4 FROM items",
+        "SELECT missing_5 FROM items",
+    ]
     react = FakeReact([[SqlCandidateDraft(sql=sql)] for sql in generated])
     expanded = []
 
@@ -176,11 +187,12 @@ def test_pipeline_classifies_answer_shape_and_empty_result_failures():
         empty: {"success": True, "columns": ["count"], "rows": []},
     })
 
-    result = StagedSqlPipeline(react=react, runner=runner).Run(
+    result = StagedSqlPipeline(react=react, analyzer=FailingAnalyzer(), runner=runner).Run(
         question="How many items?", retrieval=retrieval()
     )
 
-    assert result["kind"] == "answer"
+    assert result["kind"] == "error"
+    assert result["error"] == "no_trustworthy_candidate"
     assert {candidate["failure_class"] for candidate in result["ledger"]} == {
         "answer_shape", "empty_or_suspicious"
     }
@@ -210,3 +222,73 @@ def test_pipeline_gives_the_next_generation_targeted_previous_candidate_feedback
     assert result["sql"] == repaired
     assert react.contexts[1]["pipeline_previous_sql"] == first
     assert react.contexts[1]["pipeline_feedback"] == "Correct SQL syntax or safety validation."
+
+
+def test_pipeline_executes_at_most_one_candidate_per_recovery_stage():
+    first = "SELECT id FROM items"
+    ignored = "SELECT name FROM items"
+    runner = MappingRunner({
+        first: {"success": True, "columns": ["id"], "rows": [{"id": 1}]},
+        ignored: {"success": True, "columns": ["name"], "rows": [{"name": "a"}]},
+    })
+    react = FakeReact([[
+        SqlCandidateDraft(sql=first),
+        SqlCandidateDraft(sql=ignored),
+    ]] + [[]] * 5)
+
+    StagedSqlPipeline(react=react, analyzer=FailingAnalyzer(), runner=runner).Run(
+        question="How many items?", retrieval=retrieval()
+    )
+
+    assert runner.sql_seen == [first]
+
+
+def test_pipeline_stops_after_same_failure_class_repeats_without_progress():
+    runner = AlwaysFailingRunner()
+    events = []
+    react = FakeReact([
+        [SqlCandidateDraft(sql="SELECT id FROM items WHERE id = 1")],
+        [SqlCandidateDraft(sql="SELECT id FROM items WHERE id = 2")],
+        [SqlCandidateDraft(sql="SELECT id FROM items WHERE id = 3")],
+    ])
+
+    result = StagedSqlPipeline(react=react, runner=runner).Run(
+        question="List name",
+        retrieval=retrieval(IntentContract(shape="listing", output_attributes=["name"])),
+        emit=events.append,
+    )
+
+    assert runner.call_count == 2
+    assert result["kind"] == "error"
+    assert result["failure_class"] == "repeated_no_progress"
+    assert any(event.get("failure_class") == "repeated_no_progress" for event in events)
+
+
+def test_pipeline_runs_alternate_plan_only_after_empty_or_suspicious_result():
+    empty_sql = "SELECT COUNT(*) AS count FROM items WHERE id < 0"
+    wrong_shape_sql = "SELECT id FROM items"
+    second_empty_sql = "SELECT COUNT(id) AS count FROM items WHERE id < -1"
+    alternate_sql = "SELECT COUNT(*) AS count FROM items"
+    react = FakeReact([
+        [SqlCandidateDraft(sql=empty_sql)],
+        [SqlCandidateDraft(sql=wrong_shape_sql)],
+        [SqlCandidateDraft(sql=second_empty_sql)],
+        [SqlCandidateDraft(sql=alternate_sql)],
+    ])
+    runner = MappingRunner({
+        empty_sql: {"success": True, "columns": ["count"], "rows": []},
+        wrong_shape_sql: {"success": True, "columns": ["id"], "rows": [{"id": 1}]},
+        second_empty_sql: {"success": True, "columns": ["count"], "rows": []},
+        alternate_sql: {"success": True, "columns": ["count"], "rows": [{"count": 3}]},
+    })
+
+    result = StagedSqlPipeline(
+        react=react,
+        analyzer=RecordingAnalyzer(),
+        runner=runner,
+    ).Run(question="How many items?", retrieval=retrieval())
+
+    assert result["sql"] == alternate_sql
+    assert [context["pipeline_stage"] for context in react.contexts] == [
+        "initial", "targeted_repair_1", "targeted_repair_2", "alternate_plan"
+    ]

@@ -58,6 +58,8 @@ class GroundingFailureReact:
         from askdata.agent.react_sql_agent import SqlCandidateDraft
 
         self.index += 1
+        if self.index == 2:
+            return [SqlCandidateDraft(sql="SELECT id FROM items")]
         return [SqlCandidateDraft(sql=f"SELECT missing_{self.index} FROM items")]
 
 
