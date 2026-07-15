@@ -166,29 +166,31 @@ class QueryService:
                 database_id=request.database_id,
                 session_context=context,
             )
-            normalized = _JsonSafe(result)
-            if not isinstance(normalized, Mapping):
+            if not isinstance(result, Mapping):
                 response = self._QueryFailed(session_id, turn_id)
-            elif "error" in normalized and normalized["error"] is not None:
+            elif "error" in result and result["error"] is not None:
                 response = self._QueryFailed(session_id, turn_id)
             else:
-                sql = normalized.get("sql")
+                sql = result.get("sql")
                 if not isinstance(sql, str) or not sql.strip():
                     response = self._NoTrustworthySql(session_id, turn_id)
                 else:
-                    rows = normalized.get("rows")
-                    bounded_rows = rows[:_ROW_PREVIEW_LIMIT] if isinstance(rows, list) else []
-                    response = AnswerResponse(
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        answer=str(normalized.get("answer", "")),
-                        sql=sql.strip(),
-                        columns=normalized.get("columns") or [],
-                        rows=bounded_rows,
-                        chart=normalized.get("chart"),
-                        confidence="medium",
-                        trace=self._NormalizeTrace(normalized.get("trace")),
-                    )
+                    rows = result.get("rows")
+                    if rows is not None and not isinstance(rows, list):
+                        response = self._QueryFailed(session_id, turn_id)
+                    else:
+                        bounded_rows = _JsonSafe((rows or [])[:_ROW_PREVIEW_LIMIT])
+                        response = AnswerResponse(
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            answer=str(_JsonSafe(result.get("answer", ""))),
+                            sql=sql.strip(),
+                            columns=_JsonSafe(result.get("columns") or []),
+                            rows=bounded_rows,
+                            chart=_JsonSafe(result.get("chart")),
+                            confidence="medium",
+                            trace=self._NormalizeTrace(result.get("trace")),
+                        )
         except Exception:
             logger.exception("Query execution failed")
             response = self._QueryFailed(session_id, turn_id)
@@ -201,7 +203,7 @@ class QueryService:
 
     @staticmethod
     def _NormalizeTrace(value: Any) -> list[TraceEvent]:
-        items = value if isinstance(value, list) else [value]
+        items = value[:_TRACE_EVENT_LIMIT] if isinstance(value, list) else []
         curated = []
         for item in items:
             if not isinstance(item, Mapping):

@@ -264,6 +264,63 @@ async def test_rows_and_operational_trace_are_bounded_with_storage_parity(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_unsupported_content_beyond_preview_caps_is_not_inspected(tmp_path):
+    unsupported = object()
+    rows = [{"id": index} for index in range(100)] + [unsupported]
+    trace = [
+        {"step": "ExecuteSql", "status": "success", "message": "ignored"}
+        for _ in range(50)
+    ] + [unsupported]
+    store = await initialized_store(tmp_path)
+    graph = RecordingGraph(successful_result(rows=rows, trace=trace))
+    service = QueryService(store, graph_factory=lambda: graph)
+
+    response = await service.Run(QueryRequest(database_id="demo", question="bounded"))
+
+    assert isinstance(response, AnswerResponse)
+    assert response.rows == rows[:100]
+    assert len(response.trace) == 50
+    turn = (await store.GetSession(response.session_id))["turns"][0]
+    assert turn["result_preview"] == rows[:100]
+    assert turn["trace"] == [event.model_dump(mode="json") for event in response.trace]
+    await store.Close()
+
+
+@pytest.mark.asyncio
+async def test_supplied_non_list_rows_returns_safe_query_failed(tmp_path):
+    store = await initialized_store(tmp_path)
+    graph = RecordingGraph(successful_result(rows={"id": 1}))
+    service = QueryService(store, graph_factory=lambda: graph)
+
+    response = await service.Run(QueryRequest(database_id="demo", question="malformed"))
+
+    assert isinstance(response, ErrorResponse)
+    assert response.code == "query_failed"
+    turn = (await store.GetSession(response.session_id))["turns"][0]
+    assert turn["response_kind"] == "error"
+    assert turn["result_preview"] == []
+    await store.Close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_rows", [False, True])
+async def test_missing_or_none_rows_is_an_empty_preview(tmp_path, include_rows):
+    result = successful_result(rows=None)
+    if not include_rows:
+        result.pop("rows")
+    store = await initialized_store(tmp_path)
+    graph = RecordingGraph(result)
+    service = QueryService(store, graph_factory=lambda: graph)
+
+    response = await service.Run(QueryRequest(database_id="demo", question="empty"))
+
+    assert isinstance(response, AnswerResponse)
+    assert response.rows == []
+    assert (await store.GetSession(response.session_id))["turns"][0]["result_preview"] == []
+    await store.Close()
+
+
+@pytest.mark.asyncio
 async def test_trace_exposes_only_curated_operational_events(tmp_path):
     secret = "operational-secret-7391"
     graph = RecordingGraph(
