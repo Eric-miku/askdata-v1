@@ -447,10 +447,11 @@ class SemanticRetriever:
             questions = []
         lexical = BirdSchemaIndex().Build(databases, questions=questions)
         self.index = lexical
+        milvus_uri = settings.ResolvedMilvusUri()
         if (
             settings.VECTOR_RETRIEVAL_ENABLED
             and settings.EMBEDDING_API_URL
-            and settings.MILVUS_URI
+            and milvus_uri
         ):
             from askdata.tools.embedding_client import EmbeddingClient
             from askdata.tools.hybrid_retriever import HybridRetriever, HybridSchemaIndex
@@ -458,7 +459,7 @@ class SemanticRetriever:
 
             key = (
                 settings.EMBEDDING_API_URL, settings.EMBEDDING_MODEL,
-                settings.EMBEDDING_DIMENSION, settings.MILVUS_URI,
+                settings.EMBEDDING_DIMENSION, milvus_uri,
                 settings.MILVUS_COLLECTION,
             )
             if key in _VECTOR_VALIDATION_FAILURES:
@@ -472,7 +473,7 @@ class SemanticRetriever:
                         dimension=settings.EMBEDDING_DIMENSION,
                     )
                     probe = embedding.Validate()
-                    vector = MilvusVectorStore(settings.MILVUS_URI, settings.MILVUS_COLLECTION)
+                    vector = MilvusVectorStore(milvus_uri, settings.MILVUS_COLLECTION)
                     vector.Search(GetValue(databases[0], "databaseId", "database_id"), [probe], 1)
                 except Exception:
                     _VECTOR_VALIDATION_FAILURES.add(key)

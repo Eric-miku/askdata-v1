@@ -13,6 +13,13 @@ from askdata.agent.graph import AgentGraph
 from askdata.agent.intent import IntentContract
 
 
+@pytest.fixture(autouse=True)
+def disable_vector_retrieval_for_agent_graph_tests(monkeypatch):
+    from askdata.core.config import settings
+
+    monkeypatch.setattr(settings, "VECTOR_RETRIEVAL_ENABLED", False)
+
+
 class FakeLLM:
     def Complete(self, prompt):
         assert "COLUMN SELECTION" in prompt

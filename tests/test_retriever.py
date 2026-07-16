@@ -390,3 +390,51 @@ def test_disabled_vector_configuration_makes_no_validation_call(tmp_path, monkey
     prompt = SemanticRetriever(processed_dir=processed).Build().Retrieve("demo", "items")
 
     assert "Table items" in prompt
+
+
+def test_legacy_milvus_host_configuration_enables_vector_validation(tmp_path, monkeypatch):
+    processed = tmp_path / "processed"
+    processed.mkdir()
+    database_path = tmp_path / "demo.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE items(id INTEGER)")
+    (processed / "databases.json").write_text(json.dumps([{
+        "databaseId": "demo",
+        "databasePath": str(database_path),
+        "tables": [{"tableName": "items", "columns": []}],
+        "foreignKeys": [],
+    }]), encoding="utf-8")
+
+    from askdata.core.config import settings
+    from askdata.tools import embedding_client, vector_store
+    from askdata.tools.retriever import _ResetVectorValidationFailuresForTests
+
+    calls = {"embed": 0, "store_uri": None}
+
+    class Embedding:
+        def __init__(self, **kwargs):
+            pass
+
+        def Validate(self):
+            calls["embed"] += 1
+            return [0.1, 0.2]
+
+    class Store:
+        def __init__(self, uri, collection_name):
+            calls["store_uri"] = uri
+
+        def Search(self, database_id, vectors, top_k):
+            return []
+
+    monkeypatch.setattr(settings, "VECTOR_RETRIEVAL_ENABLED", True)
+    monkeypatch.setattr(settings, "EMBEDDING_API_URL", "http://embedding.test/v1")
+    monkeypatch.setattr(settings, "MILVUS_URI", "")
+    monkeypatch.setattr(settings, "MILVUS_HOST", "7.59.11.153", raising=False)
+    monkeypatch.setattr(settings, "MILVUS_PORT", 19530, raising=False)
+    monkeypatch.setattr(embedding_client, "EmbeddingClient", Embedding)
+    monkeypatch.setattr(vector_store, "MilvusVectorStore", Store)
+    _ResetVectorValidationFailuresForTests()
+
+    SemanticRetriever(processed_dir=processed).Build()
+
+    assert calls == {"embed": 1, "store_uri": "http://7.59.11.153:19530"}

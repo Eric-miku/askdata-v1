@@ -117,6 +117,28 @@ def test_index_schema_prints_validated_index_metadata(tmp_path, monkeypatch):
     assert "example chunks: 1" in result.output
 
 
+def test_build_vector_store_uses_legacy_milvus_host_when_uri_is_absent(monkeypatch):
+    captured = {}
+
+    class Store:
+        def __init__(self, uri, collection_name):
+            captured["uri"] = uri
+            captured["collection_name"] = collection_name
+
+    monkeypatch.setattr(cli.settings, "MILVUS_URI", "")
+    monkeypatch.setattr(cli.settings, "MILVUS_HOST", "7.59.11.153", raising=False)
+    monkeypatch.setattr(cli.settings, "MILVUS_PORT", 19530, raising=False)
+    monkeypatch.setattr(cli.settings, "MILVUS_COLLECTION", "test_chunks")
+    monkeypatch.setattr(cli, "MilvusVectorStore", Store)
+
+    cli._BuildVectorStore()
+
+    assert captured == {
+        "uri": "http://7.59.11.153:19530",
+        "collection_name": "test_chunks",
+    }
+
+
 def test_eval_bird_help_is_available():
     result = runner.invoke(cli.app, ["eval-bird", "--help"])
 

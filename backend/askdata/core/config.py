@@ -13,9 +13,20 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
     EMBEDDING_DIMENSION: int = 1024
     MILVUS_URI: str = ""
+    MILVUS_HOST: str = ""
+    MILVUS_PORT: int = 19530
     MILVUS_COLLECTION: str = "askdata_schema_chunks"
     VECTOR_RETRIEVAL_ENABLED: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    def ResolvedMilvusUri(self) -> str:
+        """Return the explicit Milvus URI or derive it from legacy host/port settings."""
+
+        if self.MILVUS_URI:
+            return self.MILVUS_URI
+        if self.MILVUS_HOST:
+            return f"http://{self.MILVUS_HOST}:{self.MILVUS_PORT}"
+        return ""
 
 settings = Settings()

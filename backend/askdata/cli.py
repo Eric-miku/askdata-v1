@@ -45,9 +45,10 @@ def _BuildEmbeddingClient() -> EmbeddingClient:
 
 
 def _BuildVectorStore() -> MilvusVectorStore:
-    if not settings.MILVUS_URI:
-        raise typer.BadParameter("MILVUS_URI is required to build the schema index")
-    return MilvusVectorStore(settings.MILVUS_URI, settings.MILVUS_COLLECTION)
+    milvus_uri = settings.ResolvedMilvusUri()
+    if not milvus_uri:
+        raise typer.BadParameter("MILVUS_URI or MILVUS_HOST is required to build the schema index")
+    return MilvusVectorStore(milvus_uri, settings.MILVUS_COLLECTION)
 
 
 class ChatSession:
