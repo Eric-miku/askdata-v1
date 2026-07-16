@@ -1,0 +1,38 @@
+[
+  {
+    "id": "toxicology_tr060_elements_label",
+    "database_id": "toxicology",
+    "question": "What are the elements of the toxicology and label of molecule TR060?",
+    "expected_columns": ["element", "label"],
+    "min_rows": 1,
+    "expected_error": null,
+    "must_not_sql": ["SELECT * FROM molecule"]
+  },
+  {
+    "id": "debit_card_consumption_decrease_rate",
+    "database_id": "debit_card_specializing",
+    "question": "For the customer who paid 634.8 in 2012/8/25, what was the consumption decrease rate from Year 2012 to 2013?",
+    "expected_columns": ["decrease_rate"],
+    "min_rows": 1,
+    "expected_error": null,
+    "must_not_sql": ["consumption_2012, consumption_2013"]
+  },
+  {
+    "id": "california_monterey_high_school_frpm_address",
+    "database_id": "california_schools",
+    "question": "State the names and full communication address of high schools in Monterey which has more than 800 free or reduced price meals for ages 15-17",
+    "expected_columns": ["School", "Street", "City", "State", "Zip"],
+    "min_rows": 1,
+    "expected_error": null,
+    "must_not_sql": ["SELECT * FROM schools"]
+  },
+  {
+    "id": "california_total_enrollment_over_500",
+    "database_id": "california_schools",
+    "question": "List the codes of the schools with a total enrollment of over 500",
+    "expected_columns": ["CDSCode"],
+    "min_rows": 1,
+    "expected_error": null,
+    "must_not_sql": ["unanswerable_from_schema"]
+  }
+]
