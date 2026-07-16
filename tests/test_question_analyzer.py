@@ -35,3 +35,26 @@ def test_analyzer_extracts_literals_and_formula_hints():
     ) in analysis.formula_hints
     assert {item.raw for item in analysis.filters} >= {"634.8", "2012/8/25"}
     assert any(item.normalized == "2012-08-25" for item in analysis.filters)
+
+
+def test_analyzer_keeps_invalid_slash_date_without_crashing():
+    analysis = QuestionAnalyzer().Analyze(
+        "Which orders were placed on 2012/99/25?",
+        {"orders": ["order_id", "order_date"]},
+    )
+
+    assert any(
+        item.raw == "2012/99/25" and item.kind == "date" and item.normalized is None
+        for item in analysis.filters
+    )
+
+
+def test_analyzer_ignores_question_words_but_keeps_useful_text_literals():
+    analysis = QuestionAnalyzer().Analyze(
+        "What/List/Which customers visited Monterey?",
+        {"customers": ["customer_name", "city"]},
+    )
+
+    text_filters = {item.raw for item in analysis.filters if item.kind == "text"}
+
+    assert text_filters == {"Monterey"}

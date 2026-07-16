@@ -11,6 +11,32 @@ from pydantic import BaseModel, Field
 from askdata.agent.intent import IntentContract
 
 
+_TEXT_FILTER_STOPWORDS = {
+    "all",
+    "average",
+    "bottom",
+    "count",
+    "for",
+    "from",
+    "highest",
+    "how",
+    "least",
+    "list",
+    "lowest",
+    "mean",
+    "most",
+    "number",
+    "show",
+    "top",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "year",
+}
+
+
 class QuestionFilter(BaseModel):
     raw: str
     kind: Literal["identifier", "number", "date", "text"]
@@ -84,7 +110,7 @@ class QuestionAnalyzer:
             self._AddFilter(filters, seen, QuestionFilter(raw=raw, kind="identifier", normalized=raw))
 
         for raw in re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", question):
-            if raw.casefold() in {"for", "year"}:
+            if self._IsTextFilterStopword(raw):
                 continue
             self._AddFilter(filters, seen, QuestionFilter(raw=raw, kind="text", normalized=raw))
 
@@ -109,9 +135,17 @@ class QuestionAnalyzer:
         return hints
 
     @staticmethod
-    def _NormalizeDate(raw: str) -> str:
+    def _NormalizeDate(raw: str) -> str | None:
         year, month, day = [int(part) for part in raw.split("/")]
-        return date(year, month, day).isoformat()
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _IsTextFilterStopword(raw: str) -> bool:
+        words = [word.casefold() for word in re.findall(r"[A-Za-z]+", raw)]
+        return bool(words) and all(word in _TEXT_FILTER_STOPWORDS for word in words)
 
     @staticmethod
     def _NormalizeConcept(value: str) -> str:
