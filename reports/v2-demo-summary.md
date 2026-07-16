@@ -5,6 +5,10 @@
 - Environment: local macOS worktree, Python 3.13 virtual environment, deterministic local fixtures unless stated otherwise
 - Secret handling: configuration values were checked only for presence; no keys, remote error bodies, or database rows are recorded here
 
+## V2.2 Stable Scope
+
+V2.2 adds deterministic question analysis, bounded value linking, and a manual regression harness for known Text2SQL hard cases. It keeps the current staged ReAct pipeline and does not implement CHASE-style multi-candidate selection yet.
+
 ## Release gate summary
 
 | Gate | Status | Evidence |
