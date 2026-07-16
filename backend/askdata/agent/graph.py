@@ -5,11 +5,13 @@ from collections.abc import Mapping
 
 from askdata.agent.prompts import BuildRepairPrompt, BuildSqlPrompt
 from askdata.agent.pipeline import StagedSqlPipeline
+from askdata.agent.question_analyzer import QuestionAnalyzer
 from askdata.agent.react_sql_agent import ReActSqlAgent
 from askdata.core.llm import LLMClient
 from askdata.tools.analyzer import ResultAnalyzer
 from askdata.tools.retriever import SemanticRetriever
 from askdata.tools.skill_loader import SkillLoader
+from askdata.tools.value_linker import ValueLinker
 
 
 _VECTOR_FALLBACK_MESSAGE = "Semantic retrieval unavailable; lexical schema matched."
@@ -27,6 +29,8 @@ class AgentGraph:
         react_agent=None,
         skill_loader=None,
         pipeline=None,
+        question_analyzer=None,
+        value_linker=None,
         max_repairs: int = 1,
     ):
         self.processed_dir = processed_dir
@@ -36,12 +40,24 @@ class AgentGraph:
         self.react_agent = react_agent
         self.skill_loader = skill_loader or SkillLoader()
         self.pipeline = pipeline
+        self.question_analyzer = question_analyzer or QuestionAnalyzer()
+        self.value_linker = value_linker or ValueLinker()
         self.max_repairs = max_repairs
 
     def Run(self, question: str, database_id: str, session_context: dict | None = None, emit=None) -> dict:
         trace = []
         retriever = self.retriever or SemanticRetriever(processed_dir=self.processed_dir).Build()
         context = retriever.index.Retrieve(database_id, question)
+        analysis = self.question_analyzer.Analyze(
+            question,
+            context.get("schema") or {},
+            str(context.get("evidence") or ""),
+        )
+        value_links = self.value_linker.Link(question, context, analysis)
+        context = dict(context)
+        context["analysis"] = analysis
+        context["intent"] = analysis.intent
+        context["value_links"] = value_links
         schema_prompt = context["schema_prompt"]
         retrieval_trace = context.get("retrieval_trace")
         has_retrieval_warning = isinstance(retrieval_trace, list) and any(
@@ -72,7 +88,11 @@ class AgentGraph:
             result = pipeline.Run(
                 question=question,
                 retrieval=context,
-                session_context=session_context,
+                session_context=self._PipelineSessionContext(
+                    session_context,
+                    analysis,
+                    value_links,
+                ),
                 emit=emit,
             )
             result["trace"] = trace + result.get("trace", [])
@@ -139,6 +159,17 @@ class AgentGraph:
     def _ExecuteSql(self, sql: str, database_path: str) -> dict:
         from askdata.db.query_runner import Execute as RunQuery
         return RunQuery(sql, database_path)
+
+    def _PipelineSessionContext(
+        self,
+        session_context: dict | None,
+        analysis,
+        value_links,
+    ) -> dict:
+        pipeline_session_context = dict(session_context or {})
+        pipeline_session_context["analysis"] = analysis
+        pipeline_session_context["value_links"] = value_links
+        return pipeline_session_context
 
     def _ExpandRetrieval(self, retriever, database_id: str, question: str, current: dict) -> dict:
         expand = getattr(retriever.index, "Expand", None)

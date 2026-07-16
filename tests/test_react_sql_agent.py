@@ -104,6 +104,35 @@ def test_react_sql_agent_prompt_includes_bird_specific_intern_agent_rules():
     assert "do not concatenate address fields" in system_prompt
 
 
+def test_build_messages_includes_question_analysis_and_value_links():
+    agent = ReActSqlAgent(llm_client=ScriptedToolCallingLLM([{"content": "done"}]))
+
+    messages = agent._BuildMessages(
+        question="What are the elements and label of molecule TR060?",
+        schema_prompt="Database: demo\nTable molecule(molecule_id text, element text, label text)",
+        session_context={
+            "analysis": {
+                "intent": {"shape": "listing"},
+                "requested_outputs": ["element", "label"],
+                "formula_hints": [],
+            },
+            "value_links": [
+                {
+                    "value": "TR060",
+                    "table": "molecule",
+                    "column": "molecule_id",
+                    "normalized_value": "TR060",
+                }
+            ],
+        },
+    )
+
+    user_prompt = messages[1]["content"]
+    assert "Question Analysis:" in user_prompt
+    assert "requested outputs: element, label" in user_prompt
+    assert "TR060 -> molecule.molecule_id = 'TR060'" in user_prompt
+
+
 def test_react_sql_agent_keeps_count_sql_when_later_detail_query_is_exploratory(tmp_path):
     database_path = tmp_path / "demo.sqlite"
     connection = sqlite3.connect(database_path)

@@ -142,7 +142,14 @@ class StagedSqlPipeline:
                     "error": None,
                 }
             question = ambiguity.resolved_question or question
-        intent = current_retrieval.get("intent") or self._InferIntent(question, schema)
+        analysis = current_retrieval.get("analysis")
+        analysis_intent = None
+        if analysis is not None:
+            if hasattr(analysis, "intent"):
+                analysis_intent = analysis.intent
+            elif isinstance(analysis, Mapping):
+                analysis_intent = analysis.get("intent")
+        intent = current_retrieval.get("intent") or analysis_intent or self._InferIntent(question, schema)
         if not isinstance(intent, IntentContract):
             intent = IntentContract.model_validate(intent)
         database_path = str(current_retrieval.get("database_path") or "")

@@ -149,6 +149,40 @@ def test_pipeline_intent_infers_singular_schema_column_from_plural_question():
     assert intent.output_attributes == ["element", "label"]
 
 
+def test_pipeline_prefers_question_analysis_intent_over_fallback_inference():
+    sql = "SELECT element, label FROM molecule"
+    analysis = {
+        "intent": IntentContract(shape="listing", output_attributes=["element", "label"]),
+        "requested_outputs": ["element", "label"],
+        "filters": [],
+        "formula_hints": [],
+        "notes": [],
+    }
+    context = {
+        "database_id": "demo",
+        "database_path": "/tmp/demo.sqlite",
+        "schema_prompt": "Database: demo\nTable molecule(element text, label text)",
+        "schema": {"molecule": ["element", "label"]},
+        "analysis": analysis,
+    }
+    runner = MappingRunner({
+        sql: {
+            "success": True,
+            "columns": ["element", "label"],
+            "rows": [{"element": "c", "label": "-"}],
+        },
+    })
+
+    result = StagedSqlPipeline(
+        react=FakeReact([[SqlCandidateDraft(sql=sql)]]),
+        analyzer=RecordingAnalyzer(),
+        runner=runner,
+    ).Run(question="how many molecule records include element and label?", retrieval=context)
+
+    assert result["kind"] == "answer"
+    assert result["sql"] == sql
+
+
 def test_pipeline_rejects_partial_molecule_label_answer_and_repairs_to_elements_join():
     partial_sql = "SELECT * FROM molecule WHERE molecule_id = 'TR060'"
     final_sql = (

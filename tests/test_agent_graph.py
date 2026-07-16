@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from askdata.agent.graph import AgentGraph
+from askdata.agent.intent import IntentContract
 
 
 class FakeLLM:
@@ -72,6 +73,52 @@ class TrackingRetriever:
     def Retrieve(self, database_id, question):
         self.calls += 1
         return dict(self.context)
+
+
+class FakeQuestionAnalyzer:
+    def __init__(self):
+        self.calls = []
+        self.analysis = SimpleAnalysis()
+
+    def Analyze(self, question, schema, evidence=""):
+        self.calls.append((question, schema, evidence))
+        return self.analysis
+
+
+class SimpleAnalysis:
+    def __init__(self):
+        self.intent = IntentContract(shape="listing", output_attributes=["name"])
+        self.requested_outputs = ["name"]
+        self.filters = []
+        self.formula_hints = []
+        self.notes = []
+
+
+class FakeValueLinker:
+    def __init__(self):
+        self.calls = []
+        self.links = [{"value": "A", "table": "items", "column": "name"}]
+
+    def Link(self, question, retrieval, analysis):
+        self.calls.append((question, retrieval, analysis))
+        return self.links
+
+
+class RecordingPipeline:
+    def __init__(self):
+        self.calls = []
+
+    def Run(self, question, retrieval, session_context=None, emit=None):
+        self.calls.append((question, retrieval, session_context))
+        return {
+            "kind": "answer",
+            "answer": "A",
+            "sql": "SELECT name FROM items",
+            "columns": ["name"],
+            "rows": [{"name": "A"}],
+            "trace": [],
+            "error": None,
+        }
 
 
 def write_processed_dataset(root, database_path):
@@ -233,6 +280,46 @@ def test_agent_graph_retrieves_again_at_grounding_expansion_stage(tmp_path):
     assert result["kind"] == "error"
     assert result["retrieval_expanded"] is True
     assert retriever.calls == 2
+
+
+def test_agent_graph_builds_analysis_and_value_links_for_pipeline():
+    retriever = TrackingRetriever({
+        "database_id": "demo",
+        "database_path": "/tmp/demo.sqlite",
+        "schema_prompt": "Database: demo\nTable items(name text)",
+        "schema": {"items": ["name"]},
+        "evidence": "name is the display label",
+    })
+    question_analyzer = FakeQuestionAnalyzer()
+    value_linker = FakeValueLinker()
+    pipeline = RecordingPipeline()
+
+    result = AgentGraph(
+        retriever=retriever,
+        react_agent=FakeReactAgent(),
+        pipeline=pipeline,
+        question_analyzer=question_analyzer,
+        value_linker=value_linker,
+    ).Run(
+        question="List item A",
+        database_id="demo",
+        session_context={"last_sql": "SELECT 1"},
+    )
+
+    analysis = question_analyzer.analysis
+    assert result["sql"] == "SELECT name FROM items"
+    assert question_analyzer.calls == [
+        ("List item A", {"items": ["name"]}, "name is the display label")
+    ]
+    assert value_linker.calls[0][0] == "List item A"
+    assert value_linker.calls[0][2] is analysis
+    _, pipeline_retrieval, pipeline_session = pipeline.calls[0]
+    assert pipeline_retrieval["analysis"] is analysis
+    assert pipeline_retrieval["intent"] == analysis.intent
+    assert pipeline_retrieval["value_links"] == value_linker.links
+    assert pipeline_session["last_sql"] == "SELECT 1"
+    assert pipeline_session["analysis"] is analysis
+    assert pipeline_session["value_links"] == value_linker.links
 
 
 @pytest.mark.asyncio

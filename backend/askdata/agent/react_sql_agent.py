@@ -2,6 +2,7 @@
 
 import json
 import re
+from collections.abc import Mapping
 
 from pydantic import BaseModel, Field
 
@@ -250,8 +251,64 @@ class ReActSqlAgent:
             if skills:
                 system_prompt += "\n\n" + skills
 
-        user_prompt = f"Question: {question}{previous}\n\nDatabase Schema:\n{schema_prompt}"
+        analysis_section = self._AnalysisSection(session_context)
+        user_prompt = f"Question: {question}{previous}{analysis_section}\n\nDatabase Schema:\n{schema_prompt}"
         return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+
+    def _AnalysisSection(self, session_context: dict | None) -> str:
+        if not session_context:
+            return ""
+
+        analysis = session_context.get("analysis")
+        value_links = session_context.get("value_links") or []
+        if not analysis and not value_links:
+            return ""
+
+        lines = ["", "", "Question Analysis:"]
+        intent = self._Get(analysis, "intent")
+        shape = self._Get(intent, "shape")
+        if shape:
+            lines.append(f"- answer shape: {shape}")
+
+        requested_outputs = self._List(self._Get(analysis, "requested_outputs"))
+        if requested_outputs:
+            lines.append(f"- requested outputs: {', '.join(map(str, requested_outputs))}")
+
+        formulas = self._List(self._Get(analysis, "formula_hints"))
+        if formulas:
+            lines.append("- formulas:")
+            for formula in formulas[:3]:
+                lines.append(f"  - {formula}")
+
+        if value_links:
+            lines.append("- value links:")
+            for link in list(value_links)[:8]:
+                value = self._Get(link, "value") or self._Get(link, "normalized_value")
+                normalized = self._Get(link, "normalized_value") or value
+                table = self._Get(link, "table")
+                column = self._Get(link, "column")
+                if value and table and column:
+                    lines.append(f"  - {value} -> {table}.{column} = '{normalized}'")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _Get(item, key: str):
+        if item is None:
+            return None
+        if isinstance(item, Mapping):
+            return item.get(key)
+        return getattr(item, key, None)
+
+    @staticmethod
+    def _List(value) -> list:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
 
     def _PipelineCorrection(self, session_context: dict) -> str:
         parts = [f"Recovery stage: {session_context.get('pipeline_stage', 'repair')}."]
