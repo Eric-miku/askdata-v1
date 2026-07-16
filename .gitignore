@@ -35,5 +35,6 @@ reports/
 /data/
 5-1-data-preprocessing-deliverable/data/
 build/
+dist/
 .superpowers/
 .worktrees/
