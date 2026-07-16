@@ -85,3 +85,28 @@ def test_manual_regression_runner_can_use_injected_query_function():
 
     assert calls == [("question", "db")]
     assert report["summary"] == {"total": 1, "passed": 1, "pass_rate": 1.0}
+
+
+def test_manual_regression_runner_accepts_single_pass_iterables():
+    cases = iter([
+        ManualRegressionCase(
+            id="demo",
+            database_id="db",
+            question="question",
+            expected_columns=["answer"],
+            min_rows=1,
+        )
+    ])
+
+    report = ManualRegressionRunner().Run(
+        cases,
+        lambda question, database_id: {
+            "error": None,
+            "sql": "SELECT answer FROM facts",
+            "columns": ["answer"],
+            "rows": [{"answer": 1}],
+        },
+    )
+
+    assert report["summary"]["total"] == 1
+    assert report["cases"][0]["passed"] is True

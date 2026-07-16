@@ -78,8 +78,9 @@ class ManualRegressionRunner:
         cases: Iterable[ManualRegressionCase],
         query_fn: Callable[[str, str], Mapping[str, Any]],
     ) -> dict[str, Any]:
+        case_list = list(cases)
         results = {
             case.id: query_fn(case.question, case.database_id)
-            for case in cases
+            for case in case_list
         }
-        return self.Compare(cases, results)
+        return self.Compare(case_list, results)
