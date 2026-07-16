@@ -5,7 +5,7 @@ from collections.abc import Mapping
 
 from askdata.agent.prompts import BuildRepairPrompt, BuildSqlPrompt
 from askdata.agent.pipeline import StagedSqlPipeline
-from askdata.agent.question_analyzer import QuestionAnalyzer
+from askdata.agent.question_analyzer import QuestionAnalysis, QuestionAnalyzer
 from askdata.agent.react_sql_agent import ReActSqlAgent
 from askdata.core.llm import LLMClient
 from askdata.tools.analyzer import ResultAnalyzer
@@ -48,16 +48,22 @@ class AgentGraph:
         trace = []
         retriever = self.retriever or SemanticRetriever(processed_dir=self.processed_dir).Build()
         context = retriever.index.Retrieve(database_id, question)
-        analysis = self.question_analyzer.Analyze(
+        raw_analysis = self.question_analyzer.Analyze(
             question,
             context.get("schema") or {},
             str(context.get("evidence") or ""),
         )
+        analysis = self._NormalizeQuestionAnalysis(raw_analysis)
         value_links = self.value_linker.Link(question, context, analysis)
         context = dict(context)
         context["analysis"] = analysis
         context["intent"] = analysis.intent
         context["value_links"] = value_links
+        pipeline_session_context = self._PipelineSessionContext(
+            session_context,
+            analysis,
+            value_links,
+        )
         schema_prompt = context["schema_prompt"]
         retrieval_trace = context.get("retrieval_trace")
         has_retrieval_warning = isinstance(retrieval_trace, list) and any(
@@ -88,11 +94,7 @@ class AgentGraph:
             result = pipeline.Run(
                 question=question,
                 retrieval=context,
-                session_context=self._PipelineSessionContext(
-                    session_context,
-                    analysis,
-                    value_links,
-                ),
+                session_context=pipeline_session_context,
                 emit=emit,
             )
             result["trace"] = trace + result.get("trace", [])
@@ -100,7 +102,7 @@ class AgentGraph:
 
         skills_section = self.skill_loader.BuildPromptSection()
         sql = self._CleanSql(
-            self.llm_client.Complete(BuildSqlPrompt(question, schema_prompt, session_context, skills_section))
+            self.llm_client.Complete(BuildSqlPrompt(question, schema_prompt, pipeline_session_context, skills_section))
         )
         trace.append(self._TraceStep("GenerateSql", "success", sql))
 
@@ -170,6 +172,19 @@ class AgentGraph:
         pipeline_session_context["analysis"] = analysis
         pipeline_session_context["value_links"] = value_links
         return pipeline_session_context
+
+    def _NormalizeQuestionAnalysis(self, raw_analysis) -> QuestionAnalysis:
+        if isinstance(raw_analysis, QuestionAnalysis):
+            return raw_analysis
+        if isinstance(raw_analysis, Mapping):
+            return QuestionAnalysis.model_validate(raw_analysis)
+        return QuestionAnalysis.model_validate({
+            "intent": getattr(raw_analysis, "intent"),
+            "requested_outputs": getattr(raw_analysis, "requested_outputs", []),
+            "filters": getattr(raw_analysis, "filters", []),
+            "formula_hints": getattr(raw_analysis, "formula_hints", []),
+            "notes": getattr(raw_analysis, "notes", []),
+        })
 
     def _ExpandRetrieval(self, retriever, database_id: str, question: str, current: dict) -> dict:
         expand = getattr(retriever.index, "Expand", None)

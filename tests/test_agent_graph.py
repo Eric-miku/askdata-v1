@@ -20,6 +20,16 @@ class FakeLLM:
         return "SELECT COUNT(id) AS count FROM items"
 
 
+class RecordingLLM:
+    def __init__(self, sql="SELECT name FROM items"):
+        self.sql = sql
+        self.prompt = ""
+
+    def Complete(self, prompt):
+        self.prompt = prompt
+        return self.sql
+
+
 class FakeReactAgent:
     def __init__(self):
         self.called = False
@@ -49,6 +59,11 @@ class FakeReactAgent:
 class FakeAnalyzer:
     def Analyze(self, question, sql, columns, rows):
         return f"共有 {rows[0]['count']} 条。"
+
+
+class TextAnalyzer:
+    def Analyze(self, question, sql, columns, rows):
+        return "answered"
 
 
 class GroundingFailureReact:
@@ -261,6 +276,35 @@ def test_agent_graph_keeps_one_shot_fallback_for_llm_without_chat(tmp_path):
     assert result["rows"] == [{"count": 3}]
 
 
+def test_agent_graph_includes_analysis_and_value_links_in_one_shot_fallback_prompt(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE items(name TEXT)")
+        connection.execute("INSERT INTO items(name) VALUES ('A')")
+
+    retriever = TrackingRetriever({
+        "database_id": "demo",
+        "database_path": str(database_path),
+        "schema_prompt": "Database: demo\nTable items(name text)",
+        "schema": {"items": ["name"]},
+        "evidence": "name is the display label",
+    })
+    llm = RecordingLLM()
+
+    result = AgentGraph(
+        retriever=retriever,
+        llm_client=llm,
+        analyzer=TextAnalyzer(),
+        question_analyzer=FakeQuestionAnalyzer(),
+        value_linker=FakeValueLinker(),
+    ).Run(question="List item A", database_id="demo")
+
+    assert result["sql"] == "SELECT name FROM items"
+    assert "<question_analysis_context>" in llm.prompt
+    assert '"requested_outputs": [' in llm.prompt
+    assert "A -> items.name = 'A'" in llm.prompt
+
+
 def test_agent_graph_retrieves_again_at_grounding_expansion_stage(tmp_path):
     database_path = tmp_path / "demo.sqlite"
     with sqlite3.connect(database_path) as connection:
@@ -306,19 +350,20 @@ def test_agent_graph_builds_analysis_and_value_links_for_pipeline():
         session_context={"last_sql": "SELECT 1"},
     )
 
-    analysis = question_analyzer.analysis
     assert result["sql"] == "SELECT name FROM items"
     assert question_analyzer.calls == [
         ("List item A", {"items": ["name"]}, "name is the display label")
     ]
     assert value_linker.calls[0][0] == "List item A"
-    assert value_linker.calls[0][2] is analysis
+    analysis = value_linker.calls[0][2]
+    assert analysis.intent.shape == "listing"
+    assert analysis.requested_outputs == ["name"]
     _, pipeline_retrieval, pipeline_session = pipeline.calls[0]
-    assert pipeline_retrieval["analysis"] is analysis
+    assert pipeline_retrieval["analysis"] == analysis
     assert pipeline_retrieval["intent"] == analysis.intent
     assert pipeline_retrieval["value_links"] == value_linker.links
     assert pipeline_session["last_sql"] == "SELECT 1"
-    assert pipeline_session["analysis"] is analysis
+    assert pipeline_session["analysis"] == analysis
     assert pipeline_session["value_links"] == value_linker.links
 
 

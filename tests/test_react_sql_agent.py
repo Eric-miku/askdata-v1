@@ -128,8 +128,10 @@ def test_build_messages_includes_question_analysis_and_value_links():
     )
 
     user_prompt = messages[1]["content"]
-    assert "Question Analysis:" in user_prompt
-    assert "requested outputs: element, label" in user_prompt
+    assert "<question_analysis_context>" in user_prompt
+    assert '"requested_outputs": [' in user_prompt
+    assert '"element"' in user_prompt
+    assert '"label"' in user_prompt
     assert "TR060 -> molecule.molecule_id = 'TR060'" in user_prompt
 
 
