@@ -74,13 +74,53 @@ def test_one_schema_supported_interpretation_proceeds():
     assert result.state == "clear"
 
 
-def test_missing_student_entity_is_unanswerable_not_ambiguous():
+def test_empty_interpretation_fails_open_instead_of_blocking_for_missing_terms():
     result = AmbiguityGate(FakeInterpreter([])).Check(
         "list student names", {"schools": ["School", "Enrollment"]}
     )
 
-    assert result.state == "unanswerable"
-    assert result.missing_concepts
+    assert result.state == "clear"
+    assert result.resolved_question == "list student names"
+
+
+def test_empty_interpretation_does_not_block_evidence_grounded_total_enrollment():
+    result = AmbiguityGate(FakeInterpreter([])).Check(
+        "Please list the codes of the schools with a total enrollment of over 500.",
+        {
+            "schools": ["CDSCode", "School"],
+            "frpm": ["CDSCode", "Enrollment (K-12)", "Enrollment (Ages 5-17)"],
+        },
+        evidence=(
+            "Total enrollment can be represented by "
+            "`Enrollment (K-12)` + `Enrollment (Ages 5-17)`"
+        ),
+    )
+
+    assert result.state == "clear"
+    assert result.resolved_question
+
+
+def test_empty_interpretation_does_not_block_frpm_meal_count_wording():
+    result = AmbiguityGate(FakeInterpreter([])).Check(
+        (
+            "State the names and full communication address of high schools in "
+            "Monterey which has more than 800 free or reduced price meals for "
+            "ages 15-17?"
+        ),
+        {
+            "schools": ["School", "Street", "City", "State", "Zip", "County"],
+            "frpm": [
+                "School Name",
+                "School Type",
+                "Free Meal Count (Ages 5-17)",
+                "FRPM Count (Ages 5-17)",
+            ],
+        },
+        evidence="Full communication address should include Street, City, State and zip code if any.",
+    )
+
+    assert result.state == "clear"
+    assert result.resolved_question
 
 
 def test_hallucinated_interpretation_is_not_counted_as_supported():
@@ -168,7 +208,7 @@ def test_inferred_coded_literal_without_business_evidence_is_rejected(condition)
         {"schools": ["School", "EdOpsCode"]},
     )
 
-    assert result.state == "unanswerable"
+    assert result.state == "clear"
 
 
 def test_equivalent_supported_interpretations_do_not_trigger_clarification():

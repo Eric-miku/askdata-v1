@@ -316,6 +316,7 @@ class BirdSchemaIndex:
         return {
             "database_id": database_id,
             "database_path": GetValue(database, "databasePath", "database_path", default=""),
+            "evidence": evidence,
             "schema": self.StructuredSchema(database_id),
             "matched_tables": matched_tables,
             "matched_columns": matched_columns,
@@ -324,13 +325,18 @@ class BirdSchemaIndex:
         }
 
     def _FindEvidence(self, database_id: str, question: str) -> str:
-        normalized = question.strip().lower()
+        normalized = self._NormalizeQuestion(question)
         for item in self.questions:
             q_db = GetValue(item, "databaseId", "database_id", default="")
-            q_text = (GetValue(item, "question", default="") or "").strip().lower()
+            q_text = self._NormalizeQuestion(GetValue(item, "question", default="") or "")
             if q_db == database_id and q_text == normalized:
                 return GetValue(item, "evidence", default="") or ""
         return ""
+
+    @staticmethod
+    def _NormalizeQuestion(question: str) -> str:
+        tokens = re.findall(r"[A-Za-z0-9]+", question.casefold())
+        return " ".join(tokens)
 
     def _ColumnDict(self, table_name: str, column: Any, reason: str) -> dict[str, str]:
         return {

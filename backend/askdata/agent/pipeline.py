@@ -186,7 +186,10 @@ class StagedSqlPipeline:
                     record_context = getattr(self.react, "RecordRetrievalContext", None)
                     if generation_state is not None and callable(record_context):
                         record_context(generation_state, schema_prompt)
-            if stage == "alternate_plan" and last_failure != "empty_or_suspicious":
+            if stage == "alternate_plan" and last_failure not in {
+                "empty_or_suspicious",
+                "answer_shape",
+            }:
                 continue
 
             generation_context = dict(session_context or {})
@@ -562,6 +565,8 @@ class StagedSqlPipeline:
         failure_class: str | None,
         progress: float,
     ) -> bool:
+        if failure_class == "answer_shape":
+            return False
         return bool(
             failure_class
             and failure_class == previous_failure
@@ -599,7 +604,13 @@ class StagedSqlPipeline:
         return {
             "syntax_or_safety": "Correct SQL syntax or safety validation.",
             "schema_grounding": "Use only tables and columns present in the schema context.",
-            "answer_shape": "Align selected columns, aggregation, filters, order, and limit with the question.",
+            "answer_shape": (
+                "The previous SQL did not directly answer the question. Do not run "
+                "inspection queries. Produce one final SQL whose SELECT columns, filters, "
+                "aggregation, order, and limit match the question. For rate, ratio, "
+                "percentage, average, or decrease/increase questions, SELECT the final "
+                "computed expression itself, not intermediate components."
+            ),
             "empty_or_suspicious": "Try a direct alternate plan and verify the expected result shape.",
             "repeated_no_progress": "Do not repeat the previous SQL.",
         }.get(failure_class, "")
@@ -622,10 +633,17 @@ class StagedSqlPipeline:
     def _InferIntent(question: str, schema: Mapping[str, list[str]]) -> IntentContract:
         lowered = question.casefold()
         all_columns = [column for columns in schema.values() for column in columns]
+        question_concepts = {
+            StagedSqlPipeline._NormalizeConcept(token)
+            for token in re.findall(r"[a-z0-9]+", lowered)
+        }
         outputs = [
             column
             for column in all_columns
-            if re.search(rf"\b{re.escape(column.casefold())}\b", lowered)
+            if (
+                re.search(rf"\b{re.escape(column.casefold())}\b", lowered)
+                or StagedSqlPipeline._NormalizeConcept(column) in question_concepts
+            )
         ]
         if re.search(r"\b(percentage|percent|ratio|rate|share)\b", lowered):
             return IntentContract(shape="ratio", metrics=["ratio"], expected_max_rows=1)
@@ -641,6 +659,18 @@ class StagedSqlPipeline:
             order = "ascending" if re.search(r"\b(bottom|lowest|least)\b", lowered) else "descending"
             return IntentContract(shape="ranking", output_attributes=outputs, order=order)
         return IntentContract(shape="listing", output_attributes=outputs)
+
+    @staticmethod
+    def _NormalizeConcept(value: str) -> str:
+        tokens = re.findall(r"[a-z0-9]+", value.casefold())
+        normalized = "".join(tokens)
+        if len(normalized) > 3 and normalized.endswith("ies"):
+            return normalized[:-3] + "y"
+        if len(normalized) > 3 and normalized.endswith(("ses", "xes", "zes", "ches", "shes")):
+            return normalized[:-2]
+        if len(normalized) > 3 and normalized.endswith("s"):
+            return normalized[:-1]
+        return normalized
 
     @staticmethod
     def _Emit(

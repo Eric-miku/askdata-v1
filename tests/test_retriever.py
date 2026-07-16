@@ -83,6 +83,24 @@ def test_retrieve_matches_column_name_and_includes_join_context():
     assert "Join students.school_id = schools.id" in result["schema_prompt"]
 
 
+def test_retrieve_returns_exact_question_evidence_separately():
+    index = BirdSchemaIndex().Build(
+        [sample_database()],
+        questions=[
+            {
+                "database_id": "demo",
+                "question": "List total enrollment?",
+                "evidence": "Total enrollment is enrollment_a + enrollment_b",
+            }
+        ],
+    )
+
+    result = index.Retrieve("demo", "list total enrollment")
+
+    assert result["evidence"] == "Total enrollment is enrollment_a + enrollment_b"
+    assert "Evidence: Total enrollment is enrollment_a + enrollment_b" in result["schema_prompt"]
+
+
 def test_retrieve_falls_back_to_first_eight_tables():
     index = BirdSchemaIndex().Build([sample_database(table_count=10)])
 

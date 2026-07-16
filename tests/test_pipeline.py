@@ -140,6 +140,64 @@ def test_pipeline_builds_chart_from_the_analyzed_selected_candidate():
     assert result["chart"]["type"] == "horizontal_bar"
 
 
+def test_pipeline_intent_infers_singular_schema_column_from_plural_question():
+    intent = StagedSqlPipeline(react=FakeReact([]))._InferIntent(
+        "What are the elements and label of molecule TR060?",
+        {"atom": ["element"], "molecule": ["label"]},
+    )
+
+    assert intent.output_attributes == ["element", "label"]
+
+
+def test_pipeline_rejects_partial_molecule_label_answer_and_repairs_to_elements_join():
+    partial_sql = "SELECT * FROM molecule WHERE molecule_id = 'TR060'"
+    final_sql = (
+        "SELECT DISTINCT atom.element, molecule.label "
+        "FROM atom JOIN molecule ON atom.molecule_id = molecule.molecule_id "
+        "WHERE molecule.molecule_id = 'TR060'"
+    )
+    toxicology_retrieval = {
+        "database_id": "demo",
+        "database_path": "/tmp/demo.sqlite",
+        "schema_prompt": (
+            "Database: demo\n"
+            "Table atom(atom_id text, molecule_id text, element text)\n"
+            "Table molecule(molecule_id text, label text)"
+        ),
+        "schema": {
+            "atom": ["atom_id", "molecule_id", "element"],
+            "molecule": ["molecule_id", "label"],
+        },
+    }
+    runner = MappingRunner({
+        partial_sql: {
+            "success": True,
+            "columns": ["molecule_id", "label"],
+            "rows": [{"molecule_id": "TR060", "label": "-"}],
+        },
+        final_sql: {
+            "success": True,
+            "columns": ["element", "label"],
+            "rows": [{"element": "c", "label": "-"}, {"element": "h", "label": "-"}],
+        },
+    })
+
+    result = StagedSqlPipeline(
+        react=FakeReact([
+            [SqlCandidateDraft(sql=partial_sql)],
+            [SqlCandidateDraft(sql=final_sql)],
+        ]),
+        analyzer=RecordingAnalyzer(),
+        runner=runner,
+    ).Run(
+        question="What are the elements of the toxicology and label of molecule TR060?",
+        retrieval=toxicology_retrieval,
+    )
+
+    assert result["kind"] == "answer"
+    assert result["sql"] == final_sql
+
+
 def test_pipeline_does_not_build_chart_for_an_error():
     chart_builder = RecordingChartBuilder()
 
@@ -180,6 +238,106 @@ def test_pipeline_stops_repeated_identical_sql_early():
 
     assert runner.call_count == 1
     assert result["failure_class"] == "repeated_no_progress"
+
+
+def test_pipeline_allows_answer_shape_repairs_to_progress_to_final_candidate():
+    inspect_city = "SELECT DISTINCT City FROM schools WHERE City LIKE '%Monterey%'"
+    inspect_exact = "SELECT DISTINCT City FROM schools WHERE City = 'Monterey'"
+    final_sql = (
+        "SELECT `School Name`, Street, City, State, Zip "
+        "FROM schools WHERE County = 'Monterey'"
+    )
+    answer_intent = IntentContract(shape="listing", output_attributes=["School Name", "Street"])
+    answer_retrieval = {
+        "database_id": "demo",
+        "database_path": "/tmp/demo.sqlite",
+        "schema_prompt": (
+            "Database: demo\n"
+            "Table schools(`School Name` text, Street text, City text, State text, Zip text, County text)"
+        ),
+        "schema": {
+            "schools": ["School Name", "Street", "City", "State", "Zip", "County"]
+        },
+        "intent": answer_intent,
+    }
+    runner = MappingRunner({
+        inspect_city: {"success": True, "columns": ["City"], "rows": [{"City": "Monterey"}]},
+        inspect_exact: {"success": True, "columns": ["City"], "rows": [{"City": "Monterey"}]},
+        final_sql: {
+            "success": True,
+            "columns": ["School Name", "Street", "City", "State", "Zip"],
+            "rows": [{"School Name": "A", "Street": "1 Main", "City": "Monterey", "State": "CA", "Zip": "93940"}],
+        },
+    })
+
+    result = StagedSqlPipeline(
+        react=FakeReact([
+            [SqlCandidateDraft(sql=inspect_city)],
+            [SqlCandidateDraft(sql=inspect_exact)],
+            [SqlCandidateDraft(sql=final_sql)],
+        ]),
+        analyzer=RecordingAnalyzer(),
+        runner=runner,
+    ).Run(question="State the names and full communication address", retrieval=answer_retrieval)
+
+    assert result["kind"] == "answer"
+    assert result["sql"] == final_sql
+
+
+def test_pipeline_uses_alternate_plan_for_late_ratio_formula_repair():
+    inspect_tx = "SELECT * FROM transactions_1k WHERE Date = '2012-08-25' AND Price = 634.8"
+    inspect_dates = "SELECT DISTINCT Date FROM yearmonth LIMIT 20"
+    inspect_customer = "SELECT * FROM yearmonth WHERE CustomerID = 6718 ORDER BY Date"
+    intermediate = (
+        "SELECT SUM(CASE WHEN substr(Date,1,4) = '2012' THEN Consumption ELSE 0 END) AS consumption_2012, "
+        "SUM(CASE WHEN substr(Date,1,4) = '2013' THEN Consumption ELSE 0 END) AS consumption_2013 "
+        "FROM yearmonth WHERE CustomerID = 6718"
+    )
+    final_sql = (
+        "SELECT (SUM(CASE WHEN substr(Date,1,4) = '2012' THEN Consumption ELSE 0 END) - "
+        "SUM(CASE WHEN substr(Date,1,4) = '2013' THEN Consumption ELSE 0 END)) * 1.0 / "
+        "SUM(CASE WHEN substr(Date,1,4) = '2012' THEN Consumption ELSE 0 END) AS decrease_rate "
+        "FROM yearmonth WHERE CustomerID = 6718"
+    )
+    ratio_retrieval = {
+        "database_id": "demo",
+        "database_path": "/tmp/demo.sqlite",
+        "schema_prompt": (
+            "Database: demo\n"
+            "Table transactions_1k(Date date, CustomerID integer, Price real)\n"
+            "Table yearmonth(CustomerID integer, Date text, Consumption real)"
+        ),
+        "schema": {
+            "transactions_1k": ["Date", "CustomerID", "Price"],
+            "yearmonth": ["CustomerID", "Date", "Consumption"],
+        },
+        "intent": IntentContract(shape="ratio", metrics=["ratio"], expected_max_rows=1),
+    }
+    runner = MappingRunner({
+        inspect_tx: {"success": True, "columns": ["Date", "CustomerID", "Price"], "rows": [{"CustomerID": 6718}]},
+        inspect_dates: {"success": True, "columns": ["Date"], "rows": [{"Date": "201201"}, {"Date": "201301"}]},
+        inspect_customer: {"success": True, "columns": ["CustomerID", "Date", "Consumption"], "rows": [{"CustomerID": 6718, "Date": "201201", "Consumption": 100.0}]},
+        intermediate: {"success": True, "columns": ["consumption_2012", "consumption_2013"], "rows": [{"consumption_2012": 100.0, "consumption_2013": 80.0}]},
+        final_sql: {"success": True, "columns": ["decrease_rate"], "rows": [{"decrease_rate": 0.2}]},
+    })
+
+    result = StagedSqlPipeline(
+        react=FakeReact([
+            [SqlCandidateDraft(sql=inspect_tx)],
+            [SqlCandidateDraft(sql=inspect_dates)],
+            [SqlCandidateDraft(sql=inspect_customer)],
+            [SqlCandidateDraft(sql=intermediate)],
+            [SqlCandidateDraft(sql=final_sql)],
+        ]),
+        analyzer=RecordingAnalyzer(),
+        runner=runner,
+    ).Run(
+        question="what was the consumption decrease rate from Year 2012 to 2013?",
+        retrieval=ratio_retrieval,
+    )
+
+    assert result["kind"] == "answer"
+    assert result["sql"] == final_sql
 
 
 def test_pipeline_expands_retrieval_only_after_schema_grounding_failure():

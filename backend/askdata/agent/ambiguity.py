@@ -92,10 +92,11 @@ class StructuredInterpreter:
     ) -> list[Interpretation] | None:
         context = json.dumps(session_context or {}, ensure_ascii=False, default=str)
         prompt = (
-            "Identify answerable interpretations of the user question. Use the "
-            "submit_interpretations tool. An interpretation is not valid merely because "
-            "it sounds related: cite schema fields or supplied business evidence. Return "
-            "multiple choices only when choosing one would materially change the query.\n\n"
+            "Identify materially different interpretations of the user question. Use the "
+            "submit_interpretations tool. Return multiple choices only when choosing one "
+            "would materially change the SQL. If no material clarification is needed, "
+            "return an empty interpretations array; do not use missing schema terms as a "
+            "reason to block the task.\n\n"
             f"Question: {question}\n"
             f"Schema: {json.dumps(schema, ensure_ascii=False)}\n"
             f"Business evidence: {evidence}\n"
@@ -156,11 +157,7 @@ class AmbiguityGate:
                 supported_by_id.setdefault(item.id, item)
         supported = list(supported_by_id.values())
         if not supported:
-            missing = list(getattr(self.interpreter, "last_missing_concepts", []) or [])
-            return AmbiguityDecision(
-                state="unanswerable",
-                missing_concepts=missing or self._MissingConcepts(question, schema),
-            )
+            return AmbiguityDecision(state="clear", resolved_question=question)
 
         if len(supported) == 1:
             chosen = supported[0]
@@ -367,26 +364,24 @@ class AmbiguityGate:
             parts.append(f"ranking: {item.ranking}")
         return "; ".join(parts) or f"entity: {', '.join(item.entities)}"
 
+    # Lightweight English stemmer — removes common suffixes so that
+    # "leagues" matches "League", "students" matches "student", etc.
+    _STEM_RE = re.compile(
+        r"(ies|sses|ses|ches|shes|xes|zes|ves|uses|s|ing|ed|er|est|ment|ness|ly)$"
+    )
+
     @classmethod
-    def _MissingConcepts(
-        cls, question: str, schema: Mapping[str, list[str]]
-    ) -> list[str]:
-        schema_tokens = cls._Tokens(
-            " ".join([*schema.keys(), *(column for values in schema.values() for column in values)])
-        )
-        ignored = {
-            "a", "all", "and", "by", "data", "for", "from", "give", "list",
-            "me", "of", "show", "the", "to", "what", "which",
-        }
-        missing = [
-            token for token in cls._Tokens(question) if token not in schema_tokens and token not in ignored
-        ]
-        return missing[:5] or ["requested concept"]
+    def _Stem(cls, word: str) -> str:
+        """Remove common English suffixes for fuzzy matching."""
+        if len(word) <= 3:
+            return word
+        stemmed = cls._STEM_RE.sub("", word)
+        return stemmed if len(stemmed) >= 3 else word
 
     @staticmethod
     def _Tokens(value: str) -> list[str]:
         return re.findall(r"[a-z0-9]+", value.casefold())
 
-    @staticmethod
-    def _Normalize(value: str) -> str:
-        return "".join(AmbiguityGate._Tokens(str(value)))
+    @classmethod
+    def _Normalize(cls, value: str) -> str:
+        return cls._Stem("".join(cls._Tokens(str(value))))
