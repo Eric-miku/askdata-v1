@@ -1,7 +1,10 @@
+import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { executeSql, type ExecuteSqlResponse } from "../api/query";
 import type { ChatTurn } from "../types/query";
 import AgentTrace from "./AgentTrace";
+import { ResultChart } from "./ResultChart";
 import { ResultTable } from "./ResultTable";
 import SqlPanel from "./SqlPanel";
 
@@ -12,11 +15,77 @@ interface QueryResultViewProps {
 
 export function QueryResultView({ turn, onRetry }: QueryResultViewProps) {
   const response = turn.response;
-  const hasTable = Boolean(
-    response?.columns?.length &&
-      response.rows !== null &&
-      response.rows !== undefined,
+  const sql = response?.sql?.trim();
+  const shouldReadExecute = Boolean(
+    turn.status === "success" &&
+      sql &&
+      (response?.rows === null || response?.rows === undefined),
   );
+  const [readExecution, setReadExecution] =
+    useState<ExecuteSqlResponse | null>(null);
+  const [readStatus, setReadStatus] = useState<
+    "idle" | "loading" | "success" | "error"
+  >("idle");
+  const [readError, setReadError] = useState<string | null>(null);
+  const hydratedResponse = useMemo(() => {
+    if (!response || !readExecution) {
+      return response;
+    }
+
+    return {
+      ...response,
+      columns: readExecution.columns ?? response.columns,
+      rows: readExecution.rows ?? response.rows,
+      chart: readExecution.chart ?? response.chart,
+      trace: readExecution.trace?.length
+        ? [...(response.trace ?? []), ...readExecution.trace]
+        : response.trace,
+      error: readExecution.error ?? response.error,
+    };
+  }, [readExecution, response]);
+  const hasTable = Boolean(
+    hydratedResponse?.columns?.length &&
+      hydratedResponse.rows !== null &&
+      hydratedResponse.rows !== undefined,
+  );
+  const hasChart = Boolean(hydratedResponse?.chart);
+
+  useEffect(() => {
+    setReadExecution(null);
+    setReadError(null);
+
+    if (!shouldReadExecute || !sql) {
+      setReadStatus("idle");
+      return;
+    }
+
+    let cancelled = false;
+    setReadStatus("loading");
+
+    executeSql({
+      database_id: turn.databaseId,
+      sql,
+    })
+      .then((result) => {
+        if (cancelled) {
+          return;
+        }
+        setReadExecution(result);
+        setReadError(result.error ?? null);
+        setReadStatus(result.error ? "error" : "success");
+      })
+      .catch((error: unknown) => {
+        if (cancelled) {
+          return;
+        }
+        setReadError(error instanceof Error ? error.message : String(error));
+        setReadStatus("error");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [shouldReadExecute, sql, turn.databaseId, turn.id]);
 
   return (
     <article className="chat-turn">
@@ -37,9 +106,11 @@ export function QueryResultView({ turn, onRetry }: QueryResultViewProps) {
           </div>
         ) : null}
 
-        {response?.answer ? (
+        {hydratedResponse?.answer ? (
           <div className="chat-turn__answer">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{response.answer}</ReactMarkdown>
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              {hydratedResponse.answer}
+            </ReactMarkdown>
           </div>
         ) : null}
 
@@ -55,16 +126,43 @@ export function QueryResultView({ turn, onRetry }: QueryResultViewProps) {
           </div>
         ) : null}
 
-        {response?.trace?.length ? <AgentTrace steps={response.trace} /> : null}
-        {response?.sql ? <SqlPanel sql={response.sql} /> : null}
+        {hydratedResponse?.trace?.length ? (
+          <AgentTrace steps={hydratedResponse.trace} />
+        ) : null}
+        {hydratedResponse?.sql ? <SqlPanel sql={hydratedResponse.sql} /> : null}
+
+        {readStatus === "loading" ? (
+          <div className="chat-turn__read-execution" role="status">
+            正在根据历史 SQL 恢复表格和图表…
+          </div>
+        ) : null}
+
+        {readStatus === "error" ? (
+          <div className="chat-turn__read-execution is-error" role="alert">
+            历史结果恢复失败：{readError || "请稍后重试。"}
+          </div>
+        ) : null}
+
+        {hasChart ? (
+          <section className="chat-turn__result">
+            <header>
+              <strong>可视化</strong>
+              <span>读时渲染</span>
+            </header>
+            <ResultChart chart={hydratedResponse?.chart} />
+          </section>
+        ) : null}
 
         {hasTable ? (
           <section className="chat-turn__result">
             <header>
               <strong>查询结果</strong>
-              <span>{response?.rows?.length ?? 0} 行</span>
+              <span>{hydratedResponse?.rows?.length ?? 0} 行</span>
             </header>
-            <ResultTable columns={response?.columns} rows={response?.rows} />
+            <ResultTable
+              columns={hydratedResponse?.columns}
+              rows={hydratedResponse?.rows}
+            />
           </section>
         ) : null}
       </div>

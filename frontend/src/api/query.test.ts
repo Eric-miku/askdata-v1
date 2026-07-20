@@ -15,6 +15,7 @@ vi.mock("axios", () => ({
 import {
   createSession,
   deleteSession,
+  executeSql,
   listDatabases,
   queryData,
 } from "./query";
@@ -65,5 +66,23 @@ describe("query API", () => {
 
     await expect(queryData(request)).resolves.toEqual(response);
     expect(client.post).toHaveBeenCalledWith("/query", request);
+  });
+
+  it("executes historical SQL with the lightweight read endpoint", async () => {
+    const response = {
+      columns: ["name"],
+      rows: [{ name: "Watch" }],
+      chart: { type: "bar", series: [{ data: [1] }] },
+      trace: [],
+      error: null,
+    };
+    const request = {
+      database_id: "demo",
+      sql: "SELECT name FROM products",
+    };
+    client.post.mockResolvedValue({ data: response });
+
+    await expect(executeSql(request)).resolves.toEqual(response);
+    expect(client.post).toHaveBeenCalledWith("/query/execute-sql", request);
   });
 });

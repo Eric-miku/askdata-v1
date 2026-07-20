@@ -1025,6 +1025,22 @@ svg {
   margin-top: 20px;
 }
 
+.chat-turn__read-execution {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-raised);
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.chat-turn__read-execution.is-error {
+  border-color: color-mix(in srgb, var(--danger) 36%, var(--border));
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface-raised));
+  color: var(--danger);
+}
+
 .chat-turn__result > header {
   display: flex;
   align-items: center;
@@ -1234,6 +1250,20 @@ svg {
 
 .result-table__json-cell {
   white-space: nowrap;
+}
+
+.result-chart {
+  min-height: 320px;
+}
+
+.result-chart__fallback {
+  display: grid;
+  min-height: 160px;
+  place-items: center;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  color: var(--text-muted);
+  font-size: 13px;
 }
 
 .composer-dock {

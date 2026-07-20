@@ -13,6 +13,16 @@ export interface QueryRequest {
   session_id: string;
 }
 
+export interface ExecuteSqlRequest {
+  database_id: string;
+  sql: string;
+}
+
+export type ExecuteSqlResponse = Pick<
+  QueryResponse,
+  "columns" | "rows" | "chart" | "trace" | "error"
+>;
+
 const api = axios.create({
   baseURL: API_BASE_URL,
 });
@@ -35,6 +45,13 @@ export async function deleteSession(sessionId: string): Promise<void> {
 
 export async function queryData(data: QueryRequest): Promise<QueryResponse> {
   const response = await api.post<QueryResponse>("/query", data);
+  return response.data;
+}
+
+export async function executeSql(
+  data: ExecuteSqlRequest,
+): Promise<ExecuteSqlResponse> {
+  const response = await api.post<ExecuteSqlResponse>("/query/execute-sql", data);
   return response.data;
 }
 
