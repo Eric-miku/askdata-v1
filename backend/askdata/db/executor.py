@@ -46,11 +46,12 @@ from typing import Optional
 
 import sqlglot
 from sqlglot import exp
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 from sqlalchemy.engine import Engine, Connection
 from sqlalchemy.exc import SQLAlchemyError, TimeoutError as SATimeoutError
 
 from .validator import SQLValidator, ValidationResult
+from .query_runner import build_sqlite_engine
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
@@ -175,23 +176,36 @@ class SQLExecutor:
         :param pool_timeout: 连接池已满时, 等待空闲连接的最长时间 (秒), 超时抛出池级别的 TIMEOUT
         :param engine: 允许外部注入已创建的 Engine (便于测试复用内存库连接; 传入时上面几个连接池参数不生效)
         """
-        connect_args = {}
-        if engine is None and (dialect == "sqlite" or (db_url and db_url.startswith("sqlite"))):
-            # SQLite 的 DBAPI 连接默认只能在创建它的线程里使用, 而超时机制需要在独立线程
-            # 里执行查询(主线程只等待固定时间), 两者天然冲突, 必须显式关闭这个限制。
-            # 安全性说明: 我们保证同一时刻只有"发起请求的线程"和"内部超时worker线程"
-            # 之一在操作这个连接(worker执行时主线程只是join等待, 不会并发访问),
-            # 所以关闭 check_same_thread 不会引入真正的并发读写风险。
-            connect_args = {"check_same_thread": False}
+        is_sqlite = dialect == "sqlite" or (db_url and db_url.startswith("sqlite"))
 
-        self.engine: Engine = engine or create_engine(
-            db_url,
-            pool_pre_ping=pool_pre_ping,
-            pool_size=pool_size,
-            max_overflow=max_overflow,
-            pool_timeout=pool_timeout,
-            connect_args=connect_args,
-        )
+        if engine is not None:
+            self.engine: Engine = engine
+        elif is_sqlite:
+            # P3 动态字符编码适配: query_runner.build_sqlite_engine() 是 db 模块里
+            # 唯一负责组装 SQLite engine 的地方——挂载数据库前先探知文件编码,
+            # 引擎创建完成后立刻挂上"多编码兜底"的 text_factory, 防止 GBK/UTF-8
+            # 混用的脏数据直接崩掉查询。同时也顺带处理了 check_same_thread=False
+            # (超时保护机制需要在独立线程里执行查询, 详见 query_runner.py 内注释)。
+            self.engine = build_sqlite_engine(
+                db_url,
+                pool_pre_ping=pool_pre_ping,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_timeout=pool_timeout,
+            )
+        else:
+            # 非 SQLite 方言 (PostgreSQL/MySQL 等) 不涉及"文件字节编码探测"这个问题,
+            # 走原生 create_engine 即可
+            from sqlalchemy import create_engine as _create_engine
+
+            self.engine = _create_engine(
+                db_url,
+                pool_pre_ping=pool_pre_ping,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_timeout=pool_timeout,
+            )
+
         self.dialect = dialect
         self.validator = SQLValidator(dialect=dialect, forbidden_tables=forbidden_tables)
         self.default_page_size = default_page_size

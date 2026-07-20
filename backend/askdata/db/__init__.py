@@ -7,6 +7,10 @@ from .executor import (
     ErrorInfo,
     ErrorCode,
 )
+from .query_runner import (
+    build_sqlite_engine,
+    detect_file_encoding,
+)
 
 __all__ = [
     "SQLValidator",
@@ -18,4 +22,6 @@ __all__ = [
     "PaginationMeta",
     "ErrorInfo",
     "ErrorCode",
+    "build_sqlite_engine",
+    "detect_file_encoding",
 ]
