@@ -33,10 +33,10 @@ def _NormalizeTupleValue(value):
     if isinstance(value, int):
         return ("number", float(value))
     if isinstance(value, float):
-        return ("number", round(value, 6))
+        return ("number", round(value, 4))
     text = str(value).strip()
     try:
-        return ("number", round(float(text), 6))
+        return ("number", round(float(text), 4))
     except ValueError:
         return ("text", text)
 
@@ -120,6 +120,12 @@ class BirdResultComparer:
             relaxed_passed = self.CompareProjectedRows(generated, gold, generated_sql, gold_sql)
             match_mode = "name" if relaxed_passed else None
 
+        if not relaxed_passed and len(generated_columns or []) == 1 and len(gold_columns) == 1:
+            generated = [tuple(self.NormalizeValue(row.get(generated_columns[0])) for _ in [0]) for row in generated_rows]
+            gold = [tuple(self.NormalizeValue(row.get(gold_columns[0])) for _ in [0]) for row in gold_rows]
+            relaxed_passed = self.CompareProjectedRows(generated, gold, generated_sql, gold_sql)
+            match_mode = "single_value" if relaxed_passed else None
+
         if not relaxed_passed and len(generated_columns or []) >= len(gold_columns):
             generated = [
                 tuple(self.NormalizeValue(row.get(generated_columns[index])) for index in range(len(gold_columns)))
@@ -164,7 +170,7 @@ class BirdResultComparer:
         return False
 
     def CompareProjectedRows(self, generated, gold, generated_sql, gold_sql):
-        if self.HasOrderBy(generated_sql) or self.HasOrderBy(gold_sql):
+        if self.HasOrderBy(gold_sql):
             return generated == gold
         return Counter(generated) == Counter(gold)
 

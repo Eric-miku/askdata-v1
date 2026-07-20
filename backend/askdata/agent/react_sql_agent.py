@@ -3,13 +3,14 @@
 import json
 import re
 
-from askdata.db.executor import SQLExecutor
+from askdata.agent.answer_shape import CheckAnswerShape
+from askdata.agent.prompts import BuildReActSystemPrompt
 
 RUN_QUERY_TOOL = {
     "type": "function",
     "function": {
         "name": "run_query",
-        "description": "Execute a SQLite SELECT query against the selected database. Returns columns and rows, or an error message that should be used to repair the SQL.",
+        "description": "Execute a SQLite SELECT query against the selected database. Returns columns and a sample of rows, or an error message that should be used to repair the SQL. The sample may be truncated; do not use OFFSET pagination to collect full result sets. Keep the SQL that directly answers the question.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -24,9 +25,10 @@ RUN_QUERY_TOOL = {
 class ReActSqlAgent:
     """Tool-calling SQL loop that can be used as one node inside AgentGraph."""
 
-    def __init__(self, llm_client, max_iterations: int = 6):
+    def __init__(self, llm_client, max_iterations: int = 8, skill_loader=None):
         self.llm_client = llm_client
         self.max_iterations = max_iterations
+        self.skill_loader = skill_loader
 
     def Run(self, question: str, schema_prompt: str, database_path: str, session_context: dict | None = None) -> dict:
         messages = self._BuildMessages(question, schema_prompt, session_context)
@@ -34,7 +36,10 @@ class ReActSqlAgent:
         last_sql = ""
         last_columns = []
         last_rows = []
+        candidates = []
+        candidate_sequence = 0
         answer = ""
+        review_requested = False
 
         for iteration in range(self.max_iterations):
             message = self.llm_client.Chat(messages, tools=[RUN_QUERY_TOOL])
@@ -44,6 +49,19 @@ class ReActSqlAgent:
 
             tool_calls = getattr(message, "tool_calls", None) or []
             if not tool_calls:
+                latest_warnings = candidates[-1].get("shape_warnings", []) if candidates else []
+                if latest_warnings and len(candidates) < 2 and not review_requested:
+                    messages.append({"role": "assistant", "content": content or ""})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Before finalizing, produce and run one corrected SQL candidate that resolves "
+                            "these answer-shape warnings: " + "; ".join(latest_warnings)
+                        ),
+                    })
+                    review_requested = True
+                    trace.append(self._TraceStep("ReviewAnswerShape", "retry", "; ".join(latest_warnings)))
+                    continue
                 answer = self._CleanFinalAnswer(content or "")
                 break
 
@@ -57,15 +75,35 @@ class ReActSqlAgent:
                 trace.append(self._TraceStep("GenerateSql", "success", sql))
                 result = self._ExecuteSql(sql, database_path)
                 if result["success"]:
+                    shape_warnings = CheckAnswerShape(question, sql)
                     last_sql = sql
                     last_columns = result["columns"]
                     last_rows = result["rows"]
+                    candidates.append({
+                        "sql": sql,
+                        "columns": last_columns,
+                        "rows": last_rows,
+                        "shape_warnings": shape_warnings,
+                        "sequence": candidate_sequence,
+                    })
+                    candidate_sequence += 1
+                    # ReAct commonly uses successful queries to inspect categorical values
+                    # before producing its final SQL. Keep the candidate set bounded without
+                    # preventing that later, directly answering query from being executed.
+                    candidates = candidates[-2:]
                     trace.append(self._TraceStep("ExecuteSql", "success", f"Returned {len(last_rows)} rows."))
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "content": json.dumps(
-                            {"columns": last_columns, "rowCount": len(last_rows), "rows": last_rows[:20]},
+                            {
+                                "columns": last_columns,
+                                "rowCount": len(last_rows),
+                                "rows": last_rows[:20],
+                                "shapeWarnings": shape_warnings,
+                                "reviewRequired": bool(shape_warnings),
+                                "note": "Rows are a sample for inspection. Do not paginate with OFFSET to collect all rows; keep the SQL that directly answers the question.",
+                            },
                             ensure_ascii=False,
                             default=str,
                         ),
@@ -79,6 +117,12 @@ class ReActSqlAgent:
         if not answer:
             answer = self._FallbackAnswer(last_columns, last_rows)
 
+        selected = self._SelectBestCandidate(question, candidates)
+        if selected:
+            last_sql = selected["sql"]
+            last_columns = selected["columns"]
+            last_rows = selected["rows"]
+
         return {
             "answer": answer,
             "sql": last_sql,
@@ -91,58 +135,69 @@ class ReActSqlAgent:
         previous = ""
         if session_context and session_context.get("last_sql"):
             previous = f"\nPrevious SQL: {session_context['last_sql']}"
-        system_prompt = """You are a SQLite data analyst. Given a question and a database schema, write and execute SQL queries to answer the question.
+        system_prompt = BuildReActSystemPrompt()
 
-HOW TO WORK (follow this sequence for every question):
-1. Read the question. Identify exactly what columns the answer requires.
-2. Check the schema: which table has each required column? If filter columns and target columns are in DIFFERENT tables, you MUST JOIN those tables.
-3. Before writing SQL, verify: does my SELECT list match exactly what the question asks for? No extra columns.
-4. Write and execute the SQL via the run_query tool.
-5. If the query fails or returns wrong results, read the error, fix the SQL, and retry.
-6. When satisfied, state ONLY the final answer based on the SQL results.
-
-COLUMN SELECTION (strict — every SELECT is checked):
-- "What is the phone number of X?" -> SELECT phone ONLY, not phone + school + score.
-- "List the schools and their writing scores" -> SELECT school, score ONLY.
-- "How many schools in each county?" -> SELECT county, COUNT(*) ONLY.
-- NEVER add extra columns "for context". If the question asks for Phone, SELECT Phone.
-- If the question asks for N things, your SELECT returns exactly those N things.
-
-PRE-AGGREGATED COLUMNS (do NOT double-aggregate):
-- If a column name contains Avg, Average, Rate, Percent, Pct, Total, Sum, Ratio, or Score: it is already a computed metric per row. Do NOT wrap it in AVG(), SUM(), or other aggregate functions.
-- Example: column "AvgScrWrite" means "average writing score per school". Use it directly: SELECT AvgScrWrite — never AVG(AvgScrWrite).
-- Only use aggregate functions (AVG, SUM, COUNT, MIN, MAX) on raw atomic columns, not on pre-computed metrics.
-
-JOIN (mandatory when data spans tables):
-- Before you skip a JOIN, ask yourself: does my WHERE column come from a different table than my SELECT column? If yes -> JOIN them.
-
-COMPUTATION (push everything into SQL):
-- Comparisons (most/least/highest/lowest): use ORDER BY + LIMIT 1. Never fetch multiple rows and pick yourself.
-- Ratios, percentages, averages, differences: compute in the SELECT expressions. Never fetch two numbers and divide in your head.
-- Conditional counts: use SUM(CASE WHEN ... THEN 1 ELSE 0 END). Never count rows manually.
-
-ANSWER (final output rules):
-- Your answer MUST contain ONLY information present in the SQL results. Never invent numbers, names, or facts.
-- Do not include your reasoning, doubts, or chain-of-thought in the final answer.
-- Keep answers concise — one or two sentences.
-- If data is insufficient, say so."""
+        if self.skill_loader:
+            skills = self.skill_loader.BuildPromptSection()
+            if skills:
+                system_prompt += "\n\n" + skills
 
         user_prompt = f"Question: {question}{previous}\n\nDatabase Schema:\n{schema_prompt}"
         return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
 
     def _ExecuteSql(self, sql: str, database_path: str) -> dict:
-        try:
-            result = SQLExecutor(f"sqlite:///{database_path}", dialect="sqlite").execute(sql)
-            if not result.success:
-                error = result.error.to_dict() if result.error else {"message": "SQL execution failed"}
-                return {"success": False, "error": error.get("detail") or error.get("message")}
-            return {
-                "success": True,
-                "columns": [column.key for column in result.columns],
-                "rows": result.rows,
-            }
-        except Exception as exc:
-            return {"success": False, "error": str(exc)}
+        from askdata.db.query_runner import Execute as RunQuery
+        return RunQuery(sql, database_path)
+
+    def _SelectBestCandidate(self, question: str, candidates: list[dict]) -> dict | None:
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda candidate: (
+                not candidate.get("shape_warnings"),
+                candidate.get("sequence", 0),
+                self._IntentScore(question, candidate),
+            ),
+        )
+
+    def _IntentScore(self, question: str, candidate: dict) -> int:
+        question_text = (question or "").lower()
+        sql = (candidate.get("sql") or "").lower()
+        columns = candidate.get("columns") or []
+        score = 0
+
+        asks_count = bool(re.search(r"\b(how many|number of|count|no\.)\b", question_text))
+        asks_list = bool(re.search(r"\b(list|name|names|show|give|which|what are)\b", question_text))
+        asks_average = bool(re.search(r"\b(avg|average|mean)\b", question_text))
+        asks_rank = "rank" in question_text
+        asks_extreme = bool(re.search(r"\b(top|bottom|highest|lowest|most|least|best|worst)\b", question_text))
+        is_count_sql = bool(re.search(r"\bcount\s*\(", sql))
+        is_count_only = is_count_sql and len(columns) == 1
+        is_avg_sql = bool(re.search(r"\b(avg|average)\s*\(", sql))
+
+        if asks_average:
+            score += 7 if is_avg_sql else -5
+            if is_count_only:
+                score -= 5
+        elif asks_count:
+            score += 6 if is_count_sql else -6
+            if len(columns) == 1:
+                score += 2
+        if asks_list and not asks_count:
+            score += -6 if is_count_only else 3
+        if asks_rank:
+            score += 5 if re.search(r"\b(rank|dense_rank|row_number)\s*\(", sql) else -4
+        if asks_extreme:
+            score += 3 if re.search(r"\border\s+by\b", sql) else -3
+            score += 2 if re.search(r"\blimit\s+1\b", sql) else 0
+            if is_count_sql and len(columns) > 1:
+                score += 2
+        if re.search(r"\boffset\b", sql):
+            score -= 4
+        if re.search(r"\blimit\s+([2-9]\d{2,}|\d{4,})\b", sql):
+            score -= 3
+        return score
 
     def _AssistantMessage(self, message) -> dict:
         return {

@@ -11,7 +11,7 @@ API 路由定义 —— 所有 HTTP 接口的入口
 设计原则:
   - 每个接口都记录 Trace 日志
   - 异常统一由全局异常处理器捕获，返回一致的错误格式
-  - 核心 /api/query 接口暂时返回占位数据，待 AI 组和 DB 组实现后对接
+  - 核心 /api/query 接口通过 AgentGraph → ReActSqlAgent 完成 NL2SQL 全链路
 """
 
 import os
@@ -36,6 +36,18 @@ router = APIRouter()
 # 辅助函数
 # ============================================================
 
+def _CountTables(db_path: str) -> int:
+    try:
+        connection = sqlite3.connect(db_path)
+        try:
+            cursor = connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            return cursor.fetchone()[0]
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return 0
+
+
 def _get_bird_databases_dir() -> str:
     """获取 BIRD 数据库文件存放目录的绝对路径
 
@@ -54,7 +66,7 @@ def _scan_databases() -> List[dict]:
     遍历目录，找到所有 .db 或 .sqlite 文件，返回数据库元信息列表。
 
     Returns:
-        数据库列表，每项包含 id, name, tables_count（目前为占位 0）
+        数据库列表，每项包含 id, name, tables_count
     """
     databases_dir = _get_bird_databases_dir()
     databases = []
@@ -77,7 +89,7 @@ def _scan_databases() -> List[dict]:
                 "id": db_id,
                 "name": db_id.replace("_", " ").title(),  # 将下划线转换为可读名称
                 "path": db_path,
-                "tables_count": 0,   # TODO: 后续接入 SQLAlchemy 后读取实际表数量
+                "tables_count": _CountTables(db_path),
             })
 
     return databases
@@ -163,8 +175,7 @@ async def get_tables(database_id: str):
         }
 
     注意:
-        目前返回占位数据。待 db/executor.py 实现后，
-        将使用 SQLAlchemy 实时读取数据库表结构。
+        通过 sqlite3 直接读取数据库表结构。
     """
     trace = TraceLogger()
     trace.log("查询表结构", f"database_id={database_id}")
@@ -277,8 +288,7 @@ async def execute_query(request: QueryRequest):
         }
 
     注意:
-        目前返回占位数据，方便前端先行开发。
-        待 AI 组实现 agent/graph.py 后，将替换为真实的 Agent 调用链。
+        调用 AgentGraph → ReActSqlAgent 完成 NL2SQL 全链路。
     """
     trace = TraceLogger()
     trace.log("收到查询请求", f"question='{request.question}', database_id='{request.database_id}'")

@@ -2,6 +2,7 @@ import { Empty, Table, Typography } from "antd";
 import type { ReactNode } from "react";
 import type { ColumnsType } from "antd/es/table";
 import type { QueryCellValue } from "../types/query";
+import { ChevronIcon } from "./Icons";
 
 interface ResultTableProps {
   columns?: string[] | null;
@@ -131,10 +132,23 @@ export function ResultTable({ columns, rows, loading = false }: ResultTableProps
       bordered
       scroll={{ x: "max-content" }}
       pagination={{
-        showSizeChanger: true,
+        showSizeChanger: {
+          showSearch: false,
+          suffixIcon: (
+            <ChevronIcon className="result-table__page-size-chevron" />
+          ),
+          classNames: {
+            popup: {
+              root: "result-table__page-size-dropdown",
+            },
+          },
+        },
+        showTitle: false,
         pageSizeOptions: [10, 20, 50, 100],
         defaultPageSize: 10,
         showTotal: (total) => `共 ${total} 行`,
+        itemRender: (_, type, originalElement) =>
+          type === "jump-prev" || type === "jump-next" ? null : originalElement,
       }}
     />
   );
