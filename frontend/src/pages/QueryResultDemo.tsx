@@ -1,93 +1,134 @@
 import { Typography } from "antd";
+import { useEffect } from "react";
 
 import { QueryResultView } from "../components/QueryResultView";
-
 import DatabaseSelector from "../components/DatabaseSelector";
-
 import QueryInput from "../components/QueryInput";
 
 import { useQueryStore } from "../store/queryStore";
+import { useSessionStore } from "../store/sessionStore";
 
 
 export function QueryResultDemo() {
 
 
-const {
-
-database,
-
-setDatabase,
-
-setQuestion,
-
-loading,
-
-result,
-
-executeQuery
-
-}=useQueryStore();
+    const currentSessionId =
+        useSessionStore(
+            state => state.currentSessionId
+        );
 
 
 
-return (
-
-<div className="app-shell">
+    useEffect(() => {
 
 
-<header className="app-shell__header">
+        if (currentSessionId) {
 
 
-<Typography.Title level={2}>
-
-AskData 智能问数
-
-</Typography.Title>
-
-
-</header>
+            console.log(
+                "当前切换session:",
+                currentSessionId
+            );
 
 
+        }
 
-<DatabaseSelector
 
-value={database}
-
-onChange={setDatabase}
-
-/>
+    }, [currentSessionId]);
 
 
 
-<QueryInput
 
-loading={loading}
+    const {
 
-onSubmit={(question)=>{
+        database,
 
-console.log(question);
+        setDatabase,
 
-executeQuery();
+        setQuestion,
+
+        loading,
+
+        result,
+
+        executeQuery
 
 
-}}
-
-/>
-
-
-
-<QueryResultView
-
-result={result}
-
-loading={loading}
-
-/>
+    } = useQueryStore();
 
 
 
-</div>
 
-);
+
+    return (
+
+        <div className="app-shell">
+
+
+            <header className="app-shell__header">
+
+
+                <Typography.Title level={2}>
+
+                    AskData 智能问数
+
+                </Typography.Title>
+
+
+            </header>
+
+
+
+
+
+            <DatabaseSelector
+
+                value={database}
+
+                onChange={setDatabase}
+
+            />
+
+
+
+
+
+            <QueryInput
+
+                loading={loading}
+
+                onSubmit={(question) => {
+
+
+                    console.log(question);
+
+
+                    setQuestion(question);
+
+
+                    executeQuery();
+
+
+                }}
+
+            />
+
+
+
+
+
+            <QueryResultView
+
+                result={result}
+
+                loading={loading}
+
+            />
+
+
+
+        </div>
+
+    );
 
 }
