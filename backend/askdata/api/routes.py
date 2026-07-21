@@ -19,6 +19,7 @@ API 路由定义 —— 所有 HTTP 接口的入口
     SemanticRetriever → LLM(ReAct/One-Shot) → SQLExecutor → ResultAnalyzer
   - /api/sessions/* 接口为前端提供完整的会话管理和历史记录功能，
     与 LangGraph SqliteSaver 检查点机制配合，实现多轮对话持久化
+  - 核心 /api/query 接口通过 AgentGraph → ReActSqlAgent 完成 NL2SQL 全链路
 """
 
 import sqlite3
@@ -50,6 +51,22 @@ router = APIRouter()
 # ============================================================
 # 辅助函数
 # ============================================================
+
+
+def _CountTables(db_path: str) -> int:
+    """统计 SQLite 数据库中的表数量（仅查询 COUNT，更高效）"""
+    try:
+        connection = sqlite3.connect(db_path)
+        try:
+            cursor = connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+            return cursor.fetchone()[0]
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return 0
+
 
 def _get_bird_databases_dir() -> Path:
     """获取 BIRD 数据库文件存放目录的绝对路径
@@ -87,17 +104,11 @@ def _scan_databases() -> list[dict]:
         db_id = db_path.stem
         if db_id not in seen:
             seen.add(db_id)
-            # 实时读取该数据库的表数量
-            try:
-                tables = _read_sqlite_tables(str(db_path))
-                tables_count = len(tables)
-            except Exception:
-                tables_count = 0
             databases.append({
                 "id": db_id,
-                "name": db_id.replace("_", " ").title(),  # 将下划线转换为可读名称
-                "path": str(db_path),
-                "tables_count": tables_count,  # 实时从 SQLite 读取
+                "name": db_id.replace("_", " ").title(),
+                "path": str(db_path),           # 转为 str，保持类型一致
+                "tables_count": _CountTables(str(db_path)),  # 使用高效 COUNT 查询
             })
 
     return databases
@@ -473,6 +484,9 @@ async def execute_query(request: QueryRequest):
     5. 将结果存入会话历史
     6. 返回 QueryResponse（包含 SQL、数据、图表配置和中文解释）
 
+    注意:
+        调用 AgentGraph → ReActSqlAgent 完成 NL2SQL 全链路。
+
     用法:
         POST /api/query
         Body: {
@@ -522,7 +536,7 @@ async def execute_query(request: QueryRequest):
             question=request.question,
             database_id=request.database_id,
             session_context=session_context,
-            thread_id=thread_id,  # 新增：启用 LangGraph 检查点持久化
+            thread_id=thread_id,  # 启用 LangGraph 检查点持久化
         )
 
         # 合并 API 层 Trace + Agent 层 Trace
