@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sqlite3
 import sys
@@ -46,6 +47,46 @@ def main(argv: list[str] | None = None) -> int:
     prepare.add_argument("--validate-sql", action="store_true", help="Execute gold SQL and record pass/fail.")
     prepare.add_argument("--build-cache", action="store_true", help="Persist gold SQL execution result cache.")
     prepare.add_argument("--max-rows", type=int, default=200, help="Maximum cached rows per query.")
+    prepare.add_argument("--build-embeddings", action="store_true", help="Build schema embedding vector index outputs.")
+    prepare.add_argument(
+        "--embedding-provider",
+        default=os.getenv("EMBEDDING_PROVIDER", "openai-compatible"),
+        choices=["openai-compatible", "hash"],
+        help="Embedding provider. Use hash only for local contract tests.",
+    )
+    prepare.add_argument(
+        "--embedding-api-base",
+        default=os.getenv("EMBEDDING_API_URL") or os.getenv("EMBEDDING_API_BASE") or os.getenv("LLM_API_BASE"),
+        help="OpenAI-compatible embedding API base or full /embeddings URL.",
+    )
+    prepare.add_argument(
+        "--embedding-api-key",
+        default=os.getenv("EMBEDDING_API_KEY") or os.getenv("LLM_API_KEY"),
+        help="Embedding API key. Defaults to EMBEDDING_API_KEY or LLM_API_KEY.",
+    )
+    prepare.add_argument(
+        "--embedding-model",
+        default=os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-3-small"),
+        help="Embedding model name sent to the provider.",
+    )
+    prepare.add_argument(
+        "--embedding-dimension",
+        type=int,
+        default=int(os.getenv("EMBEDDING_DIMENSION", "64")),
+        help="Vector dimension for the hash provider.",
+    )
+    prepare.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=int(os.getenv("EMBEDDING_BATCH_SIZE", "32")),
+        help="Number of schema documents embedded per request.",
+    )
+    prepare.add_argument(
+        "--vector-store",
+        default=os.getenv("SCHEMA_VECTOR_STORE", "faiss"),
+        choices=["faiss", "jsonl"],
+        help="Schema vector index backend. FAISS is the production target; JSONL is for offline tests.",
+    )
     prepare.set_defaults(func=prepare_bird_command)
 
     args = parser.parse_args(argv)
@@ -97,7 +138,12 @@ def prepare_bird_command(args: argparse.Namespace) -> int:
     write_jsonl(paths.out_dir / "questions.jsonl", selected_questions)
     write_jsonl(paths.out_dir / "gold_sql.jsonl", build_gold_sql_rows(selected_questions))
     write_demo_manifest(paths, selected_questions, databases, args)
-    write_report(paths, normalized_questions, selected_questions, validation_by_id, args)
+
+    vector_manifest = None
+    if args.build_embeddings:
+        vector_manifest = build_schema_embeddings(args, schemas, paths)
+
+    write_report(paths, normalized_questions, selected_questions, validation_by_id, args, vector_manifest)
 
     summary = {
         "status": "ok",
@@ -108,8 +154,40 @@ def prepare_bird_command(args: argparse.Namespace) -> int:
         "validated": bool(validation_by_id),
         "execution_success_rate": compute_success_rate(validation_by_id),
     }
+    if vector_manifest:
+        summary["vector_index"] = {
+            "index_type": vector_manifest["index_type"],
+            "document_count": vector_manifest["document_count"],
+            "dimension": vector_manifest["dimension"],
+        }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
+
+
+def build_schema_embeddings(args: argparse.Namespace, schemas: dict[str, dict[str, Any]], paths: PreparedPaths) -> dict[str, Any]:
+    try:
+        from askdata.embeddings import BuildEmbeddingClient
+        from askdata.vector_store import BuildSchemaVectorIndex
+    except ModuleNotFoundError:
+        from embeddings import BuildEmbeddingClient
+        from vector_store import BuildSchemaVectorIndex
+
+    client = BuildEmbeddingClient(
+        provider=args.embedding_provider,
+        model=args.embedding_model,
+        api_base=args.embedding_api_base,
+        api_key=args.embedding_api_key,
+        dimension=args.embedding_dimension,
+    )
+    return BuildSchemaVectorIndex(
+        schemas=schemas,
+        out_dir=paths.out_dir,
+        embedding_client=client,
+        embedding_provider=args.embedding_provider,
+        embedding_model=args.embedding_model,
+        vector_store=args.vector_store,
+        batch_size=args.embedding_batch_size,
+    )
 
 
 def resolve_paths(raw_dir: Path, db_dir: Path, out_dir: Path) -> PreparedPaths:
@@ -159,6 +237,8 @@ def copy_sqlite_databases(paths: PreparedPaths) -> dict[str, Path]:
 
     copied: dict[str, Path] = {}
     for source_db in sorted(source_root.glob("*/*.sqlite")):
+        if is_artifact_path(source_db):
+            continue
         database_id = source_db.stem
         target_dir = paths.db_dir / database_id
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -169,6 +249,15 @@ def copy_sqlite_databases(paths: PreparedPaths) -> dict[str, Path]:
     if not copied:
         raise SystemExit(f"No SQLite databases found under {source_root}")
     return copied
+
+
+def is_artifact_path(path: Path) -> bool:
+    return any(
+        part == "__MACOSX"
+        or part == ".DS_Store"
+        or part.startswith("._")
+        for part in path.parts
+    )
 
 
 def build_and_write_schemas(
@@ -228,7 +317,7 @@ def build_schema(database_id: str, db_path: Path, metadata: dict[str, Any], ques
 
     return {
         "database_id": database_id,
-        "db_path": relpath(db_path),
+        "database_path": relpath(db_path),
         "table_count": len(tables),
         "column_count": sum(len(table["columns"]) for table in tables),
         "question_count": question_count,
@@ -517,7 +606,7 @@ def build_databases_index(
         rows.append(
             {
                 "database_id": database_id,
-                "db_path": relpath(copied_db_paths[database_id]),
+                "database_path": relpath(copied_db_paths[database_id]),
                 "schema_path": relpath(paths.schemas_dir / f"{database_id}.json"),
                 "schema_prompt_path": relpath(paths.schema_prompts_dir / f"{database_id}.md"),
                 "table_count": schema["table_count"],
@@ -574,6 +663,7 @@ def write_report(
     selected_questions: list[dict[str, Any]],
     validation_by_id: dict[str, dict[str, Any]],
     args: argparse.Namespace,
+    vector_manifest: dict[str, Any] | None = None,
 ) -> None:
     failures = [
         {
@@ -621,8 +711,16 @@ def write_report(
             "validate_sql": args.validate_sql,
             "build_cache": args.build_cache,
             "max_rows": args.max_rows,
+            "build_embeddings": args.build_embeddings,
+            "embedding_provider": args.embedding_provider,
+            "embedding_model": args.embedding_model,
+            "embedding_batch_size": args.embedding_batch_size,
+            "vector_store": args.vector_store,
         },
     }
+    if vector_manifest:
+        report["outputs"]["vector_index"] = relpath(paths.out_dir / "vector_index")
+        report["vector_index"] = vector_manifest
     write_json(paths.out_dir / "preprocess_report.json", report)
 
 

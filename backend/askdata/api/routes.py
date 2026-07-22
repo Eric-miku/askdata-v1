@@ -2,28 +2,44 @@
 API 路由定义 —— 所有 HTTP 接口的入口
 
 本文件实现了以下接口:
-  1. GET  /api/metadata/databases        — 获取数据库列表
-  2. GET  /api/metadata/{database_id}/tables — 获取表结构
-  3. POST /api/sessions                  — 创建会话
-  4. DELETE /api/sessions/{session_id}    — 删除会话
-  5. POST /api/query                     — 自然语言查询（核心接口）
+  1. GET    /api/metadata/databases              — 获取数据库列表
+  2. GET    /api/metadata/{database_id}/tables   — 获取表结构
+  3. GET    /api/sessions                        — 获取会话列表
+  4. POST   /api/sessions                        — 创建会话
+  5. GET    /api/sessions/{session_id}           — 获取会话详情（含历史）
+  6. PATCH  /api/sessions/{session_id}           — 更新会话（如切换数据库）
+  7. DELETE /api/sessions/{session_id}           — 删除会话
+  8. POST   /api/sessions/{session_id}/reset     — 重置会话（清空历史）
+  9. POST   /api/query                           — 自然语言查询（核心接口）
 
 设计原则:
   - 每个接口都记录 Trace 日志
   - 异常统一由全局异常处理器捕获，返回一致的错误格式
-  - 核心 /api/query 接口暂时返回占位数据，待 AI 组和 DB 组实现后对接
+  - /api/query 调用 AgentGraph 工作流，执行 NL2SQL 全链路：
+    SemanticRetriever → LLM(ReAct/One-Shot) → SQLExecutor → ResultAnalyzer
+  - /api/sessions/* 接口为前端提供完整的会话管理和历史记录功能，
+    与 LangGraph SqliteSaver 检查点机制配合，实现多轮对话持久化
+  - 核心 /api/query 接口通过 AgentGraph → ReActSqlAgent 完成 NL2SQL 全链路
 """
 
-import os
-import glob
 import sqlite3
-from typing import List, Optional
+from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException
-from askdata.api.schemas import QueryRequest, QueryResponse
+from fastapi import APIRouter, HTTPException, Query
+from askdata.api.schemas import (
+    QueryRequest,
+    QueryResponse,
+    SessionCreateRequest,
+    SessionCreateResponse,
+    SessionItem,
+    SessionListResponse,
+    SessionDetailResponse,
+    SessionUpdateRequest,
+)
 from askdata.api.trace import TraceLogger
 from askdata.api.session_manager import session_manager
-from askdata.agent.graph import AgentGraph
+from askdata.agent.graph import AgentGraph, RunAgent
 from askdata.core.config import settings
 from askdata.core.paths import project_path
 
@@ -36,54 +52,69 @@ router = APIRouter()
 # 辅助函数
 # ============================================================
 
-def _get_bird_databases_dir() -> str:
+
+def _CountTables(db_path: str) -> int:
+    """统计 SQLite 数据库中的表数量（仅查询 COUNT，更高效）"""
+    try:
+        connection = sqlite3.connect(db_path)
+        try:
+            cursor = connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+            return cursor.fetchone()[0]
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return 0
+
+
+def _get_bird_databases_dir() -> Path:
     """获取 BIRD 数据库文件存放目录的绝对路径
 
     settings.BIRD_DATA_DIR 是相对于项目根的路径配置（如 "../data/bird"），
     这里需要解析为绝对路径。
 
     Returns:
-        databases 目录的绝对路径
+        databases 目录的 Path 对象
     """
-    return str(project_path(settings.BIRD_DATA_DIR) / "databases")
+    return project_path(settings.BIRD_DATA_DIR) / "databases"
 
 
-def _scan_databases() -> List[dict]:
+def _scan_databases() -> list[dict]:
     """扫描 data/bird/databases/ 下的所有 SQLite 数据库文件
 
     遍历目录，找到所有 .db 或 .sqlite 文件，返回数据库元信息列表。
 
     Returns:
-        数据库列表，每项包含 id, name, tables_count（目前为占位 0）
+        数据库列表，每项包含 id, name, tables_count
     """
     databases_dir = _get_bird_databases_dir()
     databases = []
 
     # 如果目录不存在，返回空列表
-    if not os.path.exists(databases_dir):
+    if not databases_dir.exists():
         return databases
 
-    # 查找所有 .db 文件
-    db_files = glob.glob(os.path.join(databases_dir, "**", "*.db"), recursive=True)
-    db_files += glob.glob(os.path.join(databases_dir, "**", "*.sqlite"), recursive=True)
+    # 查找所有 .db 和 .sqlite 文件
+    db_files = list(databases_dir.rglob("*.db")) + list(databases_dir.rglob("*.sqlite"))
 
     seen = set()
     for db_path in db_files:
         # 用文件名（不含扩展名）作为数据库 ID
-        db_id = os.path.splitext(os.path.basename(db_path))[0]
+        db_id = db_path.stem
         if db_id not in seen:
             seen.add(db_id)
             databases.append({
                 "id": db_id,
-                "name": db_id.replace("_", " ").title(),  # 将下划线转换为可读名称
-                "path": db_path,
-                "tables_count": 0,   # TODO: 后续接入 SQLAlchemy 后读取实际表数量
+                "name": db_id.replace("_", " ").title(),
+                "path": str(db_path),           # 转为 str，保持类型一致
+                "tables_count": _CountTables(str(db_path)),  # 使用高效 COUNT 查询
             })
 
     return databases
 
 
-def _read_sqlite_tables(db_path: str) -> List[dict]:
+def _read_sqlite_tables(db_path: str) -> list[dict]:
     """Read table and column metadata from a SQLite database."""
     connection = sqlite3.connect(db_path)
     try:
@@ -124,8 +155,8 @@ async def list_databases():
 
     返回示例:
         [
-            {"id": "california_schools", "name": "California Schools", "tables_count": 0},
-            {"id": "debit_card_specializing", "name": "Debit Card Specializing", "tables_count": 0}
+            {"id": "california_schools", "name": "California Schools", "tables_count": 8},
+            {"id": "debit_card_specializing", "name": "Debit Card Specializing", "tables_count": 5}
         ]
     """
     trace = TraceLogger()
@@ -161,10 +192,6 @@ async def get_tables(database_id: str):
                 }
             ]
         }
-
-    注意:
-        目前返回占位数据。待 db/executor.py 实现后，
-        将使用 SQLAlchemy 实时读取数据库表结构。
     """
     trace = TraceLogger()
     trace.log("查询表结构", f"database_id={database_id}")
@@ -194,13 +221,72 @@ async def get_tables(database_id: str):
     }
 
 
-@router.post("/sessions")
-async def create_session(database_id: Optional[str] = None):
+# ============================================================
+# 会话管理路由
+# ============================================================
+
+@router.get("/sessions", response_model=SessionListResponse)
+async def list_sessions(
+    limit: int = Query(50, ge=1, le=200, description="返回条数上限"),
+    offset: int = Query(0, ge=0, description="分页偏移量"),
+):
+    """
+    获取会话列表
+
+    返回所有会话的摘要信息，按最后更新时间降序排列（最新在最前）。
+    供前端会话侧边栏/下拉框使用，展示历史会话列表。
+
+    用法:
+        GET /api/sessions
+        GET /api/sessions?limit=10&offset=0
+
+    返回:
+        {
+            "sessions": [
+                {
+                    "session_id": "a1b2c3d4-...",
+                    "thread_id": "a1b2c3d4-...",
+                    "created_at": 1704067200.0,
+                    "updated_at": 1704067300.0,
+                    "database_id": "california_schools",
+                    "question_count": 3
+                }
+            ],
+            "total": 1
+        }
+    """
+    trace = TraceLogger()
+    trace.log("获取会话列表", f"limit={limit}, offset={offset}")
+
+    sessions_list, total = await session_manager.list_sessions(
+        limit=limit, offset=offset
+    )
+
+    # 将原始 dict 转换为 SessionItem 模型
+    items = []
+    for s in sessions_list:
+        history = s.get("history", [])
+        items.append(SessionItem(
+            session_id=s["session_id"],
+            thread_id=s.get("thread_id", s["session_id"]),
+            created_at=s["created_at"],
+            updated_at=s.get("updated_at", s["created_at"]),
+            database_id=s.get("database_id"),
+            question_count=len(history),
+        ))
+
+    trace.log("返回会话列表", f"共 {total} 个会话，返回 {len(items)} 条")
+    return SessionListResponse(sessions=items, total=total)
+
+
+@router.post("/sessions", response_model=SessionCreateResponse)
+async def create_session(body: SessionCreateRequest):
     """
     创建新的对话会话
 
-    为多轮对话创建一个会话。前端在用户首次提问或切换数据库时调用。
-    返回的 session_id 需要在后续的 /api/query 请求中传递。
+    为多轮对话创建一个新会话。每次创建同时生成一个 LangGraph thread_id
+    （与 session_id 相同），SqliteSaver 检查点机制据此持久化 Agent 状态。
+    返回的 session_id 需在后续 /api/query 请求中传递。
 
     用法:
         POST /api/sessions
@@ -209,19 +295,110 @@ async def create_session(database_id: Optional[str] = None):
     返回:
         {
             "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-            "created_at": 1704067200.0
+            "thread_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "created_at": 1704067200.0,
+            "database_id": "california_schools"
         }
     """
     trace = TraceLogger()
-    trace.log("创建会话", f"database_id={database_id}")
+    trace.log("创建会话", f"database_id={body.database_id}")
 
-    session_id = await session_manager.create_session(database_id)
+    session_id = await session_manager.create_session(body.database_id)
+    session_data = await session_manager.get_session(session_id)
 
-    trace.log("会话创建成功", f"session_id={session_id}")
-    return {
-        "session_id": session_id,
-        "created_at": (await session_manager.get_session(session_id))["created_at"],
-    }
+    trace.log("会话创建成功",
+              f"session_id={session_id}, thread_id={session_data['thread_id']}")
+
+    return SessionCreateResponse(
+        session_id=session_id,
+        thread_id=session_data["thread_id"],
+        created_at=session_data["created_at"],
+        database_id=session_data.get("database_id"),
+    )
+
+
+@router.get("/sessions/{session_id}", response_model=SessionDetailResponse)
+async def get_session_detail(session_id: str):
+    """
+    获取会话详情（含历史记录）
+
+    返回指定会话的完整信息，包括对话历史记录。
+    前端在切换到某个历史会话时调用此接口，恢复对话上下文。
+
+    用法:
+        GET /api/sessions/a1b2c3d4-e5f6-7890-abcd-ef1234567890
+
+    返回:
+        {
+            "session_id": "a1b2c3d4-...",
+            "thread_id": "a1b2c3d4-...",
+            "created_at": 1704067200.0,
+            "updated_at": 1704067300.0,
+            "database_id": "california_schools",
+            "history": [
+                {
+                    "question": "加州哪个学校学生最多？",
+                    "sql": "SELECT ...",
+                    "answer": "..., 共有 1000 名学生",
+                    "timestamp": 1704067250.0
+                }
+            ]
+        }
+    """
+    trace = TraceLogger()
+    trace.log("获取会话详情", f"session_id={session_id}")
+
+    session_data = await session_manager.get_session(session_id)
+    if session_data is None:
+        trace.log("会话未找到", f"session_id={session_id}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"会话 '{session_id}' 未找到",
+        )
+
+    trace.log("返回会话详情",
+              f"session_id={session_id}, history={len(session_data.get('history', []))}条")
+
+    return SessionDetailResponse(
+        session_id=session_data["session_id"],
+        thread_id=session_data.get("thread_id", session_data["session_id"]),
+        created_at=session_data["created_at"],
+        updated_at=session_data.get("updated_at", session_data["created_at"]),
+        database_id=session_data.get("database_id"),
+        history=session_data.get("history", []),
+    )
+
+
+@router.patch("/sessions/{session_id}")
+async def update_session(session_id: str, body: SessionUpdateRequest):
+    """
+    更新会话属性（如切换关联数据库）
+
+    前端在用户切换数据库时调用，更新会话绑定的数据库 ID。
+
+    用法:
+        PATCH /api/sessions/a1b2c3d4-...
+        Body: {"database_id": "debit_card_specializing"}
+
+    返回:
+        {"success": true, "message": "会话已更新"}
+    """
+    trace = TraceLogger()
+    trace.log("更新会话", f"session_id={session_id}, database_id={body.database_id}")
+
+    success = await session_manager.update_session(
+        session_id=session_id,
+        database_id=body.database_id,
+    )
+    if not success:
+        trace.log("会话未找到", f"session_id={session_id}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"会话 '{session_id}' 未找到",
+        )
+
+    trace.log("会话更新成功", f"session_id={session_id}")
+    return {"success": True, "message": "会话已更新"}
 
 
 @router.delete("/sessions/{session_id}")
@@ -229,7 +406,8 @@ async def delete_session(session_id: str):
     """
     删除指定的对话会话
 
-    前端在用户关闭对话或切换数据库时调用，用于清理服务端保存的会话历史。
+    前端在用户关闭对话或清理历史时调用。
+    删除会话会同时移除其对应的 LangGraph 检查点数据。
 
     用法:
         DELETE /api/sessions/a1b2c3d4-e5f6-7890-abcd-ef1234567890
@@ -255,18 +433,59 @@ async def delete_session(session_id: str):
     }
 
 
+@router.post("/sessions/{session_id}/reset")
+async def reset_session(session_id: str):
+    """
+    重置会话（清空历史记录，保留会话和 thread_id）
+
+    前端在用户点击"新建对话"（但保持同一会话）时调用。
+    清空历史后，后续 /api/query 请求会使用同一个 session_id，
+    但不再携带之前的对话上下文。
+
+    用法:
+        POST /api/sessions/a1b2c3d4-e5f6-7890-abcd-ef1234567890/reset
+
+    返回:
+        {"success": true, "message": "会话已重置", "session_id": "..."}
+    """
+    trace = TraceLogger()
+    trace.log("重置会话", f"session_id={session_id}")
+
+    success = await session_manager.clear_history(session_id)
+    if not success:
+        trace.log("会话未找到", f"session_id={session_id}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"会话 '{session_id}' 未找到",
+        )
+
+    trace.log("会话重置成功", f"session_id={session_id}")
+    return {
+        "success": True,
+        "message": "会话已重置",
+        "session_id": session_id,
+    }
+
+
 @router.post("/query", response_model=QueryResponse)
 async def execute_query(request: QueryRequest):
     """
     核心接口：自然语言查询转 SQL
 
-    这是系统的核心功能。用户传入自然语言问题，系统经历以下流程:
+    用户传入自然语言问题，系统经历以下流程:
     1. 创建 Trace 日志记录器
     2. 解析请求参数（question, database_id, session_id）
     3. 查找或创建会话（如果传了 session_id 则恢复历史）
-    4. 调用 Agent 工作流（等待 AI 组实现 agent/graph.py）
+    4. 调用 AgentGraph 工作流（graph.py）：
+       - SemanticRetriever 获取数据库 schema 上下文
+       - LLM 生成 SQL / ReAct 工具调用循环
+       - SQLExecutor 执行并验证 SQL
+       - ResultAnalyzer 生成中文解释
     5. 将结果存入会话历史
     6. 返回 QueryResponse（包含 SQL、数据、图表配置和中文解释）
+
+    注意:
+        调用 AgentGraph → ReActSqlAgent 完成 NL2SQL 全链路。
 
     用法:
         POST /api/query
@@ -275,31 +494,29 @@ async def execute_query(request: QueryRequest):
             "database_id": "california_schools",
             "session_id": "a1b2c3d4-..."  (可选)
         }
-
-    注意:
-        目前返回占位数据，方便前端先行开发。
-        待 AI 组实现 agent/graph.py 后，将替换为真实的 Agent 调用链。
     """
     trace = TraceLogger()
     trace.log("收到查询请求", f"question='{request.question}', database_id='{request.database_id}'")
 
-    # ---------- 会话管理 ----------
+    # ---------- 会话管理（与 LangGraph SqliteSaver 检查点协同） ----------
     session_id = request.session_id
     if session_id:
-        # 如果前端传了 session_id，查找是否存在
         session = await session_manager.get_session(session_id)
         if session is None:
             trace.log("会话未找到，创建新会话", f"session_id={session_id}")
             session_id = await session_manager.create_session(request.database_id)
         else:
-            # 如果会话关联的数据库不同，更新它
             if session["database_id"] != request.database_id:
-                await session_manager.update_database(session_id, request.database_id)
+                await session_manager.update_session(
+                    session_id, database_id=request.database_id
+                )
                 trace.log("更新会话数据库", f"new_database_id={request.database_id}")
     else:
-        # 没有 session_id，创建一个新会话
         session_id = await session_manager.create_session(request.database_id)
         trace.log("创建新会话", f"session_id={session_id}")
+
+    # 获取 LangGraph thread_id（用于 SqliteSaver 检查点恢复）
+    thread_id = session_manager.get_thread_id(session_id)
 
     history = await session_manager.get_history(session_id) or []
     session_context = {}
@@ -310,23 +527,32 @@ async def execute_query(request: QueryRequest):
             "last_sql": last_item.get("sql"),
         }
 
+    # ---------- 调用 Agent 工作流（传入 thread_id 以启用检查点） ----------
     try:
-        result = await AgentGraph().ARun(
+        # 使用 AgentGraph 执行完整的 NL2SQL 工作流
+        # thread_id 传递给 LangGraph 的 configurable，
+        # SqliteSaver 据此自动保存/恢复 Agent 的多轮对话状态
+        result = await RunAgent(
             question=request.question,
             database_id=request.database_id,
             session_context=session_context,
+            thread_id=thread_id,  # 启用 LangGraph 检查点持久化
         )
+
+        # 合并 API 层 Trace + Agent 层 Trace
+        combined_trace = trace.get_logs() + result.get("trace", [])
+
         response = QueryResponse(
             answer=result["answer"],
             sql=result.get("sql"),
             columns=result.get("columns"),
             rows=result.get("rows"),
             chart=result.get("chart"),
-            trace=result.get("trace", []),
+            trace=combined_trace,
             error=result.get("error"),
         )
     except Exception as exc:
-        trace.log("查询失败", str(exc))
+        trace.log("查询失败", str(exc), status="error")
         response = QueryResponse(
             answer="查询失败，请稍后重试或换一种问法。",
             sql=None,
