@@ -1,10 +1,11 @@
 import { Alert, Collapse, Divider, Space, Typography } from "antd";
 import type { QueryResponse } from "../types/query";
 import { ResultTable } from "./ResultTable";
+import SqlPanel from "./SqlPanel";
 
 interface QueryResultViewProps {
-  result?: QueryResponse | null;
-  loading?: boolean;
+  turn: ChatTurn;
+  onRetry: (turnId: string) => void;
 }
 
 export function QueryResultView({

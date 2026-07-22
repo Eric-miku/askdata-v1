@@ -33,7 +33,25 @@ interface QueryState {
 
 }
 
+export interface QueryState {
+  database: string;
+  databases: DatabaseInfo[];
+  databasesLoading: boolean;
+  databaseError: string | null;
+  sessionId: string | null;
+  turns: ChatTurn[];
+  loading: boolean;
+  validationError: string | null;
+  loadDatabases: () => Promise<void>;
+  selectDatabase: (databaseId: string) => Promise<void>;
+  newChat: () => Promise<void>;
+  sendMessage: (question: string) => Promise<void>;
+  retryTurn: (turnId: string) => Promise<void>;
+}
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 export const useQueryStore=create<QueryState>((set,get)=>({
 
@@ -133,4 +151,4 @@ executeQuery:async()=>{
 
 }
 
-}));
+export const useQueryStore = createQueryStore();

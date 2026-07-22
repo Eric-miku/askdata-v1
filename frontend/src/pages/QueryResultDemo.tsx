@@ -8,6 +8,10 @@ import QueryInput from "../components/QueryInput";
 import { useQueryStore } from "../store/queryStore";
 import { useSessionStore } from "../store/sessionStore";
 
+interface QueryResultDemoProps {
+  theme: ThemeMode;
+  onToggleTheme: () => void;
+}
 
 export function QueryResultDemo() {
 

@@ -1,3 +1,6 @@
+import { useEffect, useState } from "react";
+import { ConfigProvider, theme as antdTheme } from "antd";
+import zhCN from "antd/locale/zh_CN";
 import { QueryResultDemo } from "./pages/QueryResultDemo";
 import HistorySidebar from "./components/HistorySidebar";
 
