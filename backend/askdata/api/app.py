@@ -111,10 +111,10 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://7.59.11.153:5173",
-        "http://7.59.11.153:5174",
+        "http://localhost:5173",   # Vite 开发服务器
+        "http://localhost:3000",   # 备选端口
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:3000",
     ],
     allow_credentials=True,   # 允许携带 Cookie
     allow_methods=["*"],      # 允许所有 HTTP 方法（GET, POST, DELETE 等）
