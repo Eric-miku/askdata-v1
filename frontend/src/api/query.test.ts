@@ -16,6 +16,7 @@ import {
   createSession,
   deleteSession,
   executeSql,
+  listSessions,
   listDatabases,
   queryData,
 } from "./query";
@@ -33,6 +34,12 @@ describe("query API", () => {
 
     await expect(listDatabases()).resolves.toEqual(databases);
     expect(client.get).toHaveBeenCalledWith("/metadata/databases");
+  });
+
+  it("rejects malformed database metadata instead of returning HTML as data", async () => {
+    client.get.mockResolvedValue({ data: "<!doctype html>" });
+
+    await expect(listDatabases()).rejects.toThrow("数据库列表响应格式异常");
   });
 
   it("creates a session with the backend query parameter contract", async () => {
@@ -84,5 +91,11 @@ describe("query API", () => {
 
     await expect(executeSql(request)).resolves.toEqual(response);
     expect(client.post).toHaveBeenCalledWith("/query/execute-sql", request);
+  });
+
+  it("rejects malformed session lists instead of returning undefined", async () => {
+    client.get.mockResolvedValue({ data: { sessions: "<!doctype html>" } });
+
+    await expect(listSessions()).rejects.toThrow("会话列表响应格式异常");
   });
 });

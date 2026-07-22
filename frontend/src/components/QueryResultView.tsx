@@ -1,5 +1,11 @@
-import { Alert, Collapse, Divider, Space, Typography } from "antd";
-import type { QueryResponse } from "../types/query";
+import { useEffect, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { executeSql } from "../api/query";
+import type { ChatTurn, QueryResponse } from "../types/query";
+import { buildChartFromRows } from "../utils/chartBuilder";
+import AgentTrace from "./AgentTrace";
+import { ResultChart } from "./ResultChart";
 import { ResultTable } from "./ResultTable";
 import SqlPanel from "./SqlPanel";
 
@@ -8,198 +14,82 @@ interface QueryResultViewProps {
   onRetry: (turnId: string) => void;
 }
 
-export function QueryResultView({
-  result,
-  loading = false,
-}: QueryResultViewProps) {
+export function QueryResultView({ turn, onRetry }: QueryResultViewProps) {
+  const [restored, setRestored] = useState<QueryResponse | null>(null);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+  const response = restored || turn.response;
+  const needsRestore = Boolean(
+    turn.status === "success" && turn.databaseId && response?.sql && response.columns === null && response.rows === null,
+  );
 
-  if (!result && !loading) {
-    return null;
-  }
+  useEffect(() => {
+    let active = true;
+    if (!needsRestore || !turn.databaseId || !response?.sql) return undefined;
+    setRestoreError(null);
+    void executeSql({ database_id: turn.databaseId, sql: response.sql })
+      .then((result) => {
+        if (!active) return;
+        setRestored({
+          ...response,
+          ...result,
+          chart: result.chart ?? buildChartFromRows(result.columns, result.rows),
+          sql: response.sql,
+        });
+      })
+      .catch((error) => {
+        if (active) setRestoreError(error instanceof Error ? error.message : String(error));
+      });
+    return () => { active = false; };
+  }, [needsRestore, response, turn.databaseId]);
 
-
+  const loading = turn.status === "loading" || needsRestore;
+  const error = turn.error || response?.error || restoreError;
   return (
-    <main className="query-result">
-
-
-      {result?.error ? (
-        <Alert
-          type="error"
-          showIcon
-          message="查询失败"
-          description={result.error}
-        />
+    <article className="chat-turn" aria-busy={loading}>
+      <header className="chat-turn__question">{turn.question}</header>
+      <div className="chat-turn__assistant">
+        <div className="chat-turn__identity">
+          <span className="chat-turn__mark">A</span>
+          <span>AskData</span>
+          {loading ? <small>Working</small> : null}
+        </div>
+      {loading ? (
+        <div className="answer-loading" role="status">
+          <span />
+          <span />
+          <span />
+          <p>查询中...</p>
+        </div>
       ) : null}
-
-
-
-      <section className="query-result__section">
-
-        <Typography.Title level={4}>
-          回答
-        </Typography.Title>
-
-
-        <Typography.Paragraph className="query-result__answer">
-
-          {result?.answer || (loading ? "查询中..." : "-")}
-
-        </Typography.Paragraph>
-
-      </section>
-
-
-
-
-      {result?.sql ? (
-
-        <section className="query-result__section">
-
-          <Typography.Title level={4}>
-            SQL
-          </Typography.Title>
-
-
-          <pre className="query-result__sql">
-
-            <code>
-              {result.sql}
-            </code>
-
-          </pre>
-
-
+      {error ? (
+        <div className="chat-turn__error" role="alert">
+          <div>
+            <strong>查询失败</strong>
+            <p>{error}</p>
+          </div>
+          <button type="button" onClick={() => onRetry(turn.id)}>重试</button>
+        </div>
+      ) : null}
+      {response?.answer ? (
+        <div className="chat-turn__answer">
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{response.answer}</ReactMarkdown>
+        </div>
+      ) : null}
+      {response?.sql ? <SqlPanel sql={response.sql} /> : null}
+      {response?.chart ? (
+        <section className="chat-turn__result">
+          <header><strong>可视化</strong></header>
+          <ResultChart chart={response.chart} loading={loading} />
         </section>
-
       ) : null}
-
-
-
-
-
-      {result?.chart ? (
-
-        <section className="query-result__section">
-
-          <Typography.Title level={4}>
-            图表
-          </Typography.Title>
-
-
-          <Alert
-
-            type="info"
-
-            showIcon
-
-            message="图表配置已返回"
-
-            description="chart_builder 的最终格式确定后，可在这里接入 ECharts 渲染组件。"
-
-          />
-
-
+      {response ? (
+        <section className="chat-turn__result">
+          <header><strong>查询结果</strong></header>
+          <ResultTable columns={response.columns} rows={response.rows} loading={loading} />
         </section>
-
       ) : null}
-
-
-
-
-
-      <section className="query-result__section">
-
-        <Typography.Title level={4}>
-          数据表
-        </Typography.Title>
-
-
-        <ResultTable
-
-          columns={result?.columns}
-
-          rows={result?.rows}
-
-          loading={loading}
-
-        />
-
-
-      </section>
-
-
-
-
-
-
-      {result?.trace?.length ? (
-
-        <>
-
-          <Divider />
-
-
-          <Collapse
-
-            items={[
-              {
-
-                key: "trace",
-
-                label: "Agent Trace",
-
-
-                children: (
-
-                  <Space
-
-                    direction="vertical"
-
-                    size={8}
-
-                    className="query-result__trace"
-
-                  >
-
-
-                    {result.trace.map((item) => (
-
-
-                      <Typography.Text
-
-                        code
-
-                        key={item.step}
-
-                      >
-
-                        {`Step ${item.step} [${item.status}] : ${item.message}`}
-
-
-                      </Typography.Text>
-
-
-                    ))}
-
-
-
-                  </Space>
-
-                ),
-
-              },
-
-            ]}
-
-          />
-
-        </>
-
-
-      ) : null}
-
-
-
-    </main>
+      {response?.trace?.length ? <AgentTrace steps={response.trace} /> : null}
+      </div>
+    </article>
   );
 }

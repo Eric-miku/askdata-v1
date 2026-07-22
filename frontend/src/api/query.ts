@@ -1,10 +1,15 @@
 import axios from "axios";
-import type { QueryResponse } from "../types/query";
+import type {
+  DatabaseInfo,
+  QueryResponse,
+  SessionDetail,
+  SessionInfo,
+} from "../types/query";
 
-
-interface QueryRequest {
-  database_id:string;
-  question:string;
+export interface QueryRequest {
+  database_id: string;
+  question: string;
+  session_id?: string;
 }
 
 export interface ExecuteSqlRequest {
@@ -18,18 +23,45 @@ export type ExecuteSqlResponse = Pick<
 >;
 
 const api = axios.create({
-  baseURL: API_BASE_URL,
+  baseURL: import.meta.env.VITE_API_BASE_URL || "/api",
 });
 
+function requireArray<T>(value: unknown, label: string): T[] {
+  if (Array.isArray(value)) {
+    return value as T[];
+  }
+  throw new Error(`${label}响应格式异常，请确认后端服务已启动，或 Vite /api 代理配置正确。`);
+}
+
 export async function listDatabases(): Promise<DatabaseInfo[]> {
-  const response = await api.get<DatabaseInfo[]>("/metadata/databases");
-  return response.data;
+  const response = await api.get<unknown>("/metadata/databases");
+  return requireArray<DatabaseInfo>(response.data, "数据库列表");
 }
 
 export async function createSession(databaseId: string): Promise<SessionInfo> {
   const response = await api.post<SessionInfo>("/sessions", null, {
     params: { database_id: databaseId },
   });
+  return response.data;
+}
+
+export async function listSessions(): Promise<SessionInfo[]> {
+  const response = await api.get<unknown>("/sessions");
+  if (
+    response.data &&
+    typeof response.data === "object" &&
+    "sessions" in response.data
+  ) {
+    return requireArray<SessionInfo>(
+      (response.data as { sessions: unknown }).sessions,
+      "会话列表",
+    );
+  }
+  throw new Error("会话列表响应格式异常，请确认后端服务已启动，或 Vite /api 代理配置正确。");
+}
+
+export async function getSession(sessionId: string): Promise<SessionDetail> {
+  const response = await api.get<SessionDetail>(`/sessions/${encodeURIComponent(sessionId)}`);
   return response.data;
 }
 
@@ -42,9 +74,7 @@ export async function queryData(data: QueryRequest): Promise<QueryResponse> {
   return response.data;
 }
 
-export async function executeSql(
-  data: ExecuteSqlRequest,
-): Promise<ExecuteSqlResponse> {
+export async function executeSql(data: ExecuteSqlRequest): Promise<ExecuteSqlResponse> {
   const response = await api.post<ExecuteSqlResponse>("/query/execute-sql", data);
   return response.data;
 }
