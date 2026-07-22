@@ -123,6 +123,18 @@ function buildAxisOption(chart: ChartRecord): EChartsOption {
   } as EChartsOption;
 }
 
+function buildHorizontalOption(chart: ChartRecord): EChartsOption {
+  return {
+    title: buildTitle(chart),
+    tooltip: { trigger: "axis" },
+    legend: { type: "scroll", top: chart.title ? 28 : 0 },
+    grid: { top: chart.title ? 68 : 40, right: 28, bottom: 28, left: 32, containLabel: true },
+    xAxis: { type: "value", ...asRecord(chart.xAxis) },
+    yAxis: { type: "category", ...asRecord(chart.yAxis), axisLabel: { hideOverlap: true } },
+    series: normalizeSeries(chart).map((series) => ({ ...series, type: "bar" })),
+  } as EChartsOption;
+}
+
 export function buildChartOption(chart: unknown): EChartsOption | null {
   if (!isRecord(chart)) {
     return null;
@@ -136,9 +148,42 @@ export function buildChartOption(chart: unknown): EChartsOption | null {
     return null;
   }
 
-  return getChartType(chart) === "pie"
-    ? buildPieOption(chart)
-    : buildAxisOption(chart);
+  const type = getChartType(chart);
+  if (type === "pie") return buildPieOption(chart);
+  if (type === "horizontal_bar") return buildHorizontalOption(chart);
+  return buildAxisOption(chart);
+}
+
+export type SupportedChartType = "bar" | "horizontal_bar" | "line" | "pie";
+
+export function convertChartType(chart: Record<string, unknown>, type: SupportedChartType): ChartRecord {
+  const source = chart as ChartRecord;
+  const currentType = getChartType(source);
+  const sourceSeries = normalizeSeries(source)[0] ?? {};
+  let categories: unknown[] = [];
+  let values: unknown[] = [];
+  if (currentType === "pie") {
+    const points = Array.isArray(sourceSeries.data) ? sourceSeries.data : [];
+    categories = points.map((point) => isRecord(point) ? point.name : "");
+    values = points.map((point) => isRecord(point) ? point.value : null);
+  } else if (currentType === "horizontal_bar") {
+    const axis = asRecord(source.yAxis);
+    categories = Array.isArray(axis.data) ? axis.data : [];
+    values = Array.isArray(sourceSeries.data) ? sourceSeries.data : [];
+  } else {
+    const axis = asRecord(source.xAxis);
+    categories = Array.isArray(axis.data) ? axis.data : [];
+    values = Array.isArray(sourceSeries.data) ? sourceSeries.data : [];
+  }
+  const name = typeof sourceSeries.name === "string" ? sourceSeries.name : String(source.metric ?? "数值");
+  const base: ChartRecord = { ...source, type };
+  if (type === "pie") {
+    return { ...base, xAxis: undefined, yAxis: undefined, series: [{ name, data: categories.map((category, index) => ({ name: String(category), value: values[index] })) }] };
+  }
+  if (type === "horizontal_bar") {
+    return { ...base, xAxis: { type: "value", name }, yAxis: { type: "category", data: categories }, series: [{ name, data: values }] };
+  }
+  return { ...base, xAxis: { type: "category", data: categories }, yAxis: { type: "value", name }, series: [{ name, data: values }] };
 }
 
 function isPrimitiveCategory(value: unknown): value is string | number | boolean {

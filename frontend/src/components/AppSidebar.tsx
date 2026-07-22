@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { DatabaseInfo, ThemeMode } from "../types/query";
 import {
   CloseIcon,
+  BookIcon,
   DatabaseIcon,
   MoonIcon,
   PlusIcon,
@@ -19,6 +20,8 @@ interface AppSidebarProps {
   onNewChat: () => void;
   onSelectDatabase: (databaseId: string) => void;
   onToggleTheme: () => void;
+  onManageKnowledge?: () => void;
+  onManageDataSources?: () => void;
 }
 
 export default function AppSidebar({
@@ -31,6 +34,8 @@ export default function AppSidebar({
   onNewChat,
   onSelectDatabase,
   onToggleTheme,
+  onManageKnowledge,
+  onManageDataSources,
 }: AppSidebarProps) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [search, setSearch] = useState("");
@@ -107,6 +112,15 @@ export default function AppSidebar({
           onClick={() => setDrawerOpen(true)}
         >
           <DatabaseIcon />
+        </button>
+        <button
+          type="button"
+          className="app-rail__button"
+          aria-label="业务术语管理"
+          disabled={loading}
+          onClick={onManageKnowledge}
+        >
+          <BookIcon />
         </button>
         <div className="app-rail__spacer" />
         <button
@@ -194,6 +208,7 @@ export default function AppSidebar({
             <p className="database-drawer__footnote">
               这里只显示当前账号有权访问的数据源。
             </p>
+            <button type="button" className="database-drawer__manage" onClick={() => { closeDrawer(); onManageDataSources?.(); }}>管理数据源</button>
           </aside>
         </>
       ) : null}

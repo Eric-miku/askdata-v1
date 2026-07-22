@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import json
 import re
 import threading
 import time
@@ -64,6 +65,7 @@ class ErrorCode:
     SQL_BLOCKED = "SQL_BLOCKED"       # 未通过安全校验 (危险操作 / 多语句注入 / 黑名单表)
     DB_ERROR = "DB_ERROR"             # 数据库执行报错 (语法错误、字段不存在、连接失败等)
     TIMEOUT = "TIMEOUT"               # 执行超时 (查询本身太慢, 或等不到连接池里的连接)
+    RESULT_TOO_LARGE = "RESULT_TOO_LARGE"
     UNKNOWN_ERROR = "UNKNOWN_ERROR"   # 兜底
 
 
@@ -119,6 +121,7 @@ class ExecutionResult:
     elapsed_ms: float = 0.0
     sql: str = ""
     error: Optional[ErrorInfo] = None
+    warnings: list[str] = field(default_factory=list)
 
     def to_api_format(self) -> dict:
         """
@@ -146,6 +149,7 @@ class ExecutionResult:
                 "columns": [c.to_dict() for c in self.columns],
                 "rows": self.rows,
                 "pagination": self.pagination.to_dict() if self.pagination else None,
+                "warnings": self.warnings,
             },
         }
 
@@ -164,6 +168,10 @@ class SQLExecutor:
         max_overflow: int = 5,
         pool_timeout: float = 10.0,
         engine: Optional[Engine] = None,
+        max_joins: int = 8,
+        max_subquery_depth: int = 4,
+        max_result_bytes: int = 10 * 1024 * 1024,
+        slow_query_ms: float = 2000.0,
     ):
         """
         :param db_url: SQLAlchemy 连接串
@@ -207,10 +215,17 @@ class SQLExecutor:
             )
 
         self.dialect = dialect
-        self.validator = SQLValidator(dialect=dialect, forbidden_tables=forbidden_tables)
+        self.validator = SQLValidator(
+            dialect=dialect,
+            forbidden_tables=forbidden_tables,
+            max_joins=max_joins,
+            max_subquery_depth=max_subquery_depth,
+        )
         self.default_page_size = default_page_size
         self.max_page_size = max_page_size
         self.statement_timeout_s = statement_timeout_s
+        self.max_result_bytes = max_result_bytes
+        self.slow_query_ms = slow_query_ms
 
     # ------------------------------------------------------------------
     # 主入口
@@ -296,6 +311,22 @@ class SQLExecutor:
             fetched = result.fetchmany(fetch_cap)
             rows = [dict(zip(deduped_names, r)) for r in fetched]
 
+            result_bytes = len(
+                json.dumps(rows, ensure_ascii=False, default=str, separators=(",", ":")).encode("utf-8")
+            )
+            if result_bytes > self.max_result_bytes:
+                elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+                return ExecutionResult(
+                    success=False,
+                    sql=paged_sql,
+                    elapsed_ms=elapsed_ms,
+                    error=ErrorInfo(
+                        ErrorCode.RESULT_TOO_LARGE,
+                        "查询结果过大，已停止返回",
+                        f"结果约 {result_bytes} 字节，超过上限 {self.max_result_bytes} 字节",
+                    ),
+                )
+
             total = len(rows)
             if count_sql:
                 try:
@@ -307,6 +338,11 @@ class SQLExecutor:
 
             elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
             columns = self._infer_columns(deduped_names, rows)
+            warnings = []
+            if elapsed_ms >= self.slow_query_ms:
+                warnings.append(
+                    f"慢查询：耗时 {elapsed_ms}ms，阈值 {self.slow_query_ms}ms；建议检查筛选条件、JOIN 和索引"
+                )
 
             return ExecutionResult(
                 success=True,
@@ -315,6 +351,7 @@ class SQLExecutor:
                 pagination=PaginationMeta(page=page, page_size=page_size, total=total),
                 elapsed_ms=elapsed_ms,
                 sql=paged_sql,
+                warnings=warnings,
             )
 
         except SQLAlchemyError as e:

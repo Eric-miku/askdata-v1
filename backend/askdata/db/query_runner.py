@@ -163,7 +163,7 @@ def build_sqlite_engine(db_url: str, **create_engine_kwargs) -> Engine:
     return engine
 
 
-def Execute(sql: str, database_path: str, page_size: int = 1000) -> dict:
+def Execute(sql: str, database_path: str, page_size: int = 1000, access_mode: str = "query") -> dict:
     """Execute a read-only SQLite query using the shared resilient executor.
 
     This small adapter is the application-facing query contract used by the
@@ -172,28 +172,55 @@ def Execute(sql: str, database_path: str, page_size: int = 1000) -> dict:
     database for a misspelled path, which turns a configuration error into a
     misleading SQL error.
     """
+    from askdata.security.permissions import PrepareCurrentSql
+
+    allowed, reason, executable_sql = PrepareCurrentSql(sql, access_mode)
+    if not allowed:
+        return {
+            "success": False,
+            "error": reason or "SQL permission denied.",
+            "error_code": "PERMISSION_DENIED",
+        }
+
     path = Path(database_path)
     if not path.is_file():
-        return {"success": False, "error": f"SQLite database does not exist: {path}"}
+        return {
+            "success": False,
+            "error": f"SQLite database does not exist: {path}",
+            "error_code": "DB_NOT_FOUND",
+        }
 
     from askdata.db.executor import SQLExecutor
+    from askdata.core.config import settings
+
+    row_limit = settings.EXPORT_MAX_ROWS if access_mode == "export" else settings.QUERY_MAX_ROWS
+    effective_page_size = min(page_size, row_limit)
 
     result = SQLExecutor(
         f"sqlite:///{path.resolve()}",
         dialect="sqlite",
-        default_page_size=page_size,
-        max_page_size=page_size,
-    ).execute(sql, page_size=page_size)
+        default_page_size=effective_page_size,
+        max_page_size=effective_page_size,
+        max_joins=settings.SQL_MAX_JOINS,
+        max_subquery_depth=settings.SQL_MAX_SUBQUERY_DEPTH,
+        max_result_bytes=settings.MAX_RESULT_BYTES,
+        statement_timeout_s=settings.SQL_STATEMENT_TIMEOUT_SECONDS,
+        slow_query_ms=settings.SLOW_QUERY_MS,
+    ).execute(executable_sql, page_size=effective_page_size)
     if not result.success:
         error = result.error
         return {
             "success": False,
             "error": (error.detail or error.message) if error else "SQL execution failed.",
+            "error_code": error.code if error else "UNKNOWN_ERROR",
+            "elapsed_ms": result.elapsed_ms,
         }
     return {
         "success": True,
         "columns": [column.key for column in result.columns],
         "rows": result.rows,
-        "sql": result.sql,
+        "sql": sql,
         "pagination": result.pagination.to_dict() if result.pagination else None,
+        "elapsed_ms": result.elapsed_ms,
+        "warnings": result.warnings,
     }

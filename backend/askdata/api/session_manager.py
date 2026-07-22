@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sqlite3
 import time
 import uuid
@@ -21,7 +22,7 @@ class SessionManager:
     """
 
     def __init__(self, checkpoint_dir: Optional[str] = None):
-        self.checkpoint_dir = Path(checkpoint_dir or Path.cwd() / ".checkpoints")
+        self.checkpoint_dir = Path(checkpoint_dir or os.getenv("ASKDATA_STATE_DIR") or Path.cwd() / ".checkpoints")
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_path = self.checkpoint_dir / "sessions.sqlite"
         self._lock = asyncio.Lock()
@@ -43,7 +44,8 @@ class SessionManager:
                     thread_id TEXT NOT NULL UNIQUE,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
-                    database_id TEXT
+                    database_id TEXT,
+                    user_id TEXT NOT NULL DEFAULT 'local-user'
                 );
                 CREATE TABLE IF NOT EXISTS session_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,6 +58,14 @@ class SessionManager:
                 CREATE INDEX IF NOT EXISTS idx_session_history_session_time
                     ON session_history(session_id, timestamp, id);
                 """
+            )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(sessions)")}
+            if "user_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT 'local-user'"
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_user_updated ON sessions(user_id, updated_at DESC)"
             )
 
     def get_saver(self):
@@ -109,74 +119,87 @@ class SessionManager:
             # checkpoint extension has deliberately not been installed.
             return
 
-    async def create_session(self, database_id: Optional[str] = None) -> str:
+    async def create_session(self, database_id: Optional[str] = None, user_id: str = "local-user") -> str:
         async with self._lock:
             session_id = str(uuid.uuid4())
             now = time.time()
             with self._connect() as connection:
                 connection.execute(
-                    "INSERT INTO sessions(session_id, thread_id, created_at, updated_at, database_id) VALUES (?, ?, ?, ?, ?)",
-                    (session_id, session_id, now, now, database_id),
+                    "INSERT INTO sessions(session_id, thread_id, created_at, updated_at, database_id, user_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    (session_id, session_id, now, now, database_id, user_id),
                 )
             return session_id
 
-    async def get_session(self, session_id: str) -> Optional[dict]:
+    async def get_session(self, session_id: str, user_id: str = "local-user") -> Optional[dict]:
         async with self._lock:
             with self._connect() as connection:
                 row = connection.execute(
-                    "SELECT session_id, thread_id, created_at, updated_at, database_id FROM sessions WHERE session_id = ?",
-                    (session_id,),
+                    "SELECT session_id, thread_id, created_at, updated_at, database_id, user_id FROM sessions WHERE session_id = ? AND user_id = ?",
+                    (session_id, user_id),
                 ).fetchone()
         if row is None:
             return None
         session = dict(row)
-        session["history"] = await self.get_history(session_id) or []
+        session["history"] = await self.get_history(session_id, user_id) or []
         return session
 
-    async def list_sessions(self, limit: int = 50, offset: int = 0) -> tuple[list[dict], int]:
+    async def list_sessions(self, limit: int = 50, offset: int = 0, user_id: str = "local-user") -> tuple[list[dict], int]:
         async with self._lock:
             with self._connect() as connection:
-                total = connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+                total = connection.execute(
+                    "SELECT COUNT(*) FROM sessions WHERE user_id = ?", (user_id,)
+                ).fetchone()[0]
                 rows = connection.execute(
                     """
                     SELECT s.session_id, s.thread_id, s.created_at, s.updated_at, s.database_id,
                            COUNT(h.id) AS question_count
                     FROM sessions AS s
                     LEFT JOIN session_history AS h ON h.session_id = s.session_id
+                    WHERE s.user_id = ?
                     GROUP BY s.session_id
                     ORDER BY s.updated_at DESC
                     LIMIT ? OFFSET ?
                     """,
-                    (limit, offset),
+                    (user_id, limit, offset),
                 ).fetchall()
         return [dict(row) for row in rows], int(total)
 
-    async def delete_session(self, session_id: str) -> bool:
+    async def delete_session(self, session_id: str, user_id: str = "local-user") -> bool:
         async with self._lock:
             with self._connect() as connection:
+                owned = connection.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ? AND user_id = ?", (session_id, user_id)
+                ).fetchone()
+                if owned is None:
+                    return False
                 connection.execute("DELETE FROM session_history WHERE session_id = ?", (session_id,))
-                deleted = connection.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,)).rowcount
+                deleted = connection.execute(
+                    "DELETE FROM sessions WHERE session_id = ? AND user_id = ?", (session_id, user_id)
+                ).rowcount
         return bool(deleted)
 
-    async def update_session(self, session_id: str, database_id: Optional[str] = None) -> bool:
+    async def update_session(self, session_id: str, database_id: Optional[str] = None, user_id: str = "local-user") -> bool:
         async with self._lock:
             with self._connect() as connection:
                 if database_id is None:
                     updated = connection.execute(
-                        "UPDATE sessions SET updated_at = ? WHERE session_id = ?", (time.time(), session_id)
+                        "UPDATE sessions SET updated_at = ? WHERE session_id = ? AND user_id = ?",
+                        (time.time(), session_id, user_id),
                     ).rowcount
                 else:
                     updated = connection.execute(
-                        "UPDATE sessions SET database_id = ?, updated_at = ? WHERE session_id = ?",
-                        (database_id, time.time(), session_id),
+                        "UPDATE sessions SET database_id = ?, updated_at = ? WHERE session_id = ? AND user_id = ?",
+                        (database_id, time.time(), session_id, user_id),
                     ).rowcount
         return bool(updated)
 
-    async def append_history(self, session_id: str, question: str, sql: Optional[str] = None, answer: str = "") -> bool:
+    async def append_history(self, session_id: str, question: str, sql: Optional[str] = None, answer: str = "", user_id: str = "local-user") -> bool:
         async with self._lock:
             now = time.time()
             with self._connect() as connection:
-                exists = connection.execute("SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+                exists = connection.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ? AND user_id = ?", (session_id, user_id)
+                ).fetchone()
                 if exists is None:
                     return False
                 connection.execute(
@@ -186,10 +209,12 @@ class SessionManager:
                 connection.execute("UPDATE sessions SET updated_at = ? WHERE session_id = ?", (now, session_id))
         return True
 
-    async def get_history(self, session_id: str) -> Optional[list[dict[str, Any]]]:
+    async def get_history(self, session_id: str, user_id: str = "local-user") -> Optional[list[dict[str, Any]]]:
         async with self._lock:
             with self._connect() as connection:
-                exists = connection.execute("SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+                exists = connection.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ? AND user_id = ?", (session_id, user_id)
+                ).fetchone()
                 if exists is None:
                     return None
                 rows = connection.execute(
@@ -198,10 +223,12 @@ class SessionManager:
                 ).fetchall()
         return [dict(row) for row in rows]
 
-    async def clear_history(self, session_id: str) -> bool:
+    async def clear_history(self, session_id: str, user_id: str = "local-user") -> bool:
         async with self._lock:
             with self._connect() as connection:
-                exists = connection.execute("SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+                exists = connection.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ? AND user_id = ?", (session_id, user_id)
+                ).fetchone()
                 if exists is None:
                     return False
                 connection.execute("DELETE FROM session_history WHERE session_id = ?", (session_id,))

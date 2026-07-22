@@ -1,8 +1,10 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import AppSidebar from "../components/AppSidebar";
 import ChatComposer from "../components/ChatComposer";
 import { DatabaseIcon } from "../components/Icons";
 import { QueryResultView } from "../components/QueryResultView";
+import KnowledgeManager from "../components/KnowledgeManager";
+import DataSourceManager from "../components/DataSourceManager";
 import type { ThemeMode } from "../types/query";
 import { useQueryStore } from "../store/queryStore";
 
@@ -12,6 +14,8 @@ interface QueryResultDemoProps {
 }
 
 export function QueryResultDemo({ theme, onToggleTheme }: QueryResultDemoProps) {
+  const [knowledgeOpen, setKnowledgeOpen] = useState(false);
+  const [dataSourcesOpen, setDataSourcesOpen] = useState(false);
   const store = useQueryStore();
   const selectedDatabase = store.databases.find((item) => item.id === store.database);
 
@@ -29,7 +33,11 @@ export function QueryResultDemo({ theme, onToggleTheme }: QueryResultDemoProps) 
         onNewChat={() => void store.newChat()}
         onSelectDatabase={(database) => void store.selectDatabase(database)}
         onToggleTheme={onToggleTheme}
+        onManageKnowledge={() => setKnowledgeOpen(true)}
+        onManageDataSources={() => setDataSourcesOpen(true)}
       />
+      <KnowledgeManager open={knowledgeOpen} onClose={() => setKnowledgeOpen(false)} />
+      <DataSourceManager open={dataSourcesOpen} onClose={() => setDataSourcesOpen(false)} onChanged={() => void store.loadDatabases()} />
       <main className="chat-workspace">
         <header className="workspace-header">
           <div className="workspace-header__title">
@@ -55,6 +63,7 @@ export function QueryResultDemo({ theme, onToggleTheme }: QueryResultDemoProps) 
                 key={turn.id}
                 turn={turn}
                 onRetry={(turnId) => void store.retryTurn(turnId)}
+                onSuggestion={(question) => void store.sendMessage(question)}
               />
             ))}
           </section>

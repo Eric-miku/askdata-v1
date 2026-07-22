@@ -8,13 +8,12 @@ import {
   type QueryRequest,
 } from "../api/query";
 import type { ChatTurn, DatabaseInfo, QueryResponse, SessionInfo } from "../types/query";
-import { buildChartFromRows } from "../utils/chartBuilder";
 
 export interface QueryApi {
   listDatabases: () => Promise<DatabaseInfo[]>;
   createSession: (databaseId: string) => Promise<SessionInfo>;
   queryData: (request: QueryRequest) => Promise<QueryResponse>;
-  executeSql?: (request: ExecuteSqlRequest) => Promise<Pick<QueryResponse, "columns" | "rows" | "chart" | "trace" | "error">>;
+  executeSql?: (request: ExecuteSqlRequest) => Promise<Pick<QueryResponse, "columns" | "rows" | "chart" | "analysis" | "suggestions" | "trace" | "error">>;
 }
 
 export interface QueryState {
@@ -136,7 +135,9 @@ export function createQueryStore(api: QueryApi = defaultApi) {
             sql,
             columns: response.columns,
             rows: response.rows,
-            chart: response.chart ?? buildChartFromRows(response.columns, response.rows),
+            chart: response.chart,
+            analysis: response.analysis,
+            suggestions: response.suggestions,
             trace: response.trace,
             error: response.error,
           };

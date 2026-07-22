@@ -14,6 +14,8 @@ const stepLabels: Record<string, string> = {
   RepairSql: "修复 SQL",
   ReviewAnswerShape: "检查答案结构",
   AnalyzeResult: "生成回答",
+  UnderstandQuestion: "理解问题结构",
+  ResolveBusinessTerms: "匹配业务术语",
 };
 
 function normalizeStep(step: TraceItem, index: number): StructuredTraceItem {

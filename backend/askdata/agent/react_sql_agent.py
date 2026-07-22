@@ -146,6 +146,8 @@ class ReActSqlAgent:
         previous = ""
         if session_context and session_context.get("last_sql"):
             previous = f"\nPrevious SQL: {session_context['last_sql']}"
+        if session_context and session_context.get("understanding"):
+            previous += "\nStructured intent: " + json.dumps(session_context["understanding"], ensure_ascii=False)
         system_prompt = BuildReActSystemPrompt()
 
         if self.skill_loader:

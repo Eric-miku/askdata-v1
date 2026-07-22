@@ -2,6 +2,8 @@
 
 Natural-language-to-SQL platform. Users ask questions in plain Chinese or English; the system generates SQL, executes against a database, and returns charts with explanations.
 
+The current runnable product flow also includes deterministic chart recommendations, evidence-backed analysis, CSV/XLSX/PNG export, structured multi-turn intent, business terminology/metric management, and managed SQLite data-source lifecycle operations.
+
 **Stack**: Python 3.13 / FastAPI / LangGraph / SQLAlchemy / React + Ant Design + ECharts / OpenAI-compatible LLM
 
 ## Quick Start
@@ -89,9 +91,11 @@ POST /api/query
 ## Configuration (.env)
 
 ```env
-LLM_API_BASE=http://localhost:9001/v1
+LLM_API_BASE=https://api.deepseek.com
 LLM_API_KEY=your-key
-LLM_MODEL_NAME=Qwen3.5-397B-A17B
+LLM_MODEL_NAME=deepseek-v4-pro
+LLM_THINKING_ENABLED=true
+LLM_REASONING_EFFORT=high
 BIRD_DATA_DIR=data/bird
 BIRD_INSTRUCTIONS_DIR=data/bird/instructions
 ```
@@ -141,11 +145,39 @@ uv run pytest -q
 cd frontend && npm run build
 ```
 
+## Management and Operations
+
+- Open the book icon in the left rail to manage terms, aliases, metrics, formulas, field mappings, publishing and version rollback.
+- Open the database drawer and choose **管理数据源** to register, test, enable/disable and synchronize SQLite sources under `data/bird/databases`.
+- Schema synchronization persists SQLite DDL, columns, primary/foreign keys, indexes and a SHA-256 fingerprint; repeated synchronization reports changed tables and the management panel can expand the stored catalog.
+- Management mutations are open for local development when `ADMIN_API_TOKEN` is empty. Set it in production and provide the same token to the frontend as `VITE_ADMIN_API_TOKEN`.
+- The same management panel grants user-level database/table/field query and export policies, plus validated table-level row filters that apply to query, replay, export and execution plans. The frontend sends `VITE_USER_ID` as `X-User-ID`; production deployments should overwrite this header from a trusted gateway or SSO layer.
+- Sessions are persisted per user, and switching databases clears incompatible SQL context. Knowledge entries support JSON bulk upsert with per-row errors plus JSON/CSV export.
+- Query governance limits joins, nested subqueries, system objects, row count, result bytes and execution time; slow queries and stable error codes are exposed for operations.
+- The SQL panel can request an authorized `EXPLAIN QUERY PLAN` and display deterministic manual index candidates; AskData never applies those indexes automatically.
+- Operational endpoints are `/health`, `/ready`, and `/metrics`; every HTTP response includes `X-Request-ID`.
+
+For the containerized acceptance environment:
+
+```bash
+docker compose up --build
+```
+
+The frontend is then available at `http://localhost:5173` and the backend API at `http://localhost:8000/docs`. Override `LLM_API_BASE` when the model service is not reachable through `host.docker.internal:9001`.
+
 ## More Documentation
 
+- [Product guide](docs/product-guide.md): user, administrator, and operations workflows plus current product boundaries.
+- [System architecture](docs/architecture.md): components, query sequence, trust boundaries, persistence, and extension points.
+- [API reference](docs/api-reference.md): request headers, routes, payloads, and stable error semantics.
+- [Development and testing](docs/development-and-testing.md): local setup, module ownership, test layers, and definition of done.
+- [Release process](docs/release-process.md): branch, commit, PR, review, release, deployment, and rollback requirements.
 - [Backend instructions](backend/INSTRUCTIONS.md): architecture, BIRD data contract, evaluation rules, and known limitations.
 - [BIRD benchmark](benchmarks/README.md): fixed 100-question manifest and comparable accuracy results.
 - [Data processing](data-processing/README.md): team-owned BIRD preparation commands and output contract.
+- [Acceptance matrix](docs/acceptance-matrix.md): plan requirements mapped to implementation and tests.
+- [Acceptance report](docs/acceptance-report.md): current automated results, runnable flows, and external acceptance items.
+- [Deployment and operations](docs/deployment-and-operations.md): local/Docker deployment, configuration, probes, persistence, and release checks.
 
 ## Key Design Decisions
 

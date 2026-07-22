@@ -1,0 +1,96 @@
+{
+  "name": "askdata-core-acceptance-v1",
+  "version": 1,
+  "thresholds": {
+    "sql_execution_success_rate": 0.98,
+    "business_relaxed_accuracy": 0.80,
+    "multi_turn_pass_rate": 0.90,
+    "dangerous_sql_block_rate": 1.0,
+    "export_correctness_rate": 1.0,
+    "permission_bypass_block_rate": 1.0,
+    "blocking_or_critical_defects": 0
+  },
+  "multi_turn": [
+    {
+      "id": "sales-filter-time-dimension-metric",
+      "steps": [
+        {
+          "question": "本月按部门查看销售额前5名，只看华东",
+          "expected": {
+            "metrics": ["销售额"],
+            "dimensions": ["部门"],
+            "filters": [{"expression": "华东", "source": "explicit"}],
+            "time_range": "本月",
+            "sort": "desc",
+            "top_n": 5
+          }
+        },
+        {
+          "question": "改成上个月",
+          "expected": {
+            "metrics": ["销售额"],
+            "dimensions": ["部门"],
+            "filters": [{"expression": "华东", "source": "explicit"}],
+            "time_range": "上个月"
+          }
+        },
+        {
+          "question": "只看华南",
+          "expected": {
+            "filters": [{"expression": "华南", "source": "explicit"}],
+            "time_range": "上个月"
+          }
+        },
+        {
+          "question": "换成客户数",
+          "expected": {
+            "metrics": ["客户数"],
+            "dimensions": ["部门"],
+            "filters": [{"expression": "华南", "source": "explicit"}]
+          }
+        },
+        {
+          "question": "不限制华南，取消部门分组",
+          "expected": {
+            "metrics": ["客户数"],
+            "dimensions": [],
+            "filters": []
+          }
+        }
+      ]
+    }
+  ],
+  "security": [
+    {"id": "write", "sql": "DROP TABLE users", "must_block": true},
+    {"id": "multi-statement", "sql": "SELECT 1; DELETE FROM users", "must_block": true},
+    {"id": "system-table", "sql": "SELECT name FROM sqlite_master", "must_block": true},
+    {"id": "safe-cte", "sql": "WITH totals AS (SELECT COUNT(*) AS count FROM items) SELECT count FROM totals", "must_block": false}
+  ],
+  "schema_catalog": {
+    "required_objects": ["columns", "primary_key", "foreign_keys", "indexes", "ddl"],
+    "fingerprint_algorithm": "sha256",
+    "repeat_sync_must_be_stable": true,
+    "ddl_change_must_report_table": "orders"
+  },
+  "query_plan": [
+    {
+      "id": "filtered-scan-index-candidate",
+      "sql": "SELECT region FROM orders WHERE region = '华东'",
+      "must_succeed": true,
+      "expected_suggestion_type": "index_candidate"
+    },
+    {
+      "id": "write-plan-blocked",
+      "sql": "DELETE FROM orders",
+      "must_succeed": false,
+      "expected_error_code": "SQL_BLOCKED"
+    }
+  ],
+  "row_level_policy": {
+    "table": "orders",
+    "filter": "region = '华东'",
+    "sql": "SELECT id, region FROM orders ORDER BY id",
+    "expected_ids": [1],
+    "must_apply_to": ["query", "export", "explain"]
+  }
+}

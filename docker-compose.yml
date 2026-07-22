@@ -1,0 +1,53 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      LLM_API_BASE: ${LLM_API_BASE:-http://host.docker.internal:9001/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL_NAME: ${LLM_MODEL_NAME:-local-model}
+      LLM_THINKING_ENABLED: ${LLM_THINKING_ENABLED:-false}
+      LLM_REASONING_EFFORT: ${LLM_REASONING_EFFORT:-high}
+      BIRD_DATA_DIR: ${BIRD_DATA_DIR:-data/bird}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      ASKDATA_STATE_DIR: /app/.checkpoints
+    volumes:
+      - ./data:/app/data:ro
+      - askdata-checkpoints:/app/.checkpoints
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_ADMIN_API_TOKEN: ${VITE_ADMIN_API_TOKEN:-}
+        VITE_USER_ID: ${VITE_USER_ID:-local-user}
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "5173:8080"
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  askdata-checkpoints:

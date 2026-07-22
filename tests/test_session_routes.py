@@ -66,3 +66,27 @@ def test_execute_sql_route_replays_saved_sql(tmp_path, monkeypatch):
     assert body["error"] is None
     assert body["columns"] == ["name", "amount"]
     assert body["rows"] == [{"name": "B", "amount": 5}, {"name": "A", "amount": 3}]
+
+
+def test_session_routes_hide_other_users_sessions(tmp_path, monkeypatch):
+    monkeypatch.setattr(routes, "session_manager", SessionManager(checkpoint_dir=str(tmp_path)), raising=False)
+    client = TestClient(app, backend_options={"use_uvloop": True})
+    alice_headers = {"X-User-ID": "alice"}
+    bob_headers = {"X-User-ID": "bob"}
+
+    alice_session = client.post(
+        "/api/sessions", json={"database_id": "demo"}, headers=alice_headers
+    ).json()["session_id"]
+    bob_session = client.post(
+        "/api/sessions", json={"database_id": "demo"}, headers=bob_headers
+    ).json()["session_id"]
+
+    assert [item["session_id"] for item in client.get("/api/sessions", headers=alice_headers).json()["sessions"]] == [alice_session]
+    assert [item["session_id"] for item in client.get("/api/sessions", headers=bob_headers).json()["sessions"]] == [bob_session]
+    assert client.get(f"/api/sessions/{alice_session}", headers=bob_headers).status_code == 404
+    assert client.patch(
+        f"/api/sessions/{alice_session}", json={"database_id": "finance"}, headers=bob_headers
+    ).status_code == 404
+    assert client.post(f"/api/sessions/{alice_session}/reset", headers=bob_headers).status_code == 404
+    assert client.delete(f"/api/sessions/{alice_session}", headers=bob_headers).status_code == 404
+    assert client.get(f"/api/sessions/{alice_session}", headers=alice_headers).status_code == 200

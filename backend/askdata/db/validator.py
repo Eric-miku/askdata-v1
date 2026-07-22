@@ -65,6 +65,8 @@ _ALLOWED_ROOT_TYPES = tuple(
     if t is not None
 )
 
+_SYSTEM_SCHEMAS = {"information_schema", "mysql", "performance_schema", "sys", "pg_catalog"}
+
 
 class SQLValidator:
     def __init__(
@@ -72,6 +74,8 @@ class SQLValidator:
         dialect: str = "mysql",
         max_statements: int = 1,
         forbidden_tables: Optional[set] = None,
+        max_joins: int = 8,
+        max_subquery_depth: int = 4,
     ):
         """
         :param dialect: sqlglot 解析方言, 需与实际数据库一致 (mysql/postgres/sqlite 等)
@@ -81,6 +85,8 @@ class SQLValidator:
         self.dialect = dialect
         self.max_statements = max_statements
         self.forbidden_tables = {t.lower() for t in (forbidden_tables or set())}
+        self.max_joins = max_joins
+        self.max_subquery_depth = max_subquery_depth
 
     def validate(self, sql: str) -> ValidationResult:
         sql = (sql or "").strip()
@@ -128,16 +134,54 @@ class SQLValidator:
                     "检测到 INTO 子句 (可能用于文件写出), 已拦截",
                 )
 
-        # 3. 表名黑名单检查
-        if self.forbidden_tables:
-            tables_used = {t.name.lower() for t in root.find_all(exp.Table)}
-            hit = tables_used & self.forbidden_tables
-            if hit:
-                return ValidationResult(
-                    False,
-                    SQLRiskLevel.BLOCKED,
-                    f"禁止访问的表: {', '.join(sorted(hit))}",
-                )
+        # 3. 系统对象和表名黑名单检查
+        tables = list(root.find_all(exp.Table))
+        system_objects = {
+            table.sql(dialect=self.dialect)
+            for table in tables
+            if table.name.lower().startswith("sqlite_")
+            or str(table.db or "").lower() in _SYSTEM_SCHEMAS
+        }
+        if system_objects:
+            return ValidationResult(
+                False,
+                SQLRiskLevel.BLOCKED,
+                f"禁止访问系统对象: {', '.join(sorted(system_objects))}",
+            )
+
+        tables_used = {table.name.lower() for table in tables}
+        hit = tables_used & self.forbidden_tables
+        if hit:
+            return ValidationResult(
+                False,
+                SQLRiskLevel.BLOCKED,
+                f"禁止访问的表: {', '.join(sorted(hit))}",
+            )
+
+        # 4. 复杂度限制，防止模型生成高风险笛卡尔积或深层嵌套查询
+        join_count = sum(1 for _ in root.find_all(exp.Join))
+        if join_count > self.max_joins:
+            return ValidationResult(
+                False,
+                SQLRiskLevel.BLOCKED,
+                f"SQL 包含 {join_count} 个 JOIN，超过允许上限 {self.max_joins}",
+            )
+
+        max_depth = 0
+        for select in root.find_all(exp.Select):
+            depth = 0
+            parent = select.parent
+            while parent is not None:
+                if isinstance(parent, exp.Select):
+                    depth += 1
+                parent = parent.parent
+            max_depth = max(max_depth, depth)
+        if max_depth > self.max_subquery_depth:
+            return ValidationResult(
+                False,
+                SQLRiskLevel.BLOCKED,
+                f"SQL 子查询深度 {max_depth} 超过允许上限 {self.max_subquery_depth}",
+            )
 
         normalized = root.sql(dialect=self.dialect)
         return ValidationResult(True, SQLRiskLevel.SAFE, "", len(statements), normalized)

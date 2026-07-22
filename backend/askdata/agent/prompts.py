@@ -1,5 +1,7 @@
 """Prompt builder — classifies SQL task type (EASY/NON_NESTED/NESTED), builds structured SQL generation and repair prompts with schema linking checklist and task-specific guidance."""
 
+import json
+
 def ClassifySqlTask(question: str, schema_prompt: str) -> str:
     lowered = f" {(question or '').lower()} "
     nested_hints = [
@@ -49,6 +51,9 @@ def BuildSqlPrompt(
     previous = ""
     if session_context and session_context.get("last_sql"):
         previous = f"\nPrevious SQL: {session_context['last_sql']}"
+    understanding = ""
+    if session_context and session_context.get("understanding"):
+        understanding = "\nStructured intent: " + json.dumps(session_context["understanding"], ensure_ascii=False)
     task_type = ClassifySqlTask(question, schema_prompt)
     return f"""You are an AI assistant that converts BIRD natural language questions into one SQLite SELECT SQL query.
 Return SQL only. Do not use markdown. Do not wrap the answer in tags. Do not use SELECT *.
@@ -83,7 +88,7 @@ Before writing SQL, internally identify:
 </schema>
 
 <question>
-{question}{previous}
+    {question}{previous}{understanding}
 </question>
 """
 

@@ -8,6 +8,19 @@ const apiMocks = vi.hoisted(() => ({
   deleteSession: vi.fn(),
   executeSql: vi.fn(),
   queryData: vi.fn(),
+  listKnowledgeEntries: vi.fn(),
+  listKnowledgeVersions: vi.fn(),
+  createKnowledgeEntry: vi.fn(),
+  updateKnowledgeEntry: vi.fn(),
+  deleteKnowledgeEntry: vi.fn(),
+  publishKnowledgeEntry: vi.fn(),
+  rollbackKnowledgeEntry: vi.fn(),
+  listManagedDataSources: vi.fn(),
+  createManagedDataSource: vi.fn(),
+  deleteManagedDataSource: vi.fn(),
+  setManagedDataSourceStatus: vi.fn(),
+  syncManagedDataSource: vi.fn(),
+  testManagedDataSource: vi.fn(),
 }));
 
 vi.mock("../api/query", () => apiMocks);
@@ -46,6 +59,9 @@ describe("QueryResultDemo", () => {
       ],
       error: null,
     });
+    apiMocks.listKnowledgeEntries.mockReset().mockResolvedValue([]);
+    apiMocks.listKnowledgeVersions.mockReset().mockResolvedValue([]);
+    apiMocks.listManagedDataSources.mockReset().mockResolvedValue([]);
     useQueryStore.setState({
       database: "",
       databases: [],
@@ -89,5 +105,21 @@ describe("QueryResultDemo", () => {
     expect(screen.getByText("思考过程")).toBeVisible();
     expect(screen.getByRole("columnheader", { name: "count" })).toBeVisible();
     expect(screen.queryByText("图表配置已返回")).not.toBeInTheDocument();
+  });
+
+  it("opens the business terminology management panel", async () => {
+    const user = userEvent.setup();
+    render(<QueryResultDemo theme="dark" onToggleTheme={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "业务术语管理" }));
+    expect(screen.getByRole("dialog", { name: "业务术语管理" })).toBeVisible();
+    expect(await screen.findByText("新建术语或指标", { exact: false })).toBeVisible();
+  });
+
+  it("opens data source management from the database drawer", async () => {
+    const user = userEvent.setup();
+    render(<QueryResultDemo theme="dark" onToggleTheme={vi.fn()} />);
+    await user.click(screen.getByRole("button", { name: "打开数据库" }));
+    await user.click(screen.getByRole("button", { name: "管理数据源" }));
+    expect(screen.getByRole("dialog", { name: "数据源管理" })).toBeVisible();
   });
 });

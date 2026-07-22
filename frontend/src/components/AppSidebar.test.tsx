@@ -31,7 +31,7 @@ describe("AppSidebar", () => {
     await user.tab({ shift: true });
     expect(screen.getByRole("button", { name: "关闭数据库" })).toHaveFocus();
     await user.tab({ shift: true });
-    expect(screen.getByRole("option", { name: "Demo 2 张表" })).toHaveFocus();
+    expect(screen.getByRole("button", { name: "管理数据源" })).toHaveFocus();
 
     await user.keyboard("{Escape}");
 

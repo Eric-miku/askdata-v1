@@ -3,18 +3,24 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryResultView } from "./QueryResultView";
 
 const executeSqlMock = vi.hoisted(() => vi.fn());
+const downloadQueryExportMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/query", () => ({
   executeSql: executeSqlMock,
+  downloadQueryExport: downloadQueryExportMock,
 }));
 
-vi.mock("echarts-for-react", () => ({
-  default: () => <div data-testid="echarts-chart" />,
-}));
+vi.mock("echarts-for-react", async () => {
+  const { forwardRef } = await import("react");
+  return {
+    default: forwardRef(() => <div data-testid="echarts-chart" />),
+  };
+});
 
 describe("QueryResultView", () => {
   beforeEach(() => {
     executeSqlMock.mockReset();
+    downloadQueryExportMock.mockReset();
   });
 
   it("renders assistant answers as Markdown", () => {
@@ -75,7 +81,7 @@ describe("QueryResultView", () => {
     executeSqlMock.mockResolvedValue({
       columns: ["product_name", "sales_amount"],
       rows: [{ product_name: "智能手表", sales_amount: 197000 }],
-      chart: null,
+      chart: { type: "bar", xAxis: { data: ["智能手表"] }, series: [{ data: [197000] }] },
       trace: [],
       error: null,
     });

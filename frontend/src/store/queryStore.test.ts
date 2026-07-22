@@ -124,12 +124,12 @@ describe("query store", () => {
     });
   });
 
-  it("restores historical SQL rows and builds a chart when the replay response has none", async () => {
+  it("restores historical SQL rows and uses the backend chart recommendation", async () => {
     const api = createApi({
       executeSql: vi.fn().mockResolvedValue({
         columns: ["product_name", "sales_amount"],
         rows: [{ product_name: "智能手表", sales_amount: 197000 }],
-        chart: null,
+        chart: { type: "bar", xAxis: { data: ["智能手表"] }, yAxis: { name: "sales_amount" }, series: [{ data: [197000] }] },
         trace: [],
         error: null,
       }),

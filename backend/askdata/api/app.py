@@ -8,13 +8,57 @@ FastAPI 应用入口 —— 整个后端服务的心脏
 """
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+import logging
+import json
+import time
+import uuid
+
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Engine
 from askdata.api.routes import router
+from askdata.api.request_context import GetRequestId, ResetRequestId, SetRequestId
 from askdata.core.config import settings
 from askdata.core.paths import project_path
-from askdata.tools.retriever import SemanticRetriever
+
+
+logger = logging.getLogger("askdata.api")
+
+
+class RequestContextMiddleware:
+    """Pure ASGI request logging without BaseHTTPMiddleware streaming issues."""
+
+    def __init__(self, app):
+        self.application = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.application(scope, receive, send)
+            return
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        request_id = headers.get(b"x-request-id", b"").decode() or str(uuid.uuid4())
+        request_token = SetRequestId(request_id)
+        started = time.perf_counter()
+        status_code = 500
+
+        async def send_with_context(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+                message.setdefault("headers", []).append((b"x-request-id", request_id.encode()))
+            await send(message)
+
+        try:
+            await self.application(scope, receive, send_with_context)
+        finally:
+            logger.info(json.dumps({
+                "event": "http_request", "request_id": request_id,
+                "method": scope.get("method"), "path": scope.get("path"),
+                "status_code": status_code,
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            }, ensure_ascii=False))
+            ResetRequestId(request_token)
 
 
 # 全局引擎缓存 —— 按 database_path 缓存 SQLAlchemy Engine，避免重复创建连接池
@@ -54,33 +98,24 @@ async def lifespan(application: FastAPI):
       - 关闭所有缓存的数据库连接池
     """
     # ---------- 启动逻辑 ----------
-    print("[AskData] 服务启动中...")
+    logger.info("service_starting")
 
     # 1. 确认 BIRD 数据目录存在
     bird_data_dir = project_path(settings.BIRD_DATA_DIR)
     databases_dir = bird_data_dir / "databases"
     if not databases_dir.exists():
-        print(f"[AskData] 警告: BIRD 数据库目录不存在: {databases_dir}")
+        logger.warning("bird_database_directory_missing", extra={"database_path": str(databases_dir)})
     else:
         db_count = len(list(databases_dir.rglob("*.db"))) + len(list(databases_dir.rglob("*.sqlite")))
-        print(f"[AskData] BIRD 数据目录: {databases_dir} (发现 {db_count} 个数据库文件)")
+        logger.info("bird_databases_ready", extra={"database_path": str(databases_dir), "database_count": db_count})
 
-    # 2. 预热 SemanticRetriever —— 将 databases.json 中的 schema 元数据加载到内存
-    #    这样第一个 /api/query 请求不用再等待磁盘 I/O
-    try:
-        retriever = SemanticRetriever().Build()
-        database_count = len(retriever.index.databases) if retriever.index else 0
-        print(f"[AskData] Schema 索引已加载: {database_count} 个数据库")
-    except FileNotFoundError as exc:
-        print(f"[AskData] 警告: Schema 索引文件未找到: {exc}")
-        print("[AskData] 部分接口（如 /api/query）在首次调用时可能略有延迟")
-    except Exception as exc:
-        print(f"[AskData] 警告: Schema 索引加载失败: {exc}")
+    # Schema 索引在首个查询时懒加载，避免就绪探针被大数据目录预热阻塞。
+    logger.info("schema_index_lazy_load_enabled")
 
     yield  # 应用在此运行，直到收到关闭信号
 
     # ---------- 关闭逻辑 ----------
-    print("[AskData] 服务关闭中...")
+    logger.info("service_stopping")
 
     # 3. 关闭所有缓存的数据库引擎连接池
     closed_count = 0
@@ -89,9 +124,9 @@ async def lifespan(application: FastAPI):
             engine.dispose()
             closed_count += 1
         except Exception as exc:
-            print(f"[AskData] 关闭引擎失败: {path} — {exc}")
+            logger.warning("engine_close_failed", extra={"database_path": path, "error": str(exc)})
     _engine_pool.clear()
-    print(f"[AskData] 已关闭 {closed_count} 个数据库连接池")
+    logger.info("service_stopped", extra={"closed_engine_count": closed_count})
 
 
 # 创建 FastAPI 应用实例
@@ -104,20 +139,65 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.add_middleware(RequestContextMiddleware)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = GetRequestId() or request.headers.get("X-Request-ID", "")
+    logger.exception(json.dumps({
+        "event": "unhandled_exception", "request_id": request_id,
+        "method": request.method, "path": request.url.path,
+        "error_type": type(exc).__name__,
+    }, ensure_ascii=False))
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "code": "INTERNAL_ERROR",
+                "message": "服务暂时无法处理请求，请稍后重试",
+                "request_id": request_id,
+            }
+        },
+        headers={"X-Request-ID": request_id} if request_id else None,
+    )
+
+
+@app.get("/health", tags=["operations"])
+async def health():
+    return {"status": "ok", "service": "askdata"}
+
+
+@app.get("/ready", tags=["operations"])
+async def readiness(response: Response):
+    databases_dir = project_path(settings.BIRD_DATA_DIR) / "databases"
+    ready = databases_dir.is_dir()
+    if not ready:
+        response.status_code = 503
+    return {"status": "ready" if ready else "not_ready", "databases_dir": str(databases_dir)}
+
+
+@app.get("/metrics", tags=["operations"], response_class=Response)
+async def metrics():
+    databases_dir = project_path(settings.BIRD_DATA_DIR) / "databases"
+    database_count = sum(1 for pattern in ("*.db", "*.sqlite") for _ in databases_dir.rglob(pattern)) if databases_dir.is_dir() else 0
+    body = "\n".join([
+        "# HELP askdata_database_count Number of discovered SQLite databases.",
+        "# TYPE askdata_database_count gauge",
+        f"askdata_database_count {database_count}",
+        "# HELP askdata_engine_pool_size Number of cached database engines.",
+        "# TYPE askdata_engine_pool_size gauge",
+        f"askdata_engine_pool_size {len(_engine_pool)}",
+        "",
+    ])
+    return Response(content=body, media_type="text/plain; version=0.0.4")
 
 # CORS 中间件配置
 # 前端 Vite 开发服务器默认运行在 localhost:5173
 # 生产环境部署时请替换为实际域名
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-        "http://7.59.11.153:5173",
-        "http://7.59.11.153:5174",
-    ],
+    allow_origins=[origin.strip() for origin in settings.CORS_ORIGINS.split(",") if origin.strip()],
     allow_credentials=True,   # 允许携带 Cookie
     allow_methods=["*"],      # 允许所有 HTTP 方法（GET, POST, DELETE 等）
     allow_headers=["*"],      # 允许所有请求头
