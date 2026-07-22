@@ -29,7 +29,7 @@ class FakeGraph:
 
 def test_query_route_uses_agent_graph_instead_of_mock(monkeypatch):
     monkeypatch.setattr(routes, "AgentGraph", FakeGraph, raising=False)
-    client = TestClient(app)
+    client = TestClient(app, backend_options={"use_uvloop": True})
 
     response = client.post("/api/query", json={"question": "How many items?", "database_id": "demo"})
 

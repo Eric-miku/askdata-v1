@@ -30,6 +30,7 @@ from fastapi import APIRouter, HTTPException, Query
 from askdata.api.schemas import (
     QueryRequest,
     QueryResponse,
+    ExecuteSqlRequest,
     SessionCreateRequest,
     SessionCreateResponse,
     SessionItem,
@@ -42,6 +43,7 @@ from askdata.api.session_manager import session_manager
 from askdata.agent.graph import AgentGraph
 from askdata.core.config import settings
 from askdata.core.paths import project_path
+from askdata.db.query_runner import Execute as ExecuteSql
 
 # 创建 APIRouter 实例
 # 在 app.py 中通过 app.include_router(router, prefix="/api") 注册
@@ -265,14 +267,13 @@ async def list_sessions(
     # 将原始 dict 转换为 SessionItem 模型
     items = []
     for s in sessions_list:
-        history = s.get("history", [])
         items.append(SessionItem(
             session_id=s["session_id"],
             thread_id=s.get("thread_id", s["session_id"]),
             created_at=s["created_at"],
             updated_at=s.get("updated_at", s["created_at"]),
             database_id=s.get("database_id"),
-            question_count=len(history),
+            question_count=s.get("question_count", len(s.get("history", []))),
         ))
 
     trace.log("返回会话列表", f"共 {total} 个会话，返回 {len(items)} 条")
@@ -280,7 +281,10 @@ async def list_sessions(
 
 
 @router.post("/sessions", response_model=SessionCreateResponse)
-async def create_session(body: SessionCreateRequest):
+async def create_session(
+    body: SessionCreateRequest | None = None,
+    database_id: str | None = Query(None),
+):
     """
     创建新的对话会话
 
@@ -301,9 +305,10 @@ async def create_session(body: SessionCreateRequest):
         }
     """
     trace = TraceLogger()
-    trace.log("创建会话", f"database_id={body.database_id}")
+    requested_database_id = body.database_id if body is not None else database_id
+    trace.log("创建会话", f"database_id={requested_database_id}")
 
-    session_id = await session_manager.create_session(body.database_id)
+    session_id = await session_manager.create_session(requested_database_id)
     session_data = await session_manager.get_session(session_id)
 
     trace.log("会话创建成功",
@@ -515,14 +520,20 @@ async def execute_query(request: QueryRequest):
         session_id = await session_manager.create_session(request.database_id)
         trace.log("创建新会话", f"session_id={session_id}")
 
+    checkpoint_state = session_manager.load_agent_state(session_id)
     history = await session_manager.get_history(session_id) or []
-    session_context = {}
-    if history:
+    session_context = {"thread_id": session_manager.get_thread_id(session_id)}
+    if checkpoint_state.get("database_id") == request.database_id:
+        session_context.update({
+            "last_question": checkpoint_state.get("question"),
+            "last_sql": checkpoint_state.get("sql"),
+        })
+    elif history:
         last_item = history[-1]
-        session_context = {
+        session_context.update({
             "last_question": last_item.get("question"),
             "last_sql": last_item.get("sql"),
-        }
+        })
 
     # ---------- 调用 Agent 工作流 ----------
     try:
@@ -564,6 +575,48 @@ async def execute_query(request: QueryRequest):
         sql=response.sql,
         answer=response.answer,
     )
+    session_manager.save_agent_state(
+        session_id,
+        {
+            "database_id": request.database_id,
+            "question": request.question,
+            "sql": response.sql,
+            "answer": response.answer,
+        },
+    )
 
     trace.log("查询完成")
     return response
+
+
+@router.post("/query/execute-sql", response_model=QueryResponse)
+async def replay_sql(request: ExecuteSqlRequest):
+    """Re-execute a saved read-only SQL statement for history restoration.
+
+    The common query runner validates the SQL AST before execution, therefore
+    this endpoint cannot be used to mutate the selected SQLite database.
+    """
+    databases = _scan_databases()
+    database = next((item for item in databases if item["id"] == request.database_id), None)
+    if database is None:
+        raise HTTPException(status_code=404, detail=f"数据库 '{request.database_id}' 未找到")
+    result = ExecuteSql(request.sql, database["path"])
+    if not result["success"]:
+        return QueryResponse(
+            answer="",
+            sql=request.sql,
+            columns=[],
+            rows=[],
+            chart=None,
+            trace=[],
+            error=result["error"],
+        )
+    return QueryResponse(
+        answer="",
+        sql=request.sql,
+        columns=result["columns"],
+        rows=result["rows"],
+        chart=None,
+        trace=[],
+        error=None,
+    )

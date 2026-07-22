@@ -75,12 +75,7 @@ describe("QueryResultView", () => {
     executeSqlMock.mockResolvedValue({
       columns: ["product_name", "sales_amount"],
       rows: [{ product_name: "智能手表", sales_amount: 197000 }],
-      chart: {
-        type: "bar",
-        xAxis: { data: ["智能手表"] },
-        yAxis: { name: "销售额" },
-        series: [{ data: [197000] }],
-      },
+      chart: null,
       trace: [],
       error: null,
     });

@@ -260,3 +260,31 @@ def test_react_sql_agent_retains_two_candidates_but_still_executes_later_final_s
     assert result["sql"] == "SELECT COUNT(*) AS count FROM items WHERE id > 0"
     assert sum(step["step"] == "ExecuteSql" for step in result["trace"]) == 3
     assert not any(step["step"] == "CandidateLimit" for step in result["trace"])
+
+
+def test_react_sql_agent_uses_valid_llm_judge_verdict_for_successful_candidates(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("CREATE TABLE items(id INTEGER, name TEXT)")
+        connection.executemany("INSERT INTO items(id, name) VALUES (?, ?)", [(1, "a"), (2, "b")])
+
+    class JudgeLlm(ScriptedToolCallingLLM):
+        def Chat(self, messages, tools=None):
+            if tools is None and "NL2SQL result judge" in messages[0]["content"]:
+                return SimpleNamespace(content='{"best_index": 1, "score": 98, "reason": "The count answers directly."}', tool_calls=[])
+            return super().Chat(messages, tools)
+
+    llm = JudgeLlm([
+        {"sql": "SELECT COUNT(*) AS count FROM items", "content": "Count items."},
+        {"sql": "SELECT name FROM items ORDER BY name", "content": "Inspect names."},
+        {"content": "There are two items."},
+    ])
+    result = ReActSqlAgent(llm_client=llm).Run(
+        question="How many items are there?",
+        schema_prompt="Database: demo\nTable items(id integer, name text)",
+        database_path=str(database_path),
+    )
+
+    assert result["sql"] == "SELECT COUNT(*) AS count FROM items"
+    assert len(result["candidates"]) == 2
+    assert any(step["step"] == "SelectBestCandidate" and "count answers directly" in step["message"] for step in result["trace"])

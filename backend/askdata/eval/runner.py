@@ -1,7 +1,7 @@
 """BIRD evaluation runner using the normalized data-processing contract."""
 
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import random
@@ -34,7 +34,7 @@ class EvalRunner:
         self.comparer = comparer or BirdResultComparer()
 
     def Run(self, database_id=None, limit=None, out=None, seed=None, question_manifest=None) -> dict:
-        started_at = datetime.now(UTC)
+        started_at = datetime.now(timezone.utc)
         databases = LoadProcessedDatabases(self.processed_dir)
         database_ids = {item["database_id"] for item in databases}
         questions = [
@@ -63,7 +63,7 @@ class EvalRunner:
 
         index = BirdSchemaIndex().Build(databases, questions=questions)
         cases = [self._EvaluateQuestion(question, index) for question in tqdm(questions, desc="eval", unit="q")]
-        finished_at = datetime.now(UTC)
+        finished_at = datetime.now(timezone.utc)
         report = {
             "summary": self._BuildSummary(cases, started_at, finished_at),
             "byDatabase": self._BuildBreakdown(cases, "databaseId"),
@@ -99,8 +99,8 @@ class EvalRunner:
         gold_rows = []
         comparison = self.comparer.BuildVerdict(False, False, None, "empty_prediction")
         result = {}
-        candidate_sqls = []
-        candidate_hit = False
+        candidate_sqls: list[str] = []
+        candidate_outcomes: list[dict] = []
 
         try:
             agent = self.agent_graph or AgentGraph(processed_dir=self.processed_dir)
@@ -108,17 +108,14 @@ class EvalRunner:
             generated_sql = result.get("sql") or ""
             error = result.get("error")
 
-            # ========== 新增：提取候选 SQL 列表 ==========
             candidates = result.get("candidates", [])
             candidate_sqls = [c.get("sql", "") for c in candidates if c.get("sql")]
 
-            if not generated_sql:
-                comparison = self.comparer.BuildVerdict(False, False, None, "empty_prediction")
-            else:
-                gold = self._ExecuteSql(gold_sql, database_path)
-                execution_succeeded = True
-                gold_columns = gold["columns"]
-                gold_rows = gold["rows"]
+            gold = self._ExecuteSql(gold_sql, database_path)
+            execution_succeeded = True
+            gold_columns = gold["columns"]
+            gold_rows = gold["rows"]
+            if generated_sql:
                 comparison = self.comparer.Compare(
                     result.get("columns", []),
                     result.get("rows", []),
@@ -127,17 +124,31 @@ class EvalRunner:
                     gold_rows,
                     gold_sql,
                 )
+            else:
+                comparison = self.comparer.BuildVerdict(False, False, None, "empty_prediction")
 
-            # ========== 新增：计算候选命中率 ==========
-            if candidate_sqls and gold_rows:
-                gold_set = set(tuple(row.items()) for row in gold_rows)
-                for sql in candidate_sqls:
-                    pred = self._ExecuteSql(sql, database_path)
-                    if pred and pred["rows"]:
-                        pred_set = set(tuple(row.items()) for row in pred["rows"])
-                        if pred_set == gold_set:
-                            candidate_hit = True
-                            break
+            for candidate in candidates:
+                candidate_sql = candidate.get("sql") or ""
+                if not candidate_sql:
+                    continue
+                # Use the in-agent result when available so the evaluator does
+                # not execute an LLM-produced query a second time unnecessarily.
+                candidate_columns = candidate.get("columns") or []
+                candidate_rows = candidate.get("rows") or []
+                candidate_verdict = self.comparer.Compare(
+                    candidate_columns,
+                    candidate_rows,
+                    candidate_sql,
+                    gold_columns,
+                    gold_rows,
+                    gold_sql,
+                )
+                candidate_outcomes.append({
+                    "sql": candidate_sql,
+                    "strictPass": candidate_verdict["strict_passed"],
+                    "relaxedPass": candidate_verdict["relaxed_passed"],
+                    "matchMode": candidate_verdict["match_mode"],
+                })
 
         except Exception as exc:
             error = error or str(exc)
@@ -174,9 +185,10 @@ class EvalRunner:
             "error": error,
             "latencyMs": latency_ms,
             "trace": trace_steps,
-            # ========== 新增：候选 SQL 相关字段 ==========
             "candidateSqls": candidate_sqls,
-            "candidateHit": candidate_hit,
+            "candidateOutcomes": candidate_outcomes,
+            "candidateHit": any(item["relaxedPass"] for item in candidate_outcomes),
+            "candidateStrictHit": any(item["strictPass"] for item in candidate_outcomes),
             "candidateCount": len(candidate_sqls),
         }
 
@@ -208,8 +220,13 @@ class EvalRunner:
             "executionSuccessRate": self._Rate(cases, lambda case: case["metrics"]["executionSucceeded"]),
             "exactMatchRate": self._Rate(cases, lambda case: case["metrics"]["exactMatch"]),
             "answerProducedRate": self._Rate(cases, lambda case: case["metrics"]["answerProduced"]),
-            # ========== 新增：候选命中率 ==========
+            "retryRepairRate": self._Rate(cases, lambda case: case["metrics"]["retryOrRepair"]),
             "candidateHitRate": self._Rate(cases, lambda case: case.get("candidateHit", False)),
+            "candidateStrictHitRate": self._Rate(cases, lambda case: case.get("candidateStrictHit", False)),
+            "candidateSelectionLossRate": self._Rate(
+                cases,
+                lambda case: case.get("candidateHit", False) and not case["metrics"]["relaxedPass"],
+            ),
             "avgLatencyMs": round(sum(latencies) / len(latencies), 2) if latencies else 0,
             "p95LatencyMs": self._Percentile(latencies, 95) if latencies else 0,
             "startedAt": started_at.isoformat(),
@@ -228,7 +245,14 @@ class EvalRunner:
             group_key: {
                 "total": len(group_cases),
                 "executionAccuracy": self._Rate(group_cases, lambda case: case["passed"]),
+                "executionAccuracyStrict": self._Rate(group_cases, lambda case: case["metrics"]["strictPass"]),
+                "executionAccuracyRelaxed": self._Rate(group_cases, lambda case: case["metrics"]["relaxedPass"]),
                 "candidateHitRate": self._Rate(group_cases, lambda case: case.get("candidateHit", False)),
+                "candidateStrictHitRate": self._Rate(group_cases, lambda case: case.get("candidateStrictHit", False)),
+                "candidateSelectionLossRate": self._Rate(
+                    group_cases,
+                    lambda case: case.get("candidateHit", False) and not case["metrics"]["relaxedPass"],
+                ),
             }
             for group_key, group_cases in groups.items()
         }
@@ -236,7 +260,7 @@ class EvalRunner:
     def _Rate(self, cases: list[dict], predicate) -> float:
         if not cases:
             return 0.0
-        return round((sum(1 for case in cases if predicate(case)) / len(cases)) * 100, 2)
+        return round(sum(1 for case in cases if predicate(case)) / len(cases), 4)
 
     def _Percentile(self, values: list[float], percentile: int) -> float:
         if not values:
@@ -260,4 +284,4 @@ class EvalRunner:
         for path in sorted(processed_dir.rglob("*")):
             if path.is_file():
                 hasher.update(path.read_bytes())
-        return hasher.hexdigest()[:16]
+        return hasher.hexdigest()

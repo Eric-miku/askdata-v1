@@ -414,8 +414,20 @@ class SQLExecutor:
         count_query = exp.select(exp.Count(this=exp.Star())).from_(unlimited.subquery(alias="_count_sub"))
         count_sql = count_query.sql(dialect=self.dialect)
 
+        existing_limit = root.args.get("limit")
+        effective_page_size = page_size
+        if existing_limit is not None:
+            try:
+                requested_limit = int(existing_limit.expression.this)
+                if requested_limit >= 0:
+                    effective_page_size = min(page_size, requested_limit)
+            except (AttributeError, TypeError, ValueError):
+                pass
+
         paged = root.copy()
-        paged.set("limit", exp.Limit(expression=exp.Literal.number(page_size)))
+        # Generated SQL may already contain a semantic LIMIT (for example a
+        # top-1 question).  Pagination must never expand that result set.
+        paged.set("limit", exp.Limit(expression=exp.Literal.number(effective_page_size)))
         paged.set("offset", exp.Offset(expression=exp.Literal.number((page - 1) * page_size)))
         paged_sql = paged.sql(dialect=self.dialect)
 

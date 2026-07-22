@@ -23,6 +23,30 @@ class FakeAgentGraph:
         }
 
 
+class FakeCandidateAgentGraph:
+    def Run(self, question, database_id, session_context=None):
+        return {
+            "answer": "There is 1 item.",
+            "sql": "SELECT 1 AS count",
+            "columns": ["count"],
+            "rows": [{"count": 1}],
+            "trace": [{"step": "SelectBestCandidate", "status": "success", "message": "Selected candidate 1."}],
+            "error": None,
+            "candidates": [
+                {
+                    "sql": "SELECT 1 AS count",
+                    "columns": ["count"],
+                    "rows": [{"count": 1}],
+                },
+                {
+                    "sql": "SELECT COUNT(id) AS count FROM items",
+                    "columns": ["count"],
+                    "rows": [{"count": 2}],
+                },
+            ],
+        }
+
+
 def write_processed_dataset(root, database_path):
     processed = root / "processed"
     processed.mkdir()
@@ -169,3 +193,25 @@ def test_eval_runner_reads_native_questions_jsonl(tmp_path):
 
     assert report["summary"]["total"] == 1
     assert report["cases"][0]["questionId"] == "bird_0001"
+
+
+def test_eval_runner_reports_candidate_hit_and_selection_loss(tmp_path):
+    database_path = tmp_path / "demo.sqlite"
+    connection = sqlite3.connect(database_path)
+    connection.execute("CREATE TABLE items(id INTEGER)")
+    connection.executemany("INSERT INTO items(id) VALUES (?)", [(1,), (2,)])
+    connection.commit()
+    connection.close()
+    processed = write_processed_dataset(tmp_path, database_path)
+
+    report = EvalRunner(processed_dir=processed, agent_graph=FakeCandidateAgentGraph()).Run()
+
+    assert report["summary"]["executionAccuracyRelaxed"] == 0.0
+    assert report["summary"]["candidateHitRate"] == 1.0
+    assert report["summary"]["candidateStrictHitRate"] == 1.0
+    assert report["summary"]["candidateSelectionLossRate"] == 1.0
+    assert report["byDatabase"]["demo"]["candidateSelectionLossRate"] == 1.0
+    case = report["cases"][0]
+    assert case["candidateCount"] == 2
+    assert case["candidateHit"] is True
+    assert case["candidateOutcomes"][1]["strictPass"] is True

@@ -24,7 +24,6 @@ function createApi(overrides: Partial<QueryApi> = {}): QueryApi {
       session_id: "session-1",
       created_at: 1,
     }),
-    deleteSession: vi.fn().mockResolvedValue(undefined),
     queryData: vi.fn().mockResolvedValue(successfulResponse),
     ...overrides,
   };
@@ -66,7 +65,7 @@ describe("query store", () => {
     ]);
   });
 
-  it("clears the conversation and retires the old session when the database changes", async () => {
+  it("clears the conversation without deleting history when the database changes", async () => {
     const api = createApi();
     const store = createQueryStore(api);
     await store.getState().loadDatabases();
@@ -74,7 +73,6 @@ describe("query store", () => {
 
     await store.getState().selectDatabase("finance");
 
-    expect(api.deleteSession).toHaveBeenCalledWith("session-1");
     expect(store.getState().database).toBe("finance");
     expect(store.getState().sessionId).toBeNull();
     expect(store.getState().turns).toEqual([]);
@@ -123,6 +121,38 @@ describe("query store", () => {
       status: "error",
       error: "SQL execution failed",
       response: responseWithError,
+    });
+  });
+
+  it("restores historical SQL rows and builds a chart when the replay response has none", async () => {
+    const api = createApi({
+      executeSql: vi.fn().mockResolvedValue({
+        columns: ["product_name", "sales_amount"],
+        rows: [{ product_name: "智能手表", sales_amount: 197000 }],
+        chart: null,
+        trace: [],
+        error: null,
+      }),
+    });
+    const store = createQueryStore(api);
+
+    await store.getState().restoreSql(
+      "demo",
+      "SELECT product_name, sales_amount FROM product_sales",
+      "历史答案",
+    );
+
+    const turn = store.getState().turns[0];
+    expect(api.executeSql).toHaveBeenCalledWith({
+      database_id: "demo",
+      sql: "SELECT product_name, sales_amount FROM product_sales",
+    });
+    expect(turn.status).toBe("success");
+    expect(turn.response?.rows).toEqual([{ product_name: "智能手表", sales_amount: 197000 }]);
+    expect(turn.response?.chart).toMatchObject({
+      type: "bar",
+      xAxis: { data: ["智能手表"] },
+      yAxis: { name: "sales_amount" },
     });
   });
 });

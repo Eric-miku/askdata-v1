@@ -2,6 +2,7 @@
 
 import json
 import re
+from typing import Any
 
 from askdata.agent.answer_shape import CheckAnswerShape
 from askdata.agent.prompts import BuildReActSystemPrompt
@@ -122,6 +123,15 @@ class ReActSqlAgent:
             last_sql = selected["sql"]
             last_columns = selected["columns"]
             last_rows = selected["rows"]
+            if len(candidates) > 1:
+                reason = selected.get("selection_reason", "deterministic candidate ranking")
+                trace.append(
+                    self._TraceStep(
+                        "SelectBestCandidate",
+                        "success",
+                        f"Selected candidate {selected.get('candidate_index', 0) + 1} of {len(candidates)}: {reason}",
+                    )
+                )
 
         return {
             "answer": answer,
@@ -129,6 +139,7 @@ class ReActSqlAgent:
             "columns": last_columns,
             "rows": last_rows,
             "trace": trace,
+            "candidates": candidates,
         }
 
     def _BuildMessages(self, question: str, schema_prompt: str, session_context: dict | None) -> list[dict]:
@@ -152,14 +163,97 @@ class ReActSqlAgent:
     def _SelectBestCandidate(self, question: str, candidates: list[dict]) -> dict | None:
         if not candidates:
             return None
-        return max(
-            candidates,
-            key=lambda candidate: (
-                not candidate.get("shape_warnings"),
-                candidate.get("sequence", 0),
-                self._IntentScore(question, candidate),
+        if len(candidates) == 1:
+            selected = candidates[0].copy()
+            selected["candidate_index"] = 0
+            selected["selection_reason"] = "only successful candidate"
+            return selected
+
+        judged = self._JudgeCandidates(question, candidates)
+        if judged is not None:
+            return judged
+
+        selected_index, selected = max(
+            enumerate(candidates),
+            key=lambda item: (
+                not item[1].get("shape_warnings"),
+                self._IntentScore(question, item[1]),
+                item[1].get("sequence", 0),
             ),
         )
+        result = selected.copy()
+        result["candidate_index"] = selected_index
+        result["selection_reason"] = "LLM judge unavailable; selected by answer-shape and intent score"
+        return result
+
+    def _JudgeCandidates(self, question: str, candidates: list[dict[str, Any]]) -> dict | None:
+        """Ask an LLM to compare executable candidates without exposing full results.
+
+        Candidate execution is already the admission criterion.  The judge only
+        ranks those candidates by semantic fit; a malformed or unavailable
+        judge response never changes the deterministic fallback behaviour.
+        """
+        summaries = []
+        for index, candidate in enumerate(candidates, start=1):
+            preview = candidate.get("rows", [])[:5]
+            summaries.append(
+                "\n".join(
+                    [
+                        f"Candidate {index}",
+                        f"SQL: {candidate.get('sql', '')}",
+                        f"Columns: {json.dumps(candidate.get('columns', []), ensure_ascii=False)}",
+                        f"Rows: {len(candidate.get('rows', []))}",
+                        f"Preview: {json.dumps(preview, ensure_ascii=False, default=str)[:1200]}",
+                        f"Answer-shape warnings: {json.dumps(candidate.get('shape_warnings', []), ensure_ascii=False)}",
+                    ]
+                )
+            )
+        prompt = "\n\n".join(
+            [
+                "You are an NL2SQL result judge. Select the candidate that directly and completely answers the user question.",
+                "Prefer the exact requested result shape. Do not reward exploratory SQL, extra columns, or a result that merely looks plausible.",
+                f"Question: {question}",
+                "Candidates:",
+                "\n\n".join(summaries),
+                'Return JSON only: {"best_index": 1, "score": 0, "reason": "short reason"}.',
+            ]
+        )
+        try:
+            response = self.llm_client.Chat([{"role": "user", "content": prompt}])
+            content = (getattr(response, "content", "") or "").strip()
+            match = re.search(r"\{[\s\S]*\}", content)
+            if not match:
+                return None
+            verdict = json.loads(match.group(0))
+            selected_index = int(verdict.get("best_index", 0)) - 1
+            if not 0 <= selected_index < len(candidates):
+                return None
+            selected = candidates[selected_index].copy()
+            selected["candidate_index"] = selected_index
+            selected["judge_score"] = verdict.get("score")
+            selected["selection_reason"] = str(verdict.get("reason") or "LLM-as-a-Judge selection")
+            return selected
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError, RuntimeError, IndexError):
+            return None
+
+    def CalcStateValue(
+        self,
+        state: dict[str, Any],
+        immediate_reward: float,
+        gamma: float = 0.95,
+        next_state_value: float | None = None,
+    ) -> float:
+        """Extension point for future value-model based candidate selection.
+
+        The default is deliberately deterministic: without a trained value
+        model, the only defensible expectation is the observed reward.  A
+        caller may supply an estimated next-state value when such a model is
+        introduced, yielding the standard one-step Bellman estimate.
+        """
+        if not 0 <= gamma <= 1:
+            raise ValueError("gamma must be between 0 and 1")
+        del state
+        return float(immediate_reward) + gamma * float(next_state_value or 0.0)
 
     def _IntentScore(self, question: str, candidate: dict) -> int:
         question_text = (question or "").lower()
@@ -173,7 +267,12 @@ class ReActSqlAgent:
         asks_rank = "rank" in question_text
         asks_extreme = bool(re.search(r"\b(top|bottom|highest|lowest|most|least|best|worst)\b", question_text))
         is_count_sql = bool(re.search(r"\bcount\s*\(", sql))
-        is_count_only = is_count_sql and len(columns) == 1
+        # COUNT used in ORDER BY/GROUP BY is often the correct way to answer
+        # an entity question such as "which team won the most".  It is a
+        # count-only result only when COUNT appears in the SELECT expression.
+        is_count_only = bool(
+            re.search(r"^\s*select\s+(?:distinct\s+)?count\s*\(", sql)
+        ) and len(columns) == 1
         is_avg_sql = bool(re.search(r"\b(avg|average)\s*\(", sql))
 
         if asks_average:

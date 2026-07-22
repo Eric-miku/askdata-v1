@@ -8,6 +8,13 @@ class QueryRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="多轮对话的会话 ID")
 
 
+class ExecuteSqlRequest(BaseModel):
+    """Read-only replay request used to restore a historical result view."""
+
+    database_id: str = Field(..., description="历史 SQL 所属的 BIRD 数据库")
+    sql: str = Field(..., min_length=1, description="Previously generated read-only SQL")
+
+
 class QueryResponse(BaseModel):
     answer: str = Field(..., description="LLM 生成的最终中文解释")
     sql: Optional[str] = Field(None, description="系统生成并执行的 SQL 语句")

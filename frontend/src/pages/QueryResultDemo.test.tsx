@@ -6,6 +6,7 @@ const apiMocks = vi.hoisted(() => ({
   listDatabases: vi.fn(),
   createSession: vi.fn(),
   deleteSession: vi.fn(),
+  executeSql: vi.fn(),
   queryData: vi.fn(),
 }));
 
@@ -27,6 +28,13 @@ describe("QueryResultDemo", () => {
       created_at: 1,
     });
     apiMocks.deleteSession.mockReset().mockResolvedValue(undefined);
+    apiMocks.executeSql.mockReset().mockResolvedValue({
+      columns: [],
+      rows: [],
+      chart: null,
+      trace: [],
+      error: null,
+    });
     apiMocks.queryData.mockReset().mockResolvedValue({
       answer: "Demo 中共有 3 条记录。",
       sql: "SELECT COUNT(id) AS count FROM items",

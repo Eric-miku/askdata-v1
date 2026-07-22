@@ -4,6 +4,8 @@
 """
 
 from .metrics import (
+    BirdResultComparer,
+    ExactMatch,
     exact_match,
     exact_match_accuracy,
     execution_accuracy,
@@ -18,6 +20,8 @@ from .runner import EvalRunner
 
 __all__ = [
     "exact_match",
+    "ExactMatch",
+    "BirdResultComparer",
     "exact_match_accuracy",
     "execution_accuracy",
     "execution_accuracy_batch",

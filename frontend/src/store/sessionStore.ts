@@ -1,71 +1,51 @@
 import { create } from "zustand";
-
-
-export interface SessionItem {
-
-    session_id:string;
-
-    title:string;
-
-    created_at:string;
-
-}
-
+import { getSession, listSessions } from "../api/query";
+import type { SessionInfo } from "../types/query";
+import { useQueryStore } from "./queryStore";
 
 interface SessionState {
-
-    currentSessionId:string | null;
-
-    sessions:SessionItem[];
-
-    setSessions:
-    (sessions:SessionItem[])=>void;
-
-    switchSession:
-    (sessionId:string)=>void;
-
+  currentSessionId: string | null;
+  sessions: SessionInfo[];
+  loading: boolean;
+  error: string | null;
+  loadSessions: () => Promise<void>;
+  setCurrentSession: (sessionId: string | null) => void;
+  switchSession: (sessionId: string) => Promise<void>;
 }
 
-
-export const useSessionStore=create<SessionState>((set)=>({
-
-    currentSessionId:null,
-
-   sessions:[
-
-    {
-        session_id:"session_001",
-        title:"销售额分析",
-        created_at:"2026-07-21"
-    },
-
-
-    {
-        session_id:"session_002",
-        title:"用户增长分析",
-        created_at:"2026-07-20"
-    },
-
-
-    {
-        session_id:"session_003",
-        title:"订单统计分析",
-        created_at:"2026-07-19"
+export const useSessionStore = create<SessionState>((set) => ({
+  currentSessionId: null,
+  sessions: [],
+  loading: false,
+  error: null,
+  async loadSessions() {
+    set({ loading: true, error: null });
+    try {
+      set({ sessions: await listSessions(), loading: false });
+    } catch (error) {
+      set({ loading: false, error: error instanceof Error ? error.message : String(error) });
     }
-
-],
-
-
-    setSessions:(sessions)=>
-        set({
-            sessions
-        }),
-
-
-    switchSession:(sessionId)=>
-        set({
-            currentSessionId:sessionId
-        })
-
-
+  },
+  setCurrentSession(sessionId) {
+    set({ currentSessionId: sessionId });
+  },
+  async switchSession(sessionId) {
+    set({ loading: true, error: null });
+    try {
+      const detail = await getSession(sessionId);
+      const latest = [...detail.history].reverse().find((item) => item.sql);
+      useQueryStore.setState({
+        sessionId: detail.session_id,
+        database: detail.database_id || "",
+        turns: [],
+        loading: false,
+      });
+      if (latest?.sql && detail.database_id) {
+        await useQueryStore.getState().restoreSql(detail.database_id, latest.sql, latest.answer);
+      }
+      set({ currentSessionId: sessionId, loading: false });
+    } catch (error) {
+      set({ loading: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  },
 }));

@@ -39,6 +39,7 @@ query_runner.py
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Optional
 
 import cchardet
@@ -160,3 +161,39 @@ def build_sqlite_engine(db_url: str, **create_engine_kwargs) -> Engine:
         dbapi_conn.text_factory = text_factory
 
     return engine
+
+
+def Execute(sql: str, database_path: str, page_size: int = 1000) -> dict:
+    """Execute a read-only SQLite query using the shared resilient executor.
+
+    This small adapter is the application-facing query contract used by the
+    ReAct agent and evaluation runner.  It deliberately verifies the path
+    before constructing a SQLite URL: SQLite otherwise creates a new empty
+    database for a misspelled path, which turns a configuration error into a
+    misleading SQL error.
+    """
+    path = Path(database_path)
+    if not path.is_file():
+        return {"success": False, "error": f"SQLite database does not exist: {path}"}
+
+    from askdata.db.executor import SQLExecutor
+
+    result = SQLExecutor(
+        f"sqlite:///{path.resolve()}",
+        dialect="sqlite",
+        default_page_size=page_size,
+        max_page_size=page_size,
+    ).execute(sql, page_size=page_size)
+    if not result.success:
+        error = result.error
+        return {
+            "success": False,
+            "error": (error.detail or error.message) if error else "SQL execution failed.",
+        }
+    return {
+        "success": True,
+        "columns": [column.key for column in result.columns],
+        "rows": result.rows,
+        "sql": result.sql,
+        "pagination": result.pagination.to_dict() if result.pagination else None,
+    }

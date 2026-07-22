@@ -1,3 +1,5 @@
+export type ThemeMode = "light" | "dark";
+
 export type QueryCellValue =
   | string
   | number
@@ -7,32 +9,55 @@ export type QueryCellValue =
   | Record<string, unknown>
   | unknown[];
 
-export interface TraceItem {
-
-  step:number;
-
-  status:string;
-
-  message:string;
-
+export interface DatabaseInfo {
+  id: string;
+  name: string;
+  tables_count?: number;
 }
 
+export interface StructuredTraceItem {
+  step: string;
+  status: string;
+  message: string;
+}
 
+export type TraceItem = StructuredTraceItem | string;
 
 export interface QueryResponse {
+  answer: string;
+  sql: string | null;
+  columns: string[] | null;
+  rows: Record<string, QueryCellValue>[] | QueryCellValue[][] | null;
+  chart?: Record<string, unknown> | null;
+  trace?: TraceItem[];
+  error?: string | null;
+}
 
-  answer:string;
+export interface SessionInfo {
+  session_id: string;
+  thread_id?: string;
+  created_at: number;
+  updated_at?: number;
+  database_id?: string | null;
+  question_count?: number;
+}
 
-  sql:string;
+export interface SessionHistoryItem {
+  question: string;
+  sql: string | null;
+  answer: string;
+  timestamp: number;
+}
 
-  columns:string[];
+export interface SessionDetail extends SessionInfo {
+  history: SessionHistoryItem[];
+}
 
-  rows:any[][];
-
-  chart?:any;
-
-  trace?:TraceItem[];
-
-  error?:string;
-
+export interface ChatTurn {
+  id: string;
+  question: string;
+  databaseId?: string;
+  status: "loading" | "success" | "error";
+  response?: QueryResponse;
+  error?: string;
 }

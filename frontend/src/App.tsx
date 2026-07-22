@@ -1,31 +1,24 @@
-import { useEffect, useState } from "react";
-import { ConfigProvider, theme as antdTheme } from "antd";
-import zhCN from "antd/locale/zh_CN";
-import { QueryResultDemo } from "./pages/QueryResultDemo";
+import { useState } from "react";
 import HistorySidebar from "./components/HistorySidebar";
-
+import { QueryResultDemo } from "./pages/QueryResultDemo";
+import { getInitialTheme, saveTheme, applyTheme } from "./theme";
 
 export default function App() {
-
+  const [theme, setTheme] = useState(() => {
+    const initial = getInitialTheme();
+    applyTheme(initial);
+    return initial;
+  });
+  const toggleTheme = () => {
+    const next = theme === "dark" ? "light" : "dark";
+    setTheme(next);
+    saveTheme(next);
+    applyTheme(next);
+  };
   return (
-
-    <div className="flex h-screen">
-
-
+    <div className="app-shell">
       <HistorySidebar />
-
-
-      <main className="flex-1">
-
-
-        <QueryResultDemo />
-
-
-      </main>
-
-
+      <QueryResultDemo theme={theme} onToggleTheme={toggleTheme} />
     </div>
-
   );
-
 }

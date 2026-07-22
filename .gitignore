@@ -7,6 +7,7 @@
 .venv
 venv.nosync/
 __pycache__/
+.ipynb_checkpoints/
 *.py[cod]
 *.pyo
 *.pyd
@@ -27,9 +28,11 @@ frontend/.vite/
 .DS_Store
 
 # Local test / scratch
+.checkpoints/
 test_api.py
 reports/
 *.log
+data-processing/uv.lock
 
 # Data
 /data/
