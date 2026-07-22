@@ -1,16 +1,10 @@
 import axios from "axios";
-import type {
-  DatabaseInfo,
-  QueryResponse,
-  SessionInfo,
-} from "../types/query";
+import type { QueryResponse } from "../types/query";
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000/api";
 
-export interface QueryRequest {
-  database_id: string;
-  question: string;
-  session_id: string;
+interface QueryRequest {
+  database_id:string;
+  question:string;
 }
 
 export interface ExecuteSqlRequest {
