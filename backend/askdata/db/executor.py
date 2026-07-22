@@ -11,6 +11,27 @@ executor.py
 注意: request_id / question / chart_builder / analysis 不属于本模块职责,
 由 Agent 编排层或 API 层在拿到 ExecutionResult.to_api_format() 的返回值后,
 和其他节点的产出一起拼装成完整的 QueryResultResponse。
+
+P1 超时打断机制说明:
+    大模型生成的 SQL 质量不完全可控, 可能写出笛卡尔积 JOIN、死循环递归 CTE 等
+    会长时间挂起的语句。如果不加控制, 每一条这样的查询都会占用一个数据库连接
+    直到它自己执行完 (可能是几分钟甚至更久), 并发几次就能把连接池耗尽, 导致
+    其他正常请求也拿不到连接、整体服务瘫痪。
+
+    防护做两层:
+    1. 会话级超时 (尽力而为, 依赖数据库支持): 连接建立后, 对 PostgreSQL/MySQL
+       下发 SET statement_timeout / SET SESSION MAX_EXECUTION_TIME, 让数据库
+       自己在超时后掐断查询。SQLite 没有这个机制, 会静默跳过。
+    2. 应用层墙钟超时 (通用, 不依赖数据库支持): 把实际执行放到独立线程里,
+       主线程只等 statement_timeout_s 秒。超时后调用 conn.invalidate() 强制
+       废弃这个连接 (不会归还给连接池, 下次会创建全新连接), 从而保证连接池
+       不会被一条卡住的查询永久占死, 即使数据库本身不支持超时设置。
+
+       局限性: 应用层超时不保证数据库端的查询立刻停止执行 (取决于具体驱动
+       对"从另一线程关闭连接"的处理方式), 但能保证:
+         (a) 调用方不会被无限阻塞, 固定时间内一定拿到 TIMEOUT 错误
+         (b) 连接池的这个槽位不会被占死, 后续请求仍能正常拿到连接
+       这已经覆盖了"防止连接池耗尽"这个核心诉求。
 """
 
 from __future__ import annotations
@@ -18,20 +39,22 @@ from __future__ import annotations
 import datetime
 import decimal
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
-
 import sqlglot
 from sqlglot import exp
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import text
+from sqlalchemy.engine import Engine, Connection
+from sqlalchemy.exc import SQLAlchemyError, TimeoutError as SATimeoutError
 
 from .validator import SQLValidator, ValidationResult
+from .query_runner import build_sqlite_engine
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
 
 
 # ---------------------------------------------------------------------------
@@ -40,8 +63,12 @@ from .validator import SQLValidator, ValidationResult
 class ErrorCode:
     SQL_BLOCKED = "SQL_BLOCKED"       # 未通过安全校验 (危险操作 / 多语句注入 / 黑名单表)
     DB_ERROR = "DB_ERROR"             # 数据库执行报错 (语法错误、字段不存在、连接失败等)
-    TIMEOUT = "TIMEOUT"               # 执行超时
+    TIMEOUT = "TIMEOUT"               # 执行超时 (查询本身太慢, 或等不到连接池里的连接)
     UNKNOWN_ERROR = "UNKNOWN_ERROR"   # 兜底
+
+
+class QueryTimeoutError(Exception):
+    """内部使用: 标记一次查询触发了应用层墙钟超时"""
 
 
 @dataclass
@@ -132,6 +159,10 @@ class SQLExecutor:
         max_page_size: int = 1000,
         forbidden_tables: Optional[set] = None,
         pool_pre_ping: bool = True,
+        statement_timeout_s: float = 15.0,
+        pool_size: int = 10,
+        max_overflow: int = 5,
+        pool_timeout: float = 10.0,
         engine: Optional[Engine] = None,
     ):
         """
@@ -139,21 +170,55 @@ class SQLExecutor:
         :param dialect: 传给 sqlglot 的方言标识, 需与 db_url 对应的数据库类型一致
         :param default_page_size: 未指定 page_size 时的默认每页条数
         :param max_page_size: page_size 的硬上限, 防止前端传入超大值拖垮数据库
-        :param engine: 允许外部注入已创建的 Engine (便于测试复用内存库连接)
+        :param statement_timeout_s: 单条 SQL 最长允许执行时间 (秒), 超时会被强制中断并释放连接
+        :param pool_size: 连接池常驻连接数
+        :param max_overflow: 连接池允许的临时溢出连接数 (高峰期超出 pool_size 时使用)
+        :param pool_timeout: 连接池已满时, 等待空闲连接的最长时间 (秒), 超时抛出池级别的 TIMEOUT
+        :param engine: 允许外部注入已创建的 Engine (便于测试复用内存库连接; 传入时上面几个连接池参数不生效)
         """
-        self.engine: Engine = engine or create_engine(db_url, pool_pre_ping=pool_pre_ping)
+        is_sqlite = dialect == "sqlite" or (db_url and db_url.startswith("sqlite"))
+
+        if engine is not None:
+            self.engine: Engine = engine
+        elif is_sqlite:
+            # P3 动态字符编码适配: query_runner.build_sqlite_engine() 是 db 模块里
+            # 唯一负责组装 SQLite engine 的地方——挂载数据库前先探知文件编码,
+            # 引擎创建完成后立刻挂上"多编码兜底"的 text_factory, 防止 GBK/UTF-8
+            # 混用的脏数据直接崩掉查询。同时也顺带处理了 check_same_thread=False
+            # (超时保护机制需要在独立线程里执行查询, 详见 query_runner.py 内注释)。
+            self.engine = build_sqlite_engine(
+                db_url,
+                pool_pre_ping=pool_pre_ping,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_timeout=pool_timeout,
+            )
+        else:
+            # 非 SQLite 方言 (PostgreSQL/MySQL 等) 不涉及"文件字节编码探测"这个问题,
+            # 走原生 create_engine 即可
+            from sqlalchemy import create_engine as _create_engine
+
+            self.engine = _create_engine(
+                db_url,
+                pool_pre_ping=pool_pre_ping,
+                pool_size=pool_size,
+                max_overflow=max_overflow,
+                pool_timeout=pool_timeout,
+            )
+
         self.dialect = dialect
         self.validator = SQLValidator(dialect=dialect, forbidden_tables=forbidden_tables)
         self.default_page_size = default_page_size
         self.max_page_size = max_page_size
+        self.statement_timeout_s = statement_timeout_s
 
     # ------------------------------------------------------------------
     # 主入口
     # ------------------------------------------------------------------
     def execute(self, sql: str, page: int = 1, page_size: Optional[int] = None) -> ExecutionResult:
         """
-        校验 -> 改写分页 -> 执行 -> 统一格式化。
-        校验失败 / 执行失败都不抛异常, 而是封装进 ExecutionResult.error,
+        校验 -> 改写分页 -> 执行(带超时保护) -> 统一格式化。
+        校验失败 / 执行失败 / 超时都不抛异常, 而是封装进 ExecutionResult.error,
         方便 Agent 编排层统一捕获并决定是否触发 SQL Repair 重试。
         """
         page = max(1, page)
@@ -169,38 +234,76 @@ class SQLExecutor:
 
         try:
             paged_sql, count_sql = self._build_paginated_queries(validation.normalized_sql, page, page_size)
-            fetch_cap = page_size  # 正常路径: SQL 里已经有精确的 LIMIT, fetchmany 按 page_size 取即可
+            fetch_cap = page_size
         except Exception:
-            # AST 改写失败 (极少数复杂语句结构), 降级为不注入 LIMIT 直接执行。
-            # 这种情况下 SQL 本身可能没有行数限制, 必须在 Python 侧用 fetchmany 硬性兜底,
-            # 否则遇到大表会整表拉进内存, 拖垮服务和数据库。
             paged_sql, count_sql = validation.normalized_sql, None
             fetch_cap = self.max_page_size
 
         start = time.perf_counter()
+
+        # 第一层防护: 拿连接本身也可能因为连接池耗尽而卡住, pool_timeout 保证这里不会无限等待
         try:
-            with self.engine.connect() as conn:
+            conn = self.engine.connect()
+        except SATimeoutError:
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+            return ExecutionResult(
+                success=False,
+                sql=paged_sql,
+                elapsed_ms=elapsed_ms,
+                error=ErrorInfo(
+                    ErrorCode.TIMEOUT,
+                    "数据库连接池繁忙, 暂时无法获取连接",
+                    f"等待连接超过 {self.engine.pool.timeout()}s" if hasattr(self.engine.pool, "timeout") else None,
+                ),
+            )
+        except SQLAlchemyError as e:
+            elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+            return ExecutionResult(
+                success=False,
+                sql=paged_sql,
+                elapsed_ms=elapsed_ms,
+                error=ErrorInfo(ErrorCode.DB_ERROR, "无法建立数据库连接", self._simplify_db_error(e)),
+            )
+
+        timed_out = False
+        try:
+            try:
+                conn = conn.execution_options(postgresql_readonly=True)
+            except Exception:
+                pass
+
+            self._apply_session_timeout(conn)  # 第二层防护(尽力而为): 数据库自身的会话级超时
+
+            try:
+                # 第三层防护(通用兜底): 应用层墙钟超时, 独立线程执行, 超时则强制废弃连接
+                result = self._execute_with_wall_clock_timeout(conn, paged_sql, self.statement_timeout_s)
+            except QueryTimeoutError:
+                timed_out = True
+                elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+                return ExecutionResult(
+                    success=False,
+                    sql=paged_sql,
+                    elapsed_ms=elapsed_ms,
+                    error=ErrorInfo(
+                        ErrorCode.TIMEOUT,
+                        f"SQL 执行超过 {self.statement_timeout_s} 秒, 已强制终止",
+                        "疑似低效查询(如笛卡尔积 JOIN、递归死循环), 建议触发 SQL Repair 重新生成",
+                    ),
+                )
+
+            col_names = list(result.keys())
+            deduped_names = self._dedupe_column_names(col_names)
+            fetched = result.fetchmany(fetch_cap)
+            rows = [dict(zip(deduped_names, r)) for r in fetched]
+
+            total = len(rows)
+            if count_sql:
                 try:
-                    conn = conn.execution_options(postgresql_readonly=True)
+                    total = conn.execute(text(count_sql)).scalar_one()
                 except Exception:
-                    pass
-
-                result = conn.execute(text(paged_sql))
-                col_names = list(result.keys())
-                deduped_names = self._dedupe_column_names(col_names)
-                fetched = result.fetchmany(fetch_cap)  # 硬性行数上限, 不用 fetchall, 防止无 LIMIT 时拖垮内存
-                rows = [dict(zip(deduped_names, r)) for r in fetched]
-
+                    total = (page - 1) * page_size + len(rows)
+            elif len(fetched) >= fetch_cap:
                 total = len(rows)
-                if count_sql:
-                    try:
-                        total = conn.execute(text(count_sql)).scalar_one()
-                    except Exception:
-                        total = (page - 1) * page_size + len(rows)  # 退化估计值
-                elif len(fetched) >= fetch_cap:
-                    # fallback 路径且行数刚好等于硬上限, total 大概率不准确(可能还有更多行未取)
-                    # 没有更好的手段拿到精确总数, 只能先如实反映"已知下限"
-                    total = len(rows)
 
             elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
             columns = self._infer_columns(deduped_names, rows)
@@ -230,6 +333,74 @@ class SQLExecutor:
                 elapsed_ms=elapsed_ms,
                 error=ErrorInfo(ErrorCode.UNKNOWN_ERROR, "未知错误", str(e)),
             )
+        finally:
+            if not timed_out:
+                # 正常路径: 同步关闭连接, 归还给连接池
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            # 超时路径: 不在这里同步 close()。 conn.invalidate() 已经让这个连接
+            # 不会被连接池复用了; 如果这里再调用 close(), 会因为后台线程还卡在
+            # 原来那条慢查询里而被一起阻塞住, 导致"超时保护"名存实亡——调用方
+            # 依然要等满整个慢查询跑完才能拿到返回值。所以超时场景下直接放手,
+            # 底层连接对象会在后台线程执行完、双方都不再引用它之后被 GC 回收。
+
+    # ------------------------------------------------------------------
+    # 会话级超时 (尽力而为): 不同数据库语法不同, 不支持的直接忽略, 不影响主流程
+    # ------------------------------------------------------------------
+    def _apply_session_timeout(self, conn: Connection) -> None:
+        timeout_ms = int(self.statement_timeout_s * 1000)
+        try:
+            if self.dialect in ("postgres", "postgresql"):
+                conn.execute(text(f"SET statement_timeout = {timeout_ms}"))
+            elif self.dialect == "mysql":
+                conn.execute(text(f"SET SESSION MAX_EXECUTION_TIME = {timeout_ms}"))
+            # sqlite / 其他方言没有对应机制, 完全依赖下面的应用层墙钟超时兜底
+        except Exception:
+            pass  # 会话级超时设置失败不应该阻断主查询, 有应用层兜底
+
+    # ------------------------------------------------------------------
+    # 应用层墙钟超时 (通用兜底): 独立线程执行, 超时后 invalidate 连接释放连接池槽位
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _execute_with_wall_clock_timeout(conn: Connection, sql_text: str, timeout_s: float):
+        box: dict = {}
+
+        def worker():
+            try:
+                box["result"] = conn.execute(text(sql_text))
+            except Exception as e:  # noqa: BLE001
+                box["error"] = e
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(timeout_s)
+
+        if thread.is_alive():
+            # 查询仍未返回。注意: conn.invalidate()/conn.close() 此时会因为要等待
+            # worker 线程释放对连接的占用而同样被阻塞住(相当于白等), 所以这里不能
+            # 同步调用它们, 否则"超时保护"名存实亡。
+            #
+            # 做法: 起一个后台守护线程, 等 worker 真正跑完(不管多久)后再做清理;
+            # 当前调用方不等这个清理过程, 立刻拿到 TIMEOUT 错误返回。
+            def _cleanup_when_finished():
+                thread.join()  # 等真正的查询线程自然结束
+                try:
+                    conn.invalidate()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+            threading.Thread(target=_cleanup_when_finished, daemon=True).start()
+            raise QueryTimeoutError(f"查询超过 {timeout_s} 秒未返回")
+
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
 
     # ------------------------------------------------------------------
     # 分页 / 计数 SQL 改写 (基于 sqlglot AST, 比字符串拼接更可靠)
@@ -237,14 +408,12 @@ class SQLExecutor:
     def _build_paginated_queries(self, sql: str, page: int, page_size: int):
         root = sqlglot.parse_one(sql, read=self.dialect)
 
-        # 计数查询: 去掉原有 LIMIT/OFFSET 后包一层 SELECT COUNT(*)
         unlimited = root.copy()
         unlimited.set("limit", None)
         unlimited.set("offset", None)
         count_query = exp.select(exp.Count(this=exp.Star())).from_(unlimited.subquery(alias="_count_sub"))
         count_sql = count_query.sql(dialect=self.dialect)
 
-        # 分页查询: 用我们自己的 page/page_size 覆盖模型可能生成的 LIMIT
         paged = root.copy()
         paged.set("limit", exp.Limit(expression=exp.Literal.number(page_size)))
         paged.set("offset", exp.Offset(expression=exp.Literal.number((page - 1) * page_size)))
@@ -256,7 +425,6 @@ class SQLExecutor:
     # 重名列处理: 多表 JOIN 未加别名时 (如 SELECT a.id, b.id FROM a JOIN b)
     # SQLAlchemy 返回的 col_names 会有重复, dict(zip(...)) 会静默丢数据。
     # 这里给重复列加后缀区分, 保证 columns 数量和 rows 的 key 数量一致。
-    # 注意: 这只是兜底, 更根本的做法是提醒 NL2SQL 组生成 SQL 时对重名列显式加别名。
     # ------------------------------------------------------------------
     @staticmethod
     def _dedupe_column_names(col_names: list) -> list:
@@ -284,7 +452,7 @@ class SQLExecutor:
                 if v is None:
                     continue
                 if isinstance(v, bool):
-                    col_type = "string"  # 布尔值前端契约里没有对应类型, 按文本展示
+                    col_type = "string"
                 elif isinstance(v, (int, float, decimal.Decimal)):
                     col_type = "number"
                 elif isinstance(v, datetime.datetime):
@@ -297,12 +465,10 @@ class SQLExecutor:
                     col_type = "date"
                 else:
                     col_type = "string"
-                break  # 用第一个非空值判断即可, 同一列类型通常一致
+                break
 
             fmt = "plain"
             if col_type == "number":
-                # 简单启发式: 字段名包含金额/价格等关键字时, 提示前端按货币格式化
-                # 命中率有限, 更准确的做法是从 NL2SQL 组的 Schema 元信息里读字段语义, 后续可对接
                 lowered = name.lower()
                 if any(k in lowered for k in ("amount", "price", "salary", "revenue", "cost", "金额", "价格")):
                     fmt = "currency"
@@ -314,7 +480,7 @@ class SQLExecutor:
             columns.append(
                 ColumnMeta(
                     key=name,
-                    title=name,  # 中文展示名建议由 NL2SQL/Schema 层的字段注释覆盖, 这里先用原始字段名兜底
+                    title=name,
                     type=col_type,
                     format=fmt,
                     sortable=True,
