@@ -39,7 +39,7 @@ from askdata.api.schemas import (
 )
 from askdata.api.trace import TraceLogger
 from askdata.api.session_manager import session_manager
-from askdata.agent.graph import AgentGraph, RunAgent
+from askdata.agent.graph import AgentGraph
 from askdata.core.config import settings
 from askdata.core.paths import project_path
 
@@ -515,9 +515,6 @@ async def execute_query(request: QueryRequest):
         session_id = await session_manager.create_session(request.database_id)
         trace.log("创建新会话", f"session_id={session_id}")
 
-    # 获取 LangGraph thread_id（用于 SqliteSaver 检查点恢复）
-    thread_id = session_manager.get_thread_id(session_id)
-
     history = await session_manager.get_history(session_id) or []
     session_context = {}
     if history:
@@ -527,20 +524,17 @@ async def execute_query(request: QueryRequest):
             "last_sql": last_item.get("sql"),
         }
 
-    # ---------- 调用 Agent 工作流（传入 thread_id 以启用检查点） ----------
+    # ---------- 调用 Agent 工作流 ----------
     try:
         # 使用 AgentGraph 执行完整的 NL2SQL 工作流
-        # thread_id 传递给 LangGraph 的 configurable，
-        # SqliteSaver 据此自动保存/恢复 Agent 的多轮对话状态
-        result = await RunAgent(
+        result = await AgentGraph().ARun(
             question=request.question,
             database_id=request.database_id,
             session_context=session_context,
-            thread_id=thread_id,  # 启用 LangGraph 检查点持久化
         )
 
         # 合并 API 层 Trace + Agent 层 Trace
-        combined_trace = trace.get_logs() + result.get("trace", [])
+        combined_trace = result.get("trace", []) + trace.get_logs()
 
         response = QueryResponse(
             answer=result["answer"],

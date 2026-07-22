@@ -66,13 +66,13 @@ def prepare_raw_bird(zip_path: Path, extract_dir: Path, target_dir: Path) -> Non
     dev_databases = find_dev_databases(extract_dir)
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(dev_tables, target_dir / "dev_tables.json")
-    shutil.copy2(mini_dev_sqlite, target_dir / "mini_dev_sqlite.json")
+    copy_raw_file(dev_tables, target_dir / "dev_tables.json")
+    copy_raw_file(mini_dev_sqlite, target_dir / "mini_dev_sqlite.json")
 
     target_databases = target_dir / "dev_databases"
     if target_databases.exists():
         shutil.rmtree(target_databases)
-    shutil.copytree(dev_databases, target_databases, ignore=ignore_artifacts)
+    copy_raw_tree(dev_databases, target_databases)
 
     print(f"Prepared raw files in: {target_dir}")
     print(f"SQLite databases copied from: {dev_databases}")
@@ -83,6 +83,30 @@ def find_one(root: Path, name: str) -> Path:
     if not matches:
         raise SystemExit(f"Could not find {name} under {root}")
     return matches[0]
+
+
+def copy_raw_file(source: Path | str, target: Path | str) -> str:
+    """Copy file contents without preserving metadata.
+
+    Some mounted filesystems reject timestamp/mode updates from shutil.copy2.
+    The preprocessing contract only needs file contents, so avoid copystat.
+    """
+    shutil.copyfile(source, target)
+    return str(target)
+
+
+def copy_raw_tree(source: Path, target: Path) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    for path in sorted(source.rglob("*")):
+        if is_artifact_path(path):
+            continue
+        relative = path.relative_to(source)
+        destination = target / relative
+        if path.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        copy_raw_file(path, destination)
 
 
 def find_dev_databases(root: Path) -> Path:

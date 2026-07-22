@@ -244,7 +244,7 @@ def copy_sqlite_databases(paths: PreparedPaths) -> dict[str, Path]:
         target_dir.mkdir(parents=True, exist_ok=True)
         target_db = target_dir / source_db.name
         if not target_db.exists() or source_db.stat().st_size != target_db.stat().st_size:
-            shutil.copy2(source_db, target_db)
+            shutil.copyfile(source_db, target_db)
         copied[database_id] = target_db
     if not copied:
         raise SystemExit(f"No SQLite databases found under {source_root}")
