@@ -1,11 +1,51 @@
-from pydantic import BaseModel, Field
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+def _strip_optional(value: Optional[str]) -> Optional[str]:
+    stripped = value.strip() if value else ""
+    return stripped or None
+
+
+class ClarificationResolution(BaseModel):
+    clarification_id: str
+    option_id: Optional[str] = None
+    text: Optional[str] = None
+
+    @field_validator("clarification_id")
+    @classmethod
+    def require_nonblank_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("clarification_id must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def require_exactly_one_resolution(self) -> "ClarificationResolution":
+        self.option_id = _strip_optional(self.option_id)
+        self.text = _strip_optional(self.text)
+
+        if bool(self.option_id) == bool(self.text):
+            raise ValueError("Provide exactly one of option_id or text")
+        return self
+
 
 
 class QueryRequest(BaseModel):
-    question: str = Field(..., description="用户输入的自然语言问题")
     database_id: str = Field(..., description="选中的 BIRD 数据库 ID，如 'california_schools'")
     session_id: Optional[str] = Field(None, description="多轮对话的会话 ID")
+    question: Optional[str] = Field(None, description="用户输入的自然语言问题")
+    clarification: Optional[ClarificationResolution] = None
+
+    @model_validator(mode="after")
+    def require_exactly_one_input(self) -> "QueryRequest":
+        self.question = _strip_optional(self.question)
+
+        if bool(self.question) == (self.clarification is not None):
+            raise ValueError("Provide exactly one of question or clarification")
+        return self
+
 
 
 class QueryResponse(BaseModel):

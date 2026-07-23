@@ -3,8 +3,10 @@
 import json
 import re
 
+from pydantic import BaseModel, Field
+
 from askdata.agent.answer_shape import CheckAnswerShape
-from askdata.agent.prompts import BuildReActSystemPrompt
+from askdata.agent.prompts import BuildAnalysisContextSection, BuildReActSystemPrompt
 
 RUN_QUERY_TOOL = {
     "type": "function",
@@ -22,6 +24,21 @@ RUN_QUERY_TOOL = {
 }
 
 
+class SqlCandidateDraft(BaseModel):
+    """An unexecuted SQL proposal produced by the focused ReAct generator."""
+
+    sql: str
+    reason: str = ""
+    referenced_context: list[str] = Field(default_factory=list)
+    tool_call_id: str = ""
+
+
+class CandidateGenerationState(BaseModel):
+    """Conversation messages retained across deterministic recovery stages."""
+
+    messages: list[dict] = Field(default_factory=list)
+
+
 class ReActSqlAgent:
     """Tool-calling SQL loop that can be used as one node inside AgentGraph."""
 
@@ -29,6 +46,91 @@ class ReActSqlAgent:
         self.llm_client = llm_client
         self.max_iterations = max_iterations
         self.skill_loader = skill_loader
+
+    def GenerateCandidates(
+        self,
+        question: str,
+        schema_prompt: str,
+        session_context: dict | None = None,
+        *,
+        state: CandidateGenerationState | None = None,
+    ) -> list[SqlCandidateDraft]:
+        """Generate SQL drafts while leaving execution and selection to the pipeline."""
+
+        messages = (
+            state.messages
+            if state is not None
+            else self._BuildMessages(question, schema_prompt, session_context)
+        )
+        if state is not None and session_context and session_context.get("pipeline_stage") != "initial":
+            messages.append(
+                {
+                    "role": "user",
+                    "content": self._PipelineCorrection(session_context),
+                }
+            )
+        message = self.llm_client.Chat(messages, tools=[RUN_QUERY_TOOL])
+        reason = self._CleanFinalAnswer(getattr(message, "content", None) or "")
+        messages.append(self._AssistantMessage(message))
+        drafts = []
+        for tool_call in getattr(message, "tool_calls", None) or []:
+            if tool_call.function.name != "run_query":
+                continue
+            sql = self._CleanSql(self._ParseSql(tool_call.function.arguments))
+            drafts.append(
+                SqlCandidateDraft(
+                    sql=sql,
+                    reason=reason,
+                    tool_call_id=tool_call.id,
+                )
+            )
+        return drafts
+
+    def NewCandidateState(
+        self,
+        question: str,
+        schema_prompt: str,
+        session_context: dict | None = None,
+    ) -> CandidateGenerationState:
+        return CandidateGenerationState(
+            messages=self._BuildMessages(question, schema_prompt, session_context)
+        )
+
+    def RecordExecutionFeedback(
+        self,
+        state: CandidateGenerationState,
+        draft: SqlCandidateDraft,
+        feedback: dict,
+    ) -> None:
+        """Append bounded tool feedback without exposing raw database errors."""
+
+        payload = {
+            "success": bool(feedback.get("success")),
+            "failureClass": feedback.get("failure_class"),
+            "error": str(feedback.get("error") or "")[:300],
+            "columns": list(feedback.get("columns") or []),
+            "rowCount": len(feedback.get("rows") or []),
+            "rows": list(feedback.get("rows") or [])[:20],
+        }
+        state.messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": draft.tool_call_id,
+                "content": json.dumps(payload, ensure_ascii=False, default=str),
+            }
+        )
+
+    def RecordRetrievalContext(
+        self,
+        state: CandidateGenerationState,
+        schema_prompt: str,
+    ) -> None:
+        state.messages.append(
+            {
+                "role": "user",
+                "content": f"Expanded database schema context:\n{schema_prompt}",
+            }
+        )
 
     def Run(self, question: str, schema_prompt: str, database_path: str, session_context: dict | None = None) -> dict:
         messages = self._BuildMessages(question, schema_prompt, session_context)
@@ -135,6 +237,12 @@ class ReActSqlAgent:
         previous = ""
         if session_context and session_context.get("last_sql"):
             previous = f"\nPrevious SQL: {session_context['last_sql']}"
+        if session_context and session_context.get("pipeline_stage"):
+            previous += f"\nRecovery stage: {session_context['pipeline_stage']}"
+        if session_context and session_context.get("pipeline_previous_sql"):
+            previous += f"\nPrevious candidate SQL: {session_context['pipeline_previous_sql']}"
+        if session_context and session_context.get("pipeline_feedback"):
+            previous += f"\nCorrection needed: {session_context['pipeline_feedback']}"
         system_prompt = BuildReActSystemPrompt()
 
         if self.skill_loader:
@@ -142,8 +250,21 @@ class ReActSqlAgent:
             if skills:
                 system_prompt += "\n\n" + skills
 
-        user_prompt = f"Question: {question}{previous}\n\nDatabase Schema:\n{schema_prompt}"
+        analysis_section = self._AnalysisSection(session_context)
+        user_prompt = f"Question: {question}{previous}{analysis_section}\n\nDatabase Schema:\n{schema_prompt}"
         return [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+
+    def _AnalysisSection(self, session_context: dict | None) -> str:
+        return BuildAnalysisContextSection(session_context)
+
+    def _PipelineCorrection(self, session_context: dict) -> str:
+        parts = [f"Recovery stage: {session_context.get('pipeline_stage', 'repair')}."]
+        if session_context.get("pipeline_previous_sql"):
+            parts.append(f"Previous candidate SQL: {session_context['pipeline_previous_sql']}")
+        if session_context.get("pipeline_feedback"):
+            parts.append(f"Correction needed: {session_context['pipeline_feedback']}")
+        parts.append("Generate one corrected SQL candidate using run_query.")
+        return "\n".join(parts)
 
     def _ExecuteSql(self, sql: str, database_path: str) -> dict:
         from askdata.db.query_runner import Execute as RunQuery
@@ -200,10 +321,13 @@ class ReActSqlAgent:
         return score
 
     def _AssistantMessage(self, message) -> dict:
-        return {
+        msg: dict = {
             "role": "assistant",
             "content": getattr(message, "content", None),
-            "tool_calls": [
+        }
+        tool_calls = getattr(message, "tool_calls", None) or []
+        if tool_calls:
+            msg["tool_calls"] = [
                 {
                     "id": tool_call.id,
                     "type": "function",
@@ -212,9 +336,9 @@ class ReActSqlAgent:
                         "arguments": tool_call.function.arguments,
                     },
                 }
-                for tool_call in (getattr(message, "tool_calls", None) or [])
-            ],
-        }
+                for tool_call in tool_calls
+            ]
+        return msg
 
     def _ParseSql(self, arguments: str) -> str:
         try:

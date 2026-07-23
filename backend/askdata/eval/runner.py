@@ -99,19 +99,12 @@ class EvalRunner:
         gold_rows = []
         comparison = self.comparer.BuildVerdict(False, False, None, "empty_prediction")
         result = {}
-        candidate_sqls = []
-        candidate_hit = False
 
         try:
             agent = self.agent_graph or AgentGraph(processed_dir=self.processed_dir)
             result = agent.Run(question=question_text, database_id=database_id)
             generated_sql = result.get("sql") or ""
             error = result.get("error")
-
-            # ========== 新增：提取候选 SQL 列表 ==========
-            candidates = result.get("candidates", [])
-            candidate_sqls = [c.get("sql", "") for c in candidates if c.get("sql")]
-
             if not generated_sql:
                 comparison = self.comparer.BuildVerdict(False, False, None, "empty_prediction")
             else:
@@ -127,18 +120,6 @@ class EvalRunner:
                     gold_rows,
                     gold_sql,
                 )
-
-            # ========== 新增：计算候选命中率 ==========
-            if candidate_sqls and gold_rows:
-                gold_set = set(tuple(row.items()) for row in gold_rows)
-                for sql in candidate_sqls:
-                    pred = self._ExecuteSql(sql, database_path)
-                    if pred and pred["rows"]:
-                        pred_set = set(tuple(row.items()) for row in pred["rows"])
-                        if pred_set == gold_set:
-                            candidate_hit = True
-                            break
-
         except Exception as exc:
             error = error or str(exc)
             if generated_sql:
@@ -146,7 +127,6 @@ class EvalRunner:
 
         latency_ms = round((time.perf_counter() - started) * 1000, 2)
         trace_steps = result.get("trace", [])
-
         return {
             "questionId": question_id,
             "databaseId": database_id,
@@ -174,10 +154,6 @@ class EvalRunner:
             "error": error,
             "latencyMs": latency_ms,
             "trace": trace_steps,
-            # ========== 新增：候选 SQL 相关字段 ==========
-            "candidateSqls": candidate_sqls,
-            "candidateHit": candidate_hit,
-            "candidateCount": len(candidate_sqls),
         }
 
     def _ExecuteSql(self, sql: str, database_path: str) -> dict:
@@ -208,56 +184,59 @@ class EvalRunner:
             "executionSuccessRate": self._Rate(cases, lambda case: case["metrics"]["executionSucceeded"]),
             "exactMatchRate": self._Rate(cases, lambda case: case["metrics"]["exactMatch"]),
             "answerProducedRate": self._Rate(cases, lambda case: case["metrics"]["answerProduced"]),
-            # ========== 新增：候选命中率 ==========
-            "candidateHitRate": self._Rate(cases, lambda case: case.get("candidateHit", False)),
-            "avgLatencyMs": round(sum(latencies) / len(latencies), 2) if latencies else 0,
-            "p95LatencyMs": self._Percentile(latencies, 95) if latencies else 0,
+            "retryRepairRate": self._Rate(cases, lambda case: case["metrics"]["retryOrRepair"]),
+            "mismatchBuckets": dict(Counter(
+                case["metrics"]["mismatchType"]
+                for case in cases
+                if case["metrics"]["mismatchType"]
+            )),
+            "latencyMs": {
+                "avg": round(sum(latencies) / len(latencies), 2) if latencies else 0,
+                "p50": self._Percentile(latencies, 50),
+                "p95": self._Percentile(latencies, 95),
+            },
+            "modelName": settings.LLM_MODEL_NAME,
             "startedAt": started_at.isoformat(),
             "finishedAt": finished_at.isoformat(),
             "durationSeconds": round((finished_at - started_at).total_seconds(), 2),
         }
 
-    def _BuildBreakdown(self, cases: list[dict], key: str) -> dict:
-        groups = {}
-        for case in cases:
-            group_key = case.get(key, "unknown")
-            if group_key not in groups:
-                groups[group_key] = []
-            groups[group_key].append(case)
-        return {
-            group_key: {
-                "total": len(group_cases),
-                "executionAccuracy": self._Rate(group_cases, lambda case: case["passed"]),
-                "candidateHitRate": self._Rate(group_cases, lambda case: case.get("candidateHit", False)),
-            }
-            for group_key, group_cases in groups.items()
-        }
-
     def _Rate(self, cases: list[dict], predicate) -> float:
         if not cases:
             return 0.0
-        return round((sum(1 for case in cases if predicate(case)) / len(cases)) * 100, 2)
+        return round(sum(1 for case in cases if predicate(case)) / len(cases), 4)
+
+    def _BuildBreakdown(self, cases: list[dict], key: str) -> dict:
+        groups: dict[str, list] = {}
+        for case in cases:
+            value = case.get(key) or "unknown"
+            groups.setdefault(value, []).append(case)
+        return {value: self._BuildGroupSummary(items) for value, items in sorted(groups.items())}
+
+    def _BuildGroupSummary(self, cases: list[dict]) -> dict:
+        latencies = [case["latencyMs"] for case in cases]
+        return {
+            "total": len(cases),
+            "executionAccuracy": self._Rate(cases, lambda case: case["passed"]),
+            "executionAccuracyStrict": self._Rate(cases, lambda case: case["metrics"]["strictPass"]),
+            "executionAccuracyRelaxed": self._Rate(cases, lambda case: case["metrics"]["relaxedPass"]),
+            "validSqlRate": self._Rate(cases, lambda case: case["metrics"]["validSql"]),
+            "avgLatencyMs": round(sum(latencies) / len(latencies), 2) if latencies else 0,
+        }
 
     def _Percentile(self, values: list[float], percentile: int) -> float:
         if not values:
-            return 0.0
-        sorted_values = sorted(values)
-        index = (len(sorted_values) - 1) * percentile / 100
-        if index.is_integer():
-            return sorted_values[int(index)]
-        lower = sorted_values[int(index)]
-        upper = sorted_values[int(index) + 1]
-        return lower + (upper - lower) * (index - int(index))
+            return 0
+        ordered = sorted(values)
+        return ordered[round((len(ordered) - 1) * percentile / 100)]
 
     def _ProcessedDataFingerprint(self) -> str:
-        """生成 processed 目录内容的 SHA256 指纹"""
-        import hashlib
-        import os
-        processed_dir = Path(self.processed_dir)
-        if not processed_dir.exists():
-            return ""
-        hasher = hashlib.sha256()
-        for path in sorted(processed_dir.rglob("*")):
-            if path.is_file():
-                hasher.update(path.read_bytes())
-        return hasher.hexdigest()[:16]
+        digest = hashlib.sha256()
+        paths = [self.processed_dir / "databases.json"]
+        questions_path = self.processed_dir / "questions.jsonl"
+        paths.append(questions_path if questions_path.exists() else self.processed_dir / "questions.json")
+        paths.extend(sorted((self.processed_dir / "schemas").glob("*.json")))
+        for path in paths:
+            digest.update(str(path.relative_to(self.processed_dir)).encode("utf-8"))
+            digest.update(path.read_bytes())
+        return digest.hexdigest()

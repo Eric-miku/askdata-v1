@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { DatabaseInfo, ThemeMode } from "../types/query";
+import type { DatabaseInfo, SessionSummary, ThemeMode } from "../types/query";
 import {
   CloseIcon,
   DatabaseIcon,
+  HistoryIcon,
   MoonIcon,
   PlusIcon,
   SearchIcon,
   SunIcon,
 } from "./Icons";
+import ConversationDrawer from "./ConversationDrawer";
 
 interface AppSidebarProps {
   theme: ThemeMode;
@@ -16,7 +18,12 @@ interface AppSidebarProps {
   loading: boolean;
   databasesLoading: boolean;
   databaseError: string | null;
+  sessions: SessionSummary[];
+  activeSessionId: string | null;
+  sessionsLoading: boolean;
+  sessionsError: string | null;
   onNewChat: () => void;
+  onOpenSession: (sessionId: string) => void;
   onSelectDatabase: (databaseId: string) => void;
   onToggleTheme: () => void;
 }
@@ -28,13 +35,19 @@ export default function AppSidebar({
   loading,
   databasesLoading,
   databaseError,
+  sessions,
+  activeSessionId,
+  sessionsLoading,
+  sessionsError,
   onNewChat,
+  onOpenSession,
   onSelectDatabase,
   onToggleTheme,
 }: AppSidebarProps) {
-  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [openDrawer, setOpenDrawer] = useState<"database" | "history" | null>(null);
   const [search, setSearch] = useState("");
   const databaseButtonRef = useRef<HTMLButtonElement>(null);
+  const historyButtonRef = useRef<HTMLButtonElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const drawerRef = useRef<HTMLElement>(null);
   const filtered = useMemo(() => {
@@ -46,19 +59,19 @@ export default function AppSidebar({
       : databases;
   }, [databases, search]);
 
-  const closeDrawer = () => {
-    setDrawerOpen(false);
+  const closeDatabaseDrawer = () => {
+    setOpenDrawer(null);
     queueMicrotask(() => databaseButtonRef.current?.focus());
   };
 
   useEffect(() => {
-    if (!drawerOpen) {
+    if (openDrawer !== "database") {
       return;
     }
     searchInputRef.current?.focus();
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        closeDrawer();
+        closeDatabaseDrawer();
         return;
       }
       if (event.key === "Tab") {
@@ -80,7 +93,7 @@ export default function AppSidebar({
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [drawerOpen]);
+  }, [openDrawer]);
 
   return (
     <>
@@ -100,13 +113,24 @@ export default function AppSidebar({
         <button
           ref={databaseButtonRef}
           type="button"
-          className={`app-rail__button ${drawerOpen ? "is-active" : ""}`}
+          className={`app-rail__button ${openDrawer === "database" ? "is-active" : ""}`}
           aria-label="打开数据库"
-          aria-expanded={drawerOpen}
+          aria-expanded={openDrawer === "database"}
           disabled={loading}
-          onClick={() => setDrawerOpen(true)}
+          onClick={() => setOpenDrawer("database")}
         >
           <DatabaseIcon />
+        </button>
+        <button
+          ref={historyButtonRef}
+          type="button"
+          className={`app-rail__button ${openDrawer === "history" ? "is-active" : ""}`}
+          aria-label="打开历史记录"
+          aria-expanded={openDrawer === "history"}
+          disabled={loading}
+          onClick={() => setOpenDrawer("history")}
+        >
+          <HistoryIcon />
         </button>
         <div className="app-rail__spacer" />
         <button
@@ -122,13 +146,13 @@ export default function AppSidebar({
         </div>
       </aside>
 
-      {drawerOpen ? (
+      {openDrawer === "database" ? (
         <>
           <button
             type="button"
             className="database-drawer__scrim"
             aria-label="关闭数据库抽屉"
-            onClick={closeDrawer}
+            onClick={closeDatabaseDrawer}
           />
           <aside
             ref={drawerRef}
@@ -146,7 +170,7 @@ export default function AppSidebar({
                 type="button"
                 className="icon-button"
                 aria-label="关闭数据库"
-                onClick={closeDrawer}
+                onClick={closeDatabaseDrawer}
               >
                 <CloseIcon />
               </button>
@@ -182,7 +206,7 @@ export default function AppSidebar({
                   disabled={loading}
                   onClick={() => {
                     onSelectDatabase(item.id);
-                    closeDrawer();
+                    closeDatabaseDrawer();
                   }}
                 >
                   <DatabaseIcon />
@@ -197,6 +221,16 @@ export default function AppSidebar({
           </aside>
         </>
       ) : null}
+      <ConversationDrawer
+        open={openDrawer === "history"}
+        sessions={sessions}
+        activeSessionId={activeSessionId}
+        loading={sessionsLoading}
+        error={sessionsError}
+        triggerRef={historyButtonRef}
+        onClose={() => setOpenDrawer(null)}
+        onOpenSession={onOpenSession}
+      />
     </>
   );
 }

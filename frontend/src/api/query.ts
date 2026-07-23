@@ -1,21 +1,16 @@
 import axios from "axios";
-import type { QueryResponse } from "../types/query";
-
-
-interface QueryRequest {
-  database_id:string;
-  question:string;
-}
-
-export interface ExecuteSqlRequest {
-  database_id: string;
-  sql: string;
-}
-
-export type ExecuteSqlResponse = Pick<
+import type {
+  DatabaseInfo,
   QueryResponse,
-  "columns" | "rows" | "chart" | "trace" | "error"
->;
+  RestoredSession,
+  SessionInfo,
+  SessionSummary,
+  V2QueryRequest,
+} from "../types/query";
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000/api";
+
+export type QueryRequest = V2QueryRequest;
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -37,16 +32,26 @@ export async function deleteSession(sessionId: string): Promise<void> {
   await api.delete(`/sessions/${encodeURIComponent(sessionId)}`);
 }
 
+export async function listSessions(): Promise<SessionSummary[]> {
+  const response = await api.get<SessionSummary[]>("/sessions");
+  return response.data;
+}
+
+export async function getSession(sessionId: string): Promise<RestoredSession> {
+  const response = await api.get<RestoredSession>(
+    `/sessions/${encodeURIComponent(sessionId)}`,
+  );
+  return response.data;
+}
+
 export async function queryData(data: QueryRequest): Promise<QueryResponse> {
   const response = await api.post<QueryResponse>("/query", data);
   return response.data;
 }
 
-export async function executeSql(
-  data: ExecuteSqlRequest,
-): Promise<ExecuteSqlResponse> {
-  const response = await api.post<ExecuteSqlResponse>("/query/execute-sql", data);
-  return response.data;
-}
-
-export type { DatabaseInfo, SessionInfo } from "../types/query";
+export type {
+  DatabaseInfo,
+  RestoredSession,
+  SessionInfo,
+  SessionSummary,
+} from "../types/query";

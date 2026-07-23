@@ -6,7 +6,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from askdata.agent.react_sql_agent import ReActSqlAgent
+from askdata.agent.react_sql_agent import ReActSqlAgent, SqlCandidateDraft
 from askdata.agent.prompts import BuildReActSystemPrompt
 
 
@@ -102,6 +102,37 @@ def test_react_sql_agent_prompt_includes_bird_specific_intern_agent_rules():
     assert "select only the rate expression" in system_prompt
     assert "do not include helper ranking/count columns" in system_prompt
     assert "do not concatenate address fields" in system_prompt
+
+
+def test_build_messages_includes_question_analysis_and_value_links():
+    agent = ReActSqlAgent(llm_client=ScriptedToolCallingLLM([{"content": "done"}]))
+
+    messages = agent._BuildMessages(
+        question="What are the elements and label of molecule TR060?",
+        schema_prompt="Database: demo\nTable molecule(molecule_id text, element text, label text)",
+        session_context={
+            "analysis": {
+                "intent": {"shape": "listing"},
+                "requested_outputs": ["element", "label"],
+                "formula_hints": [],
+            },
+            "value_links": [
+                {
+                    "value": "TR060",
+                    "table": "molecule",
+                    "column": "molecule_id",
+                    "normalized_value": "TR060",
+                }
+            ],
+        },
+    )
+
+    user_prompt = messages[1]["content"]
+    assert "<question_analysis_context>" in user_prompt
+    assert '"requested_outputs": [' in user_prompt
+    assert '"element"' in user_prompt
+    assert '"label"' in user_prompt
+    assert "TR060 -> molecule.molecule_id = 'TR060'" in user_prompt
 
 
 def test_react_sql_agent_keeps_count_sql_when_later_detail_query_is_exploratory(tmp_path):
@@ -260,3 +291,100 @@ def test_react_sql_agent_retains_two_candidates_but_still_executes_later_final_s
     assert result["sql"] == "SELECT COUNT(*) AS count FROM items WHERE id > 0"
     assert sum(step["step"] == "ExecuteSql" for step in result["trace"]) == 3
     assert not any(step["step"] == "CandidateLimit" for step in result["trace"])
+
+
+def test_react_sql_agent_generate_candidates_returns_drafts_without_executing():
+    llm = ScriptedToolCallingLLM([
+        {"sql": "SELECT COUNT(*) AS count FROM items", "content": "Count the rows."},
+    ])
+    agent = ReActSqlAgent(llm_client=llm)
+    agent._ExecuteSql = lambda sql, database_path: (_ for _ in ()).throw(AssertionError("must not execute"))
+
+    drafts = agent.GenerateCandidates(
+        question="How many items?",
+        schema_prompt="Database: demo\nTable items(id integer)",
+        session_context={"pipeline_stage": "initial"},
+    )
+
+    assert drafts == [
+        SqlCandidateDraft(
+            sql="SELECT COUNT(*) AS count FROM items",
+            reason="Count the rows.",
+            tool_call_id="call_1",
+        )
+    ]
+
+
+def test_react_candidate_generation_retains_tool_messages_and_execution_feedback():
+    first_sql = "SELECT missing FROM items"
+    repaired_sql = "SELECT id FROM items"
+    llm = ScriptedToolCallingLLM([
+        {"sql": first_sql, "content": "Inspect."},
+        {"sql": repaired_sql, "content": "Repair."},
+    ])
+    agent = ReActSqlAgent(llm_client=llm)
+    state = agent.NewCandidateState(
+        question="List items",
+        schema_prompt="Database: demo\nTable items(id integer)",
+        session_context=None,
+    )
+
+    first = agent.GenerateCandidates(
+        "List items",
+        "Database: demo\nTable items(id integer)",
+        {"pipeline_stage": "initial"},
+        state=state,
+    )[0]
+    agent.RecordExecutionFeedback(
+        state,
+        first,
+        {
+            "success": False,
+            "failure_class": "schema_grounding",
+            "error": "no such column: missing",
+        },
+    )
+    agent.RecordRetrievalContext(
+        state,
+        "Database: demo\nTable items(id integer)\nTable labels(item_id integer, name text)",
+    )
+    second = agent.GenerateCandidates(
+        "List items",
+        "Database: demo\nTable items(id integer)",
+        {
+            "pipeline_stage": "targeted_repair_1",
+            "pipeline_feedback": "Use grounded columns.",
+            "pipeline_previous_sql": first_sql,
+        },
+        state=state,
+    )[0]
+
+    second_call_messages = llm.messages_seen[1]
+    assert second.sql == repaired_sql
+    assert any(message.get("role") == "assistant" and message.get("tool_calls") for message in second_call_messages)
+    assert any(
+        message.get("role") == "tool"
+        and message.get("tool_call_id") == first.tool_call_id
+        and "schema_grounding" in message.get("content", "")
+        and "no such column: missing" in message.get("content", "")
+        for message in second_call_messages
+    )
+    assert any(
+        message.get("role") == "user" and "Table labels" in message.get("content", "")
+        for message in second_call_messages
+    )
+
+
+def test_react_candidate_generation_keeps_empty_tool_draft_for_validation_feedback():
+    agent = ReActSqlAgent(
+        llm_client=ScriptedToolCallingLLM([{"sql": "", "content": "Try."}])
+    )
+
+    drafts = agent.GenerateCandidates(
+        "List items",
+        "Database: demo\nTable items(id integer)",
+    )
+
+    assert len(drafts) == 1
+    assert drafts[0].sql == ""
+    assert drafts[0].tool_call_id == "call_1"

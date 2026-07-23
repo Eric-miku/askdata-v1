@@ -1,5 +1,6 @@
 """Typer command-line entry points for AskData development workflows."""
 
+import json
 from pathlib import Path
 
 import typer
@@ -7,9 +8,15 @@ import typer
 from askdata.agent.graph import AgentGraph
 from askdata.core.config import settings
 from askdata.core.paths import project_path
-from askdata.data.bird_io import LoadProcessedDatabases, ResolveProcessedDir
-from askdata.eval import EvalRunner
-from askdata.tools.retriever import GetValue
+from askdata.data.bird_io import (
+    LoadProcessedDatabases,
+    LoadProcessedQuestions,
+    ResolveProcessedDir,
+)
+from askdata.eval import DemoSuite, EvalRunner
+from askdata.tools.embedding_client import EmbeddingClient, EmbeddingConfigurationError
+from askdata.tools.retriever import BirdSchemaIndex, GetValue
+from askdata.tools.vector_store import MilvusVectorStore, SOURCE_VERSION
 
 
 app = typer.Typer(help="AskData — NL2SQL development CLI")
@@ -24,6 +31,24 @@ def _LoadDatabases(processed_dir: Path | None = None) -> list[dict]:
         return LoadProcessedDatabases(processed_dir or settings.BIRD_DATA_DIR)
     except (FileNotFoundError, ValueError) as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+def _BuildEmbeddingClient() -> EmbeddingClient:
+    if not settings.EMBEDDING_API_URL:
+        raise typer.BadParameter("EMBEDDING_API_URL is required to build the schema index")
+    return EmbeddingClient(
+        base_url=settings.EMBEDDING_API_URL,
+        api_key=settings.EMBEDDING_API_KEY,
+        model=settings.EMBEDDING_MODEL,
+        dimension=settings.EMBEDDING_DIMENSION,
+    )
+
+
+def _BuildVectorStore() -> MilvusVectorStore:
+    milvus_uri = settings.ResolvedMilvusUri()
+    if not milvus_uri:
+        raise typer.BadParameter("MILVUS_URI or MILVUS_HOST is required to build the schema index")
+    return MilvusVectorStore(milvus_uri, settings.MILVUS_COLLECTION)
 
 
 class ChatSession:
@@ -143,6 +168,50 @@ def EvalBird(
     typer.echo(f"Report: {out}")
 
 
+@app.command("eval-demo")
+def EvalDemo(
+    cases: Path = typer.Option(..., "--cases", help="Versioned demo case JSON"),
+    predictions: Path = typer.Option(
+        ...,
+        "--predictions",
+        help="Captured prediction JSON from the system under evaluation",
+    ),
+    out: Path = typer.Option(
+        Path("reports/v2-demo.json"), "--out", "-o", help="JSON report output path"
+    ),
+):
+    """Compare offline V2 demo predictions and write a deterministic report."""
+    resolved_cases = cases.resolve()
+    resolved_predictions = predictions.resolve()
+    resolved_out = out.resolve()
+    if resolved_out in {resolved_cases, resolved_predictions}:
+        raise typer.BadParameter(
+            "--out must differ from --cases and --predictions"
+        )
+    try:
+        loaded_cases = DemoSuite.Load(cases, "cases")
+        loaded_predictions = DemoSuite.Load(predictions, "predictions")
+        report = DemoSuite(loaded_cases).Compare(loaded_predictions)
+        DemoSuite.WriteReport(report, out)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    typer.echo("Category             Passed   Rate")
+    for category, metrics in report["by_category"].items():
+        typer.echo(
+            f"{category:<20} {metrics['passed']}/{metrics['total']:<7} "
+            f"{metrics['pass_rate']:.0%}"
+        )
+    summary = report["summary"]
+    typer.echo(
+        f"Overall              {summary['passed']}/{summary['total']}     "
+        f"{summary['pass_rate']:.0%}"
+    )
+    typer.echo(f"Report: {out}")
+    if summary["passed"] != summary["total"]:
+        raise typer.Exit(code=1)
+
+
 @app.command("databases")
 def Databases(
     processed_dir: Path | None = typer.Option(None, "--processed-dir", help="BIRD processed directory"),
@@ -186,6 +255,59 @@ def GenInstructions(
         ])
         (out_path / f"{database_id}.md").write_text(content, encoding="utf-8")
     typer.echo(f"Generated {len(databases)} instruction files in {out_path}")
+
+
+@app.command("index-schema")
+def IndexSchema(
+    database_id: str = typer.Option(..., "--database-id", "-d", help="Database to index"),
+    processed_dir: Path | None = typer.Option(None, "--processed-dir", help="BIRD processed directory"),
+):
+    """Validate and index canonical schema chunks for one database."""
+    databases = _LoadDatabases(processed_dir)
+    try:
+        questions = LoadProcessedQuestions(
+            processed_dir or settings.BIRD_DATA_DIR,
+            database_ids={GetValue(database, "databaseId", "database_id") for database in databases},
+        )
+    except FileNotFoundError:
+        questions = []
+    try:
+        index = BirdSchemaIndex().Build(databases, questions=questions)
+        chunks = index.BuildChunks(database_id)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if not chunks:
+        raise typer.BadParameter(f"No indexable chunks for database_id: {database_id}")
+
+    embedding = _BuildEmbeddingClient()
+    store = _BuildVectorStore()
+    try:
+        vectors = embedding.Embed([chunk.text for chunk in chunks])
+        # Validate the entire batch before the first collection mutation. This is
+        # deliberately repeated here so custom clients used by operators cannot
+        # bypass the atomicity boundary.
+        if len(vectors) != len(chunks):
+            raise EmbeddingConfigurationError(
+                f"Embedding service returned {len(vectors)} vectors for {len(chunks)} texts"
+            )
+        if any(len(vector) != embedding.dimension for vector in vectors):
+            raise EmbeddingConfigurationError(
+                f"Embedding dimension mismatch: expected {embedding.dimension}"
+            )
+    except (EmbeddingConfigurationError, RuntimeError, ValueError) as exc:
+        raise typer.BadParameter(f"Schema index validation failed: {exc}") from exc
+
+    store.Upsert(chunks, vectors)
+    counts: dict[str, int] = {}
+    for chunk in chunks:
+        counts[chunk.source_type] = counts.get(chunk.source_type, 0) + 1
+    typer.echo(f"database: {database_id}")
+    for source_type in sorted(counts):
+        typer.echo(f"{source_type} chunks: {counts[source_type]}")
+    typer.echo(f"model: {embedding.model}")
+    typer.echo(f"dimension: {embedding.dimension}")
+    typer.echo(f"collection: {store.collection_name}")
+    typer.echo(f"source version: {SOURCE_VERSION}")
 
 
 @app.command("chat")

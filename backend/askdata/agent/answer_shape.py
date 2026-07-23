@@ -8,6 +8,16 @@ import sqlglot
 from sqlglot import exp
 
 
+_WARNING_CODES = {
+    "SQL could not be parsed for answer-shape review.": "invalid_sql",
+    "Question asks for a count, but SQL does not use COUNT.": "missing_count_aggregation",
+    "Question asks for one final computed value, but SQL selects multiple expressions.": "computed_value_has_extra_projections",
+    "Question asks for a computed percentage, ratio, or rate, but SQL returns a raw value.": "missing_ratio_computation",
+    "Question asks for a list, but SQL returns only aggregate expressions.": "listing_returns_only_aggregates",
+    "Question asks for the top entity only; remove unrequested helper columns.": "unrequested_helper_columns",
+}
+
+
 def CheckAnswerShape(question: str, sql: str) -> list[str]:
     try:
         parsed = sqlglot.parse_one(sql or "", read="sqlite")
@@ -51,3 +61,9 @@ def CheckAnswerShape(question: str, sql: str) -> list[str]:
         warnings.append("Question asks for the top entity only; remove unrequested helper columns.")
 
     return warnings
+
+
+def AnswerShapeFailureCodes(question: str, sql: str) -> list[str]:
+    """Return stable machine-readable codes for the legacy shape warnings."""
+
+    return [_WARNING_CODES[warning] for warning in CheckAnswerShape(question, sql)]

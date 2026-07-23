@@ -56,12 +56,12 @@ export default function AgentTrace({ steps }: Props) {
       <button
         type="button"
         className="agent-trace__summary"
-        aria-label={open ? "折叠思考过程" : "展开思考过程"}
+        aria-label={open ? "折叠执行过程" : "展开执行过程"}
         aria-expanded={open}
         onClick={() => setOpen((current) => !current)}
       >
         <ChevronIcon className={open ? "is-open" : ""} />
-        <strong>思考过程</strong>
+        <strong>执行过程</strong>
         <span className={`agent-trace__state is-${hasError ? "error" : "success"}`}>
           {summary}
         </span>
