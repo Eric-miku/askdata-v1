@@ -321,10 +321,13 @@ class ReActSqlAgent:
         return score
 
     def _AssistantMessage(self, message) -> dict:
-        return {
+        msg: dict = {
             "role": "assistant",
             "content": getattr(message, "content", None),
-            "tool_calls": [
+        }
+        tool_calls = getattr(message, "tool_calls", None) or []
+        if tool_calls:
+            msg["tool_calls"] = [
                 {
                     "id": tool_call.id,
                     "type": "function",
@@ -333,9 +336,9 @@ class ReActSqlAgent:
                         "arguments": tool_call.function.arguments,
                     },
                 }
-                for tool_call in (getattr(message, "tool_calls", None) or [])
-            ],
-        }
+                for tool_call in tool_calls
+            ]
+        return msg
 
     def _ParseSql(self, arguments: str) -> str:
         try:

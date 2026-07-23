@@ -31,7 +31,6 @@ _GROUNDING_FAILURES = {
     "unknown_table",
     "unknown_column",
     "invalid_join_using",
-    "missing_entity",
     "unconnected_join",
 }
 _ANSWER_SHAPE_FAILURES = {
@@ -664,20 +663,21 @@ class StagedSqlPipeline:
             )
         if re.search(r"\b(top|bottom|highest|lowest|most|least|rank)\b", lowered):
             order = "ascending" if re.search(r"\b(bottom|lowest|least)\b", lowered) else "descending"
-            return IntentContract(shape="ranking", output_attributes=outputs, order=order)
+            return IntentContract(shape="ranking", order=order, output_attributes=outputs)
         return IntentContract(shape="listing", output_attributes=outputs)
 
-    @staticmethod
-    def _NormalizeConcept(value: str) -> str:
+    @classmethod
+    def _NormalizeConcept(cls, value: str) -> str:
         tokens = re.findall(r"[a-z0-9]+", value.casefold())
-        normalized = "".join(tokens)
-        if len(normalized) > 3 and normalized.endswith("ies"):
-            return normalized[:-3] + "y"
-        if len(normalized) > 3 and normalized.endswith(("ses", "xes", "zes", "ches", "shes")):
-            return normalized[:-2]
-        if len(normalized) > 3 and normalized.endswith("s"):
-            return normalized[:-1]
-        return normalized
+        word = "".join(tokens)
+        if len(word) <= 3:
+            return word
+        stemmed = re.sub(
+            r"(ies|sses|ses|ches|shes|xes|zes|ves|uses|s|ing|ed|er|est|ness|ly)$",
+            "",
+            word,
+        )
+        return stemmed if len(stemmed) >= 3 else word
 
     @staticmethod
     def _Emit(

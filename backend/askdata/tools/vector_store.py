@@ -143,11 +143,21 @@ class MilvusVectorStore:
         vectors = [list(vector) for vector in vectors]
         if len(chunks) != len(vectors):
             raise ValueError("Chunk and vector counts must match")
+        if not chunks:
+            return
+        if not self.client.has_collection(self.collection_name):
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                dimension=len(vectors[0]),
+                metric_type="COSINE",
+                auto_id=True,
+                enable_dynamic_field=True,
+            )
         rows = []
         for chunk, vector in zip(chunks, vectors):
             row = asdict(chunk)
-            row["chunk_id"] = row.pop("id")
+            row["chunk_id"] = row.pop("id")  # auto_id=True: PK is auto-generated
             row["vector"] = vector
             rows.append(row)
         if rows:
-            self.client.upsert(collection_name=self.collection_name, data=rows)
+            self.client.insert(collection_name=self.collection_name, data=rows)

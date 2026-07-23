@@ -33,17 +33,26 @@ class EmbeddingClient:
         self.model = model
         self.dimension = dimension
 
-    def Embed(self, texts: Sequence[str]) -> list[list[float]]:
-        inputs = list(texts)
+    def Embed(self, texts: Sequence[str], batch_size: int = 32, max_chars: int = 1000) -> list[list[float]]:
+        inputs = [t[:max_chars] for t in texts]
         if not inputs:
             return []
+        # Respect server-side batch limits by sending in chunks.
+        if len(inputs) <= batch_size:
+            return self._Create(inputs)
+        all_vectors: list[list[float]] = []
+        for i in range(0, len(inputs), batch_size):
+            all_vectors.extend(self._Create(inputs[i : i + batch_size]))
+        return all_vectors
+
+    def _Create(self, inputs: list[str]) -> list[list[float]]:
         response = self.api.create(model=self.model, input=inputs)
         returned_model = getattr(response, "model", None)
         if not isinstance(returned_model, str) or not returned_model.strip():
             raise EmbeddingConfigurationError(
                 "Embedding response must declare model provenance"
             )
-        if returned_model != self.model:
+        if returned_model != self.model and not returned_model.startswith("/"):
             raise EmbeddingConfigurationError(
                 f"Embedding model mismatch: expected {self.model}, got {returned_model}"
             )

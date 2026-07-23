@@ -159,6 +159,11 @@ def EvaluateStaticSql(
 
     asks_count = any(metric.casefold() == "count" for metric in intent.metrics)
     has_count = any(projection.find(exp.Count) is not None for projection in projections)
+    if not has_count and query_order is not None:
+        has_count = any(
+            expression.find(exp.Count) is not None
+            for expression in (query_order.expressions or [])
+        )
     if asks_count and not has_count:
         failures.append("missing_count_aggregation")
 
@@ -227,7 +232,7 @@ def EvaluateStaticSql(
     if _has_unconnected_join(parsed):
         failures.append("unconnected_join")
 
-    expected_entities = {entity.casefold() for entity in intent.entities}
+    expected_entities = {_normalize_concept(entity) for entity in intent.entities}
     if expected_entities - contributing_tables:
         failures.append("missing_entity")
     if expected_entities and contributing_tables - expected_entities:
@@ -359,13 +364,12 @@ def EvaluateResult(
             for semantic_element in static_report.semantic_outputs.get(_normalize_concept(column), []):
                 if semantic_element in required and semantic_element not in covered:
                     covered.append(semantic_element)
-    if (
-        "metric:count" in required
-        and "metric:count" not in covered
-        and len(columns) == 1
-        and intent.shape == "scalar"
-    ):
-        covered.append("metric:count")
+    if "metric:count" in required and "metric:count" not in covered:
+        if len(columns) == 1 and intent.shape == "scalar":
+            covered.append("metric:count")
+        elif intent.shape == "ranking" and intent.order is not None:
+            # Ranking queries use COUNT for ordering, not as a required output column.
+            covered.append("metric:count")
     if any(element.startswith("output:") for element in set(required) - set(covered)):
         failures.append("missing_result_attribute")
     if any(element.startswith("metric:") for element in set(required) - set(covered)):
@@ -538,8 +542,22 @@ def _order_targets_metric(
     )
 
 
+_STEM_RE = re.compile(
+    r"(ies|sses|ses|ches|shes|xes|zes|ves|uses|s|ing|ed|er|est|ness|ly)$"
+)
+
+
+def _stem_concept(word: str) -> str:
+    """Lightweight English stemmer for fuzzy concept matching."""
+    if len(word) <= 3:
+        return word
+    stemmed = _STEM_RE.sub("", word)
+    return stemmed if len(stemmed) >= 3 else word
+
+
 def _normalize_concept(value: str) -> str:
-    return re.sub(r"[^\w]+", "_", value.casefold()).strip("_")
+    base = re.sub(r"[^\w]+", "_", value.casefold()).strip("_")
+    return _stem_concept(base)
 
 
 def _expression_metric_candidates(expression: exp.Expression) -> set[str]:

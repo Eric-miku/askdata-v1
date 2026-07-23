@@ -367,7 +367,7 @@ class AmbiguityGate:
     # Lightweight English stemmer — removes common suffixes so that
     # "leagues" matches "League", "students" matches "student", etc.
     _STEM_RE = re.compile(
-        r"(ies|sses|ses|ches|shes|xes|zes|ves|uses|s|ing|ed|er|est|ment|ness|ly)$"
+        r"(ies|sses|ses|ches|shes|xes|zes|ves|uses|s|ing|ed|er|est|ness|ly)$"
     )
 
     @classmethod
