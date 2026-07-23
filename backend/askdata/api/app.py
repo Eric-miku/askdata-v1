@@ -51,14 +51,18 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",   # Vite 开发服务器
-        "http://localhost:3000",   # 备选端口
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:3000",
         "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
         "http://127.0.0.1:3000",
+        "http://7.59.11.153:5173",
+        "http://7.59.11.153:5174",
     ],
-    allow_credentials=True,   # 允许携带 Cookie
-    allow_methods=["*"],      # 允许所有 HTTP 方法（GET, POST, DELETE 等）
-    allow_headers=["*"],      # 允许所有请求头
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # 将路由注册到应用
@@ -71,4 +75,5 @@ app.include_router(router, prefix="/api")
 # 正常启动请使用: uvicorn askdata.api.app:app --reload
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("askdata.api.app:app", host="0.0.0.0", port=8000, reload=True)
