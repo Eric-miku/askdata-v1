@@ -497,6 +497,37 @@ def test_pipeline_executes_at_most_one_candidate_per_recovery_stage():
     assert runner.sql_seen == [first]
 
 
+def test_pipeline_classifies_adapter_error_code_before_error_text():
+    sql = "SELECT id FROM missing_items"
+
+    class ErrorCodeRunner:
+        def __call__(self, attempted_sql, database_path):
+            return {
+                "success": False,
+                "sql": attempted_sql,
+                "error": "driver-specific unrelated text",
+                "error_code": "unknown_table",
+            }
+
+    result = StagedSqlPipeline(
+        react=FakeReact([[SqlCandidateDraft(sql=sql)]] + [[]] * 5),
+        analyzer=FailingAnalyzer(),
+        runner=ErrorCodeRunner(),
+    ).Run(
+        question="List items",
+        retrieval={
+            "database_id": "demo",
+            "database_path": "/tmp/demo.sqlite",
+            "schema_prompt": "Database: demo\nTable missing_items(id integer)",
+            "schema": {"missing_items": ["id"]},
+            "intent": IntentContract(shape="listing", output_attributes=["id"]),
+        },
+    )
+
+    assert result["kind"] == "error"
+    assert result["ledger"][0]["failure_class"] == "schema_grounding"
+
+
 def test_pipeline_stops_after_same_failure_class_repeats_without_progress():
     runner = AlwaysFailingRunner()
     events = []

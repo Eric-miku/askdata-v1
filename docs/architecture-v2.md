@@ -30,6 +30,8 @@ Browser UI
 - `backend/askdata/analysis/`: Final answer explanation and chart recommendation.
 - `backend/askdata/api/`: HTTP routes, request/response contracts, streaming service, and persistent session storage.
 - `backend/askdata/db/query_runner.py`: V2 ReAct SQL execution path. It preserves model SQL and only caps returned previews.
+- `backend/askdata/db/adapters/`: SQLite/MySQL/PostgreSQL execution adapters resolved internally by `query_runner.Execute()`.
+- `backend/askdata/db/error_normalizer.py`: Converts database-specific errors into stable `error_code` values such as `unknown_table` and `unknown_column`.
 - `backend/askdata/db/executor.py`: Generic SQLAlchemy executor path for team infrastructure. It is not the V2 ReAct loop executor.
 - `data-processing/`: Offline BIRD data preparation and schema/vector index construction.
 
@@ -40,6 +42,7 @@ Browser UI
 - `backend/askdata/api/response_models.py` is the V2 discriminated query response contract.
 - `backend/askdata/api/schemas.py` contains request schemas and remaining legacy compatibility models.
 - `backend/askdata/db/executor.py` may coexist with `db/query_runner.py`, but the ReAct agent uses `query_runner.Execute()`.
+- `query_runner.Execute(sql, database_path)` keeps its historical signature. For SQLite, `database_path` is a file path; for registered external databases, the same argument can be a `database_id` resolved by the adapter registry.
 
 ## RAG Boundary
 

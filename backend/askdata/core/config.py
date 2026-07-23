@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     BIRD_DATA_DIR: str = "data/bird"
     BIRD_INSTRUCTIONS_DIR: str = "data/bird/instructions"
     APP_DATABASE_PATH: str = "data/askdata-app.sqlite"
+    DATABASE_CONNECTIONS_PATH: str = "data/database_connections.json"
     EMBEDDING_API_URL: str = ""
     EMBEDDING_API_KEY: str = ""
     EMBEDDING_MODEL: str = "BAAI/bge-m3"

@@ -318,7 +318,11 @@ class StagedSqlPipeline:
                 execution = self.runner(sql, database_path)
                 executions += 1
                 if not execution.get("success"):
-                    failure_class = self._ClassifyExecution(execution.get("error"), static_class)
+                    failure_class = self._ClassifyExecution(
+                        execution.get("error"),
+                        static_class,
+                        execution.get("error_code"),
+                    )
                     grounding_failure_seen = grounding_failure_seen or failure_class == "schema_grounding"
                     ledger.Add(
                         SqlCandidate(
@@ -543,9 +547,13 @@ class StagedSqlPipeline:
         return None
 
     @staticmethod
-    def _ClassifyExecution(error: Any, static_class: str | None) -> str:
+    def _ClassifyExecution(error: Any, static_class: str | None, error_code: Any = None) -> str:
         if static_class == "schema_grounding":
             return static_class
+        if error_code in {"unknown_table", "unknown_column", "ambiguous_column"}:
+            return "schema_grounding"
+        if error_code in {"syntax_error", "timeout", "database_error"}:
+            return "syntax_or_safety"
         lowered = str(error or "").casefold()
         if any(marker in lowered for marker in ("no such table", "no such column", "ambiguous column")):
             return "schema_grounding"

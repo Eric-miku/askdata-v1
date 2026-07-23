@@ -11,6 +11,15 @@ from .query_runner import (
     build_sqlite_engine,
     detect_file_encoding,
 )
+from .adapters import (
+    DatabaseAdapter,
+    LoadFromJson,
+    MySQLAdapter,
+    PostgreSQLAdapter,
+    Register,
+    Resolve,
+    SQLiteAdapter,
+)
 
 __all__ = [
     "SQLValidator",
@@ -24,4 +33,11 @@ __all__ = [
     "ErrorCode",
     "build_sqlite_engine",
     "detect_file_encoding",
+    "DatabaseAdapter",
+    "LoadFromJson",
+    "MySQLAdapter",
+    "PostgreSQLAdapter",
+    "Register",
+    "Resolve",
+    "SQLiteAdapter",
 ]
