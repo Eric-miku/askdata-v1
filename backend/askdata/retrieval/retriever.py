@@ -8,7 +8,7 @@ from typing import Any
 from askdata.core.config import settings
 from askdata.data.bird_io import LoadProcessedDatabases, LoadProcessedQuestions, ResolveProcessedDir
 from askdata.core.paths import project_path
-from askdata.tools.vector_store import RankedChunk, SchemaChunk
+from askdata.retrieval.vector_store import RankedChunk, SchemaChunk
 
 
 _VECTOR_VALIDATION_FAILURES: set[tuple[str, str, int, str, str]] = set()
@@ -453,9 +453,9 @@ class SemanticRetriever:
             and settings.EMBEDDING_API_URL
             and milvus_uri
         ):
-            from askdata.tools.embedding_client import EmbeddingClient
-            from askdata.tools.hybrid_retriever import HybridRetriever, HybridSchemaIndex
-            from askdata.tools.vector_store import MilvusVectorStore
+            from askdata.retrieval.embedding_client import EmbeddingClient
+            from askdata.retrieval.hybrid_retriever import HybridRetriever, HybridSchemaIndex
+            from askdata.retrieval.vector_store import MilvusVectorStore
 
             key = (
                 settings.EMBEDDING_API_URL, settings.EMBEDDING_MODEL,

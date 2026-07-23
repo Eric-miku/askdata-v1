@@ -22,7 +22,7 @@ from askdata.data.bird_io import (
     ResolveProcessedDir,
 )
 from askdata.eval.metrics import BirdResultComparer, ExactMatch
-from askdata.tools.retriever import BirdSchemaIndex
+from askdata.retrieval.retriever import BirdSchemaIndex
 
 
 class EvalRunner:

@@ -3,9 +3,9 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from askdata.tools.hybrid_retriever import HybridRetriever, ReciprocalRankFusion
-from askdata.tools.retriever import BirdSchemaIndex
-from askdata.tools.vector_store import (
+from askdata.retrieval.hybrid_retriever import HybridRetriever, ReciprocalRankFusion
+from askdata.retrieval.retriever import BirdSchemaIndex
+from askdata.retrieval.vector_store import (
     DisabledVectorStore,
     MilvusVectorStore,
     RankedChunk,

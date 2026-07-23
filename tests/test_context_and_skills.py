@@ -5,8 +5,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from askdata.agent.prompts import BuildSqlPrompt
-from askdata.tools.retriever import BirdSchemaIndex
-from askdata.tools.skill_loader import SkillLoader
+from askdata.retrieval.retriever import BirdSchemaIndex
+from askdata.agent.skill_loader import SkillLoader
 
 
 def test_schema_prompt_includes_database_instructions(tmp_path):

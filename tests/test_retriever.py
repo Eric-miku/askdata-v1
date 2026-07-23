@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from askdata.tools.retriever import BirdSchemaIndex, SemanticRetriever
+from askdata.retrieval.retriever import BirdSchemaIndex, SemanticRetriever
 
 
 def sample_database(table_count=2):
@@ -327,8 +327,8 @@ def test_vector_startup_failure_is_cached_and_returns_safe_fallback(
     }]), encoding="utf-8")
 
     from askdata.core.config import settings
-    from askdata.tools import embedding_client, vector_store
-    from askdata.tools.retriever import _ResetVectorValidationFailuresForTests
+    from askdata.retrieval import embedding_client, vector_store
+    from askdata.retrieval.retriever import _ResetVectorValidationFailuresForTests
 
     calls = {"embed": 0, "search": 0}
 
@@ -380,7 +380,7 @@ def test_disabled_vector_configuration_makes_no_validation_call(tmp_path, monkey
     }]), encoding="utf-8")
 
     from askdata.core.config import settings
-    from askdata.tools import embedding_client
+    from askdata.retrieval import embedding_client
 
     monkeypatch.setattr(settings, "VECTOR_RETRIEVAL_ENABLED", False)
     monkeypatch.setattr(embedding_client, "EmbeddingClient", lambda **kwargs: (_ for _ in ()).throw(
@@ -406,8 +406,8 @@ def test_legacy_milvus_host_configuration_enables_vector_validation(tmp_path, mo
     }]), encoding="utf-8")
 
     from askdata.core.config import settings
-    from askdata.tools import embedding_client, vector_store
-    from askdata.tools.retriever import _ResetVectorValidationFailuresForTests
+    from askdata.retrieval import embedding_client, vector_store
+    from askdata.retrieval.retriever import _ResetVectorValidationFailuresForTests
 
     calls = {"embed": 0, "store_uri": None}
 

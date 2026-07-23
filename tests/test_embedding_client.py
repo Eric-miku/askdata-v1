@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from askdata.tools.embedding_client import EmbeddingClient, EmbeddingConfigurationError
+from askdata.retrieval.embedding_client import EmbeddingClient, EmbeddingConfigurationError
 
 
 class FakeEmbeddingsApi:
