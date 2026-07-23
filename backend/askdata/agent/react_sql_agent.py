@@ -5,17 +5,17 @@ import re
 from typing import Any
 
 from askdata.agent.answer_shape import CheckAnswerShape
-from askdata.agent.prompts import BuildReActSystemPrompt
+from askdata.agent.prompts import BuildReActSystemPrompt, CleanSqlText, SchemaDialect
 
 RUN_QUERY_TOOL = {
     "type": "function",
     "function": {
         "name": "run_query",
-        "description": "Execute a SQLite SELECT query against the selected database. Returns columns and a sample of rows, or an error message that should be used to repair the SQL. The sample may be truncated; do not use OFFSET pagination to collect full result sets. Keep the SQL that directly answers the question.",
+        "description": "Execute a read-only SELECT query against the selected database using the schema's SQL dialect. Returns columns and a sample of rows, or an error message that should be used to repair the SQL. The sample may be truncated; do not use OFFSET pagination to collect full result sets. Keep the SQL that directly answers the question.",
         "parameters": {
             "type": "object",
             "properties": {
-                "sql": {"type": "string", "description": "The SQLite SELECT query to execute."},
+                "sql": {"type": "string", "description": "The read-only SELECT query to execute."},
             },
             "required": ["sql"],
         },
@@ -148,7 +148,7 @@ class ReActSqlAgent:
             previous = f"\nPrevious SQL: {session_context['last_sql']}"
         if session_context and session_context.get("understanding"):
             previous += "\nStructured intent: " + json.dumps(session_context["understanding"], ensure_ascii=False)
-        system_prompt = BuildReActSystemPrompt()
+        system_prompt = BuildReActSystemPrompt(SchemaDialect(schema_prompt))
 
         if self.skill_loader:
             skills = self.skill_loader.BuildPromptSection()
@@ -324,10 +324,7 @@ class ReActSqlAgent:
             return ""
 
     def _CleanSql(self, text: str) -> str:
-        cleaned = (text or "").strip().strip("`").strip()
-        if cleaned.lower().startswith("sql"):
-            cleaned = cleaned[3:].strip()
-        return cleaned.rstrip(";")
+        return CleanSqlText(text)
 
     def _CleanFinalAnswer(self, answer: str) -> str:
         cleaned = (answer or "").strip()

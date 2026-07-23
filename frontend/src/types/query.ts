@@ -12,6 +12,7 @@ export type QueryCellValue =
 export interface DatabaseInfo {
   id: string;
   name: string;
+  kind?: "sqlite" | "mysql" | "postgres";
   tables_count?: number;
 }
 
@@ -44,7 +45,7 @@ export type KnowledgeEntryInput = Omit<
 export interface ManagedDataSource {
   id: string;
   name: string;
-  kind: "sqlite";
+  kind: "sqlite" | "mysql" | "postgres";
   path: string;
   enabled: boolean;
   health: "unknown" | "healthy" | "unhealthy";
@@ -83,7 +84,7 @@ export interface SchemaCatalogSnapshot {
   synced_at: number;
   change_summary: SchemaChangeSummary;
   catalog: {
-    dialect: "sqlite";
+    dialect: "sqlite" | "mysql" | "postgres";
     fingerprint: string;
     table_count: number;
     column_count: number;
@@ -117,6 +118,7 @@ export interface QueryPlanResult {
 export interface ManagedDataSourceInput {
   id: string;
   name: string;
+  kind: "sqlite" | "mysql" | "postgres";
   path: string;
   enabled: boolean;
 }

@@ -18,6 +18,7 @@ export interface QueryApi {
 
 export interface QueryState {
   database: string;
+  databaseSelectionSource: "auto" | "user";
   databases: DatabaseInfo[];
   databasesLoading: boolean;
   databaseError: string | null;
@@ -34,6 +35,30 @@ export interface QueryState {
 }
 
 const defaultApi: QueryApi = { listDatabases, createSession, queryData, executeSql };
+
+function isCompanyDatabase(database: DatabaseInfo): boolean {
+  return database.kind === "mysql" || database.kind === "postgres";
+}
+
+function preferredDatabaseId(databases: DatabaseInfo[]): string {
+  return databases.find(isCompanyDatabase)?.id || databases[0]?.id || "";
+}
+
+function resolveDatabaseSelection(state: QueryState, databases: DatabaseInfo[]): Pick<QueryState, "database" | "databaseSelectionSource"> {
+  const preferred = preferredDatabaseId(databases);
+  const selectionSource = state.databaseSelectionSource || "auto";
+  const currentExists = Boolean(databases.find((database) => database.id === state.database));
+  if (!state.database || !currentExists) {
+    return { database: preferred, databaseSelectionSource: "auto" };
+  }
+  if (selectionSource === "auto" && preferred && state.database !== preferred) {
+    return { database: preferred, databaseSelectionSource: "auto" };
+  }
+  return {
+    database: state.database,
+    databaseSelectionSource: selectionSource,
+  };
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -78,6 +103,7 @@ export function createQueryStore(api: QueryApi = defaultApi) {
 
     return {
       database: "",
+      databaseSelectionSource: "auto",
       databases: [],
       databasesLoading: false,
       databaseError: null,
@@ -91,7 +117,7 @@ export function createQueryStore(api: QueryApi = defaultApi) {
           const databases = await api.listDatabases();
           set((state) => ({
             databases,
-            database: state.database || databases[0]?.id || "",
+            ...resolveDatabaseSelection(state, databases),
             databasesLoading: false,
           }));
         } catch (error) {
@@ -99,9 +125,12 @@ export function createQueryStore(api: QueryApi = defaultApi) {
         }
       },
       async selectDatabase(database) {
-        if (database === get().database) return;
+        if (database === get().database) {
+          set({ databaseSelectionSource: "user", validationError: null });
+          return;
+        }
         await get().newChat();
-        set({ database, validationError: null });
+        set({ database, databaseSelectionSource: "user", validationError: null });
       },
       async newChat() {
         set({ sessionId: null, turns: [], loading: false, validationError: null });
@@ -127,7 +156,7 @@ export function createQueryStore(api: QueryApi = defaultApi) {
       },
       async restoreSql(databaseId, sql, answer = "") {
         const turn = { ...makeTurn("历史查询", "loading"), databaseId };
-        set({ database: databaseId, turns: [turn], loading: true, validationError: null });
+        set({ database: databaseId, databaseSelectionSource: "user", turns: [turn], loading: true, validationError: null });
         try {
           const response = await (api.executeSql || executeSql)({ database_id: databaseId, sql });
           const fullResponse: QueryResponse = {

@@ -165,8 +165,9 @@ If the default uv cache directory is not writable in a sandboxed environment, ru
 ## Management and Operations
 
 - Open the book icon in the left rail to manage terms, aliases, metrics, formulas, field mappings, publishing and version rollback.
-- Open the database drawer and choose **管理数据源** to register, test, enable/disable and synchronize SQLite sources under `data/bird/databases`.
-- Schema synchronization persists SQLite DDL, columns, primary/foreign keys, indexes and a SHA-256 fingerprint; repeated synchronization reports changed tables and the management panel can expand the stored catalog.
+- Open the database drawer and choose **管理数据源** to register, test, enable/disable and synchronize SQLite sources under `data/bird/databases` or external read-only MySQL/PostgreSQL sources.
+- For a company MySQL database, create a read-only database user, place the SQLAlchemy URL in `.env` as `COMPANY_MYSQL_URL=...`, and register the data source path as `env:COMPANY_MYSQL_URL`. AskData stores only schema metadata locally; query rows are read live through the configured connection and SQL mutation statements remain blocked.
+- Schema synchronization persists columns, primary/foreign keys, indexes and a SHA-256 fingerprint; repeated synchronization reports changed tables and the management panel can expand the stored catalog.
 - Management mutations are open for local development when `ADMIN_API_TOKEN` is empty. Set it in production and provide the same token to the frontend as `VITE_ADMIN_API_TOKEN`.
 - The same management panel grants user-level database/table/field query and export policies, plus validated table-level row filters that apply to query, replay, export and execution plans. The frontend sends `VITE_USER_ID` as `X-User-ID`; production deployments should overwrite this header from a trusted gateway or SSO layer.
 - Sessions are persisted per user, and switching databases clears incompatible SQL context. Knowledge entries support JSON bulk upsert with per-row errors plus JSON/CSV export.

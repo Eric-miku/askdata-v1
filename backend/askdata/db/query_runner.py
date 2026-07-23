@@ -164,15 +164,17 @@ def build_sqlite_engine(db_url: str, **create_engine_kwargs) -> Engine:
 
 
 def Execute(sql: str, database_path: str, page_size: int = 1000, access_mode: str = "query") -> dict:
-    """Execute a read-only SQLite query using the shared resilient executor.
+    """Execute a read-only query using the shared resilient executor.
 
     This small adapter is the application-facing query contract used by the
-    ReAct agent and evaluation runner.  It deliberately verifies the path
-    before constructing a SQLite URL: SQLite otherwise creates a new empty
-    database for a misspelled path, which turns a configuration error into a
-    misleading SQL error.
+    ReAct agent and evaluation runner. SQLite file paths are still supported,
+    and managed external sources are addressed as ``source:<id>`` so credentials
+    never need to appear in prompts or trace output.
     """
     from askdata.security.permissions import PrepareCurrentSql
+
+    if str(database_path).startswith("source:"):
+        return _ExecuteManagedSource(sql, str(database_path).split(":", 1)[1], page_size, access_mode)
 
     allowed, reason, executable_sql = PrepareCurrentSql(sql, access_mode)
     if not allowed:
@@ -190,6 +192,59 @@ def Execute(sql: str, database_path: str, page_size: int = 1000, access_mode: st
             "error_code": "DB_NOT_FOUND",
         }
 
+    return _ExecuteWithUrl(sql, executable_sql, f"sqlite:///{path.resolve()}", "sqlite", page_size, access_mode)
+
+
+def _ExecuteManagedSource(sql: str, source_id: str, page_size: int, access_mode: str) -> dict:
+    from askdata.data.source_store import NormalizeKind, ResolveConnectionUrl, data_source_store
+    from askdata.security.permissions import PrepareCurrentSql
+
+    source = data_source_store.get(source_id)
+    if source is None or not source["enabled"]:
+        return {
+            "success": False,
+            "error": f"Data source is not available: {source_id}",
+            "error_code": "DB_NOT_FOUND",
+        }
+
+    allowed, reason, executable_sql = PrepareCurrentSql(sql, access_mode)
+    if not allowed:
+        return {
+            "success": False,
+            "error": reason or "SQL permission denied.",
+            "error_code": "PERMISSION_DENIED",
+        }
+
+    kind = NormalizeKind(source["kind"])
+    if kind == "sqlite":
+        path = Path(source["path"])
+        if not path.is_file():
+            return {
+                "success": False,
+                "error": f"SQLite database does not exist: {path}",
+                "error_code": "DB_NOT_FOUND",
+            }
+        return _ExecuteWithUrl(sql, executable_sql, f"sqlite:///{path.resolve()}", "sqlite", page_size, access_mode)
+
+    try:
+        db_url = ResolveConnectionUrl(source["path"])
+    except ValueError as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "error_code": "DB_NOT_FOUND",
+        }
+    return _ExecuteWithUrl(sql, executable_sql, db_url, kind, page_size, access_mode)
+
+
+def _ExecuteWithUrl(
+    original_sql: str,
+    executable_sql: str,
+    db_url: str,
+    dialect: str,
+    page_size: int,
+    access_mode: str,
+) -> dict:
     from askdata.db.executor import SQLExecutor
     from askdata.core.config import settings
 
@@ -197,8 +252,8 @@ def Execute(sql: str, database_path: str, page_size: int = 1000, access_mode: st
     effective_page_size = min(page_size, row_limit)
 
     result = SQLExecutor(
-        f"sqlite:///{path.resolve()}",
-        dialect="sqlite",
+        db_url,
+        dialect=dialect,
         default_page_size=effective_page_size,
         max_page_size=effective_page_size,
         max_joins=settings.SQL_MAX_JOINS,
@@ -219,7 +274,7 @@ def Execute(sql: str, database_path: str, page_size: int = 1000, access_mode: st
         "success": True,
         "columns": [column.key for column in result.columns],
         "rows": result.rows,
-        "sql": sql,
+        "sql": original_sql,
         "pagination": result.pagination.to_dict() if result.pagination else None,
         "elapsed_ms": result.elapsed_ms,
         "warnings": result.warnings,

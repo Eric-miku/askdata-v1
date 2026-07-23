@@ -24,7 +24,7 @@ interface Props {
 export default function DataSourceManager({ open, onClose, onChanged }: Props) {
   const [sources, setSources] = useState<Awaited<ReturnType<typeof listManagedDataSources>>>([]);
   const [policies, setPolicies] = useState<Awaited<ReturnType<typeof listPermissionPolicies>>>([]);
-  const [form, setForm] = useState<ManagedDataSourceInput>({ id: "", name: "", path: "", enabled: true });
+  const [form, setForm] = useState<ManagedDataSourceInput>({ id: "", name: "", kind: "sqlite", path: "", enabled: true });
   const [permissionForm, setPermissionForm] = useState<PermissionPolicyInput>({
     user_id: "", database_id: "", table_name: null, field_name: null,
     can_query: true, can_export: true, row_filter: null,
@@ -42,10 +42,10 @@ export default function DataSourceManager({ open, onClose, onChanged }: Props) {
   if (!open) return null;
 
   const create = async () => {
-    if (!form.id || !form.name || !form.path) { setError("请填写 ID、名称和 SQLite 路径"); return; }
+    if (!form.id || !form.name || !form.path) { setError("请填写 ID、名称和数据源位置"); return; }
     try {
       await createManagedDataSource(form);
-      setForm({ id: "", name: "", path: "", enabled: true });
+      setForm({ id: "", name: "", kind: "sqlite", path: "", enabled: true });
       await load();
       onChanged();
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
@@ -79,19 +79,20 @@ export default function DataSourceManager({ open, onClose, onChanged }: Props) {
   return <div className="knowledge-modal" role="dialog" aria-modal="true" aria-label="数据源管理">
     <button type="button" className="knowledge-modal__scrim" aria-label="关闭数据源管理" onClick={onClose} />
     <section className="knowledge-panel data-source-panel">
-      <header className="knowledge-panel__header"><div><strong>数据源管理</strong><span>接入、测试和同步受控 SQLite 数据源</span></div><button type="button" className="icon-button" aria-label="关闭数据源管理" onClick={onClose}><CloseIcon /></button></header>
+      <header className="knowledge-panel__header"><div><strong>数据源管理</strong><span>接入、测试和同步受控 SQLite / MySQL 数据源</span></div><button type="button" className="icon-button" aria-label="关闭数据源管理" onClick={onClose}><CloseIcon /></button></header>
       <main className="data-source-content">
         {error ? <div className="workspace-alert" role="alert">{error}</div> : null}
         <section className="data-source-create">
           <label><span>数据源 ID</span><input value={form.id} onChange={(event) => setForm({ ...form, id: event.target.value })} placeholder="finance" /></label>
           <label><span>显示名称</span><input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="财务数据库" /></label>
-          <label><span>SQLite 相对路径</span><input value={form.path} onChange={(event) => setForm({ ...form, path: event.target.value })} placeholder="financial/financial.sqlite" /></label>
+          <label><span>类型</span><select value={form.kind} onChange={(event) => setForm({ ...form, kind: event.target.value as ManagedDataSourceInput["kind"] })}><option value="sqlite">SQLite</option><option value="mysql">MySQL</option><option value="postgres">PostgreSQL</option></select></label>
+          <label><span>{form.kind === "sqlite" ? "SQLite 相对路径" : "连接配置"}</span><input value={form.path} onChange={(event) => setForm({ ...form, path: event.target.value })} placeholder={form.kind === "sqlite" ? "financial/financial.sqlite" : "env:COMPANY_MYSQL_URL"} /></label>
           <button type="button" onClick={() => void create()}>新增数据源</button>
         </section>
         <section className="data-source-list">
           {sources.length ? sources.map((source) => <article key={source.id}>
             <header><div><strong>{source.name}</strong><code>{source.id}</code></div><span className={`is-${source.health}`}>{source.health === "healthy" ? "连接正常" : source.health === "unhealthy" ? "连接失败" : "未测试"}</span></header>
-            <p>{source.path}</p>
+            <p>{source.kind} · {source.path}</p>
             <small>{source.table_count} 张表 · {source.index_count || 0} 个索引 · {source.last_synced_at ? `最近同步 ${new Date(source.last_synced_at * 1000).toLocaleString()}` : "尚未同步"}</small>
             {source.schema_fingerprint ? <small className="schema-fingerprint">Schema {source.schema_fingerprint.slice(0, 12)}{source.schema_changed ? " · 检测到结构变化" : " · 结构未变化"}</small> : null}
             {source.last_error ? <em>{source.last_error}</em> : null}

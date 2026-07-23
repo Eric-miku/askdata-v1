@@ -235,9 +235,10 @@ class BirdSchemaIndex:
         matched_joins = self._MatchedJoins(database, selected_names)
 
         schema_prompt = self.BuildSchemaPrompt(database, selected_names, matched_joins, evidence)
+        execution_target = GetValue(database, "executionTarget", "execution_target", default=None)
         return {
             "database_id": database_id,
-            "database_path": GetValue(database, "databasePath", "database_path", default=""),
+            "database_path": execution_target or GetValue(database, "databasePath", "database_path", default=""),
             "matched_tables": matched_tables,
             "matched_columns": matched_columns,
             "matched_joins": matched_joins,
@@ -374,9 +375,12 @@ class BirdSchemaIndex:
     def BuildSchemaPrompt(self, database: Any, selected_names: set[str], joins: list[dict[str, str]], evidence: str = "") -> str:
         database_id = GetValue(database, "databaseId", "database_id")
         database_path = GetValue(database, "databasePath", "database_path", default="")
-        lines = [f"Database: {database_id}", "Dialect: SQLite"]
-        if database_path:
+        dialect = str(GetValue(database, "dialect", default="sqlite") or "sqlite")
+        lines = [f"Database: {database_id}", f"Dialect: {dialect}"]
+        if dialect == "sqlite" and database_path:
             lines.append(f"SQLite path: {database_path}")
+        elif GetValue(database, "executionTarget", "execution_target", default=""):
+            lines.append(f"Connection: configured data source {database_id}; credentials are hidden.")
         if evidence:
             lines.append(f"Evidence: {evidence}")
         instructions = self._LoadInstructions(database_id)
@@ -441,6 +445,7 @@ class SemanticRetriever:
         if self.index:
             return self
         databases = LoadProcessedDatabases(self.processed_dir)
+        databases.extend(_LoadManagedCatalogDatabases())
         try:
             questions = LoadProcessedQuestions(
                 self.processed_dir,
@@ -456,6 +461,59 @@ class SemanticRetriever:
         if not self.index:
             self.Build()
         return self.index.Retrieve(database_id, question)["schema_prompt"]
+
+
+def _LoadManagedCatalogDatabases() -> list[dict[str, Any]]:
+    try:
+        from askdata.data.source_store import data_source_store
+    except Exception:
+        return []
+
+    databases = []
+    for source in data_source_store.list():
+        if not source.get("enabled"):
+            continue
+        snapshot = data_source_store.catalog(source["id"])
+        if snapshot is None:
+            continue
+        catalog = snapshot["catalog"]
+        databases.append(_CatalogToRetrieverDatabase(source["id"], catalog))
+    return databases
+
+
+def _CatalogToRetrieverDatabase(source_id: str, catalog: dict[str, Any]) -> dict[str, Any]:
+    tables = []
+    foreign_keys = []
+    for table in catalog.get("tables", []):
+        table_name = table["name"]
+        primary_key = {str(column) for column in table.get("primary_key", [])}
+        tables.append({
+            "table_name": table_name,
+            "columns": [
+                {
+                    "column_name": column["name"],
+                    "data_type": column.get("type") or "text",
+                    "is_primary_key": column["name"] in primary_key or bool(column.get("primary_key_position")),
+                }
+                for column in table.get("columns", [])
+            ],
+        })
+        for foreign_key in table.get("foreign_keys", []):
+            if not foreign_key.get("from_column") or not foreign_key.get("referenced_table"):
+                continue
+            foreign_keys.append({
+                "source_table": table_name,
+                "source_column": foreign_key.get("from_column"),
+                "target_table": foreign_key.get("referenced_table"),
+                "target_column": foreign_key.get("to_column"),
+            })
+    return {
+        "database_id": source_id,
+        "dialect": catalog.get("dialect") or "sqlite",
+        "execution_target": f"source:{source_id}",
+        "tables": tables,
+        "foreign_keys": foreign_keys,
+    }
 
 
 def _BuildEmbeddingClient(manifest: dict[str, Any]) -> EmbeddingClient:

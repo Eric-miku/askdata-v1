@@ -45,7 +45,8 @@ class KnowledgeBulkImportRequest(BaseModel):
 class DataSourceRequest(BaseModel):
     id: str = Field(..., pattern=r"^[A-Za-z0-9_-]+$", min_length=1, max_length=100)
     name: str = Field(..., min_length=1, max_length=200)
-    path: str = Field(..., min_length=1, description="BIRD databases 目录中的 SQLite 相对路径")
+    kind: str = Field("sqlite", pattern="^(sqlite|mysql|postgres|postgresql)$")
+    path: str = Field(..., min_length=1, description="SQLite 相对路径，或外部数据库 SQLAlchemy 连接串")
     enabled: bool = True
 
 

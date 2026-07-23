@@ -1812,7 +1812,7 @@ svg {
 
 .data-source-create {
   display: grid;
-  grid-template-columns: 0.7fr 1fr 1.5fr auto;
+  grid-template-columns: 0.7fr 1fr 0.8fr 1.8fr auto;
   align-items: end;
   gap: 12px;
   padding-bottom: 20px;
@@ -1828,6 +1828,7 @@ svg {
 }
 
 .data-source-create input,
+.data-source-create select,
 .data-source-create button,
 .data-source-list button {
   min-height: 38px;

@@ -1,4 +1,4 @@
-"""Deterministic SQLite schema catalog and change detection."""
+"""Deterministic schema catalog and change detection."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any
+
+from sqlalchemy import create_engine, inspect, text
 
 
 def _quote_identifier(value: str) -> str:
@@ -89,6 +91,78 @@ def BuildSqliteCatalog(database_path: str | Path) -> dict[str, Any]:
         "index_count": sum(len(table["indexes"]) for table in tables),
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload["fingerprint"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return payload
+
+
+def BuildSqlAlchemyCatalog(db_url: str, dialect: str, schema: str | None = None) -> dict[str, Any]:
+    """Read a stable catalog from an external SQL database without reading table data."""
+    engine = create_engine(db_url, pool_pre_ping=True, pool_size=1, max_overflow=0, pool_timeout=5)
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+            inspector = inspect(connection)
+            table_names = sorted(inspector.get_table_names(schema=schema))
+            tables: list[dict[str, Any]] = []
+            for table_name in table_names:
+                columns_raw = inspector.get_columns(table_name, schema=schema)
+                pk_raw = inspector.get_pk_constraint(table_name, schema=schema) or {}
+                pk_columns = [str(item) for item in pk_raw.get("constrained_columns", [])]
+                pk_positions = {name: index + 1 for index, name in enumerate(pk_columns)}
+                columns = [
+                    {
+                        "name": str(column["name"]),
+                        "type": str(column.get("type") or "TEXT"),
+                        "nullable": bool(column.get("nullable", True)),
+                        "default": column.get("default"),
+                        "primary_key_position": pk_positions.get(str(column["name"]), 0),
+                    }
+                    for column in columns_raw
+                ]
+                foreign_keys = []
+                for index, foreign_key in enumerate(inspector.get_foreign_keys(table_name, schema=schema) or []):
+                    constrained = foreign_key.get("constrained_columns") or []
+                    referred = foreign_key.get("referred_columns") or []
+                    for sequence, from_column in enumerate(constrained):
+                        foreign_keys.append({
+                            "id": index,
+                            "sequence": sequence,
+                            "referenced_table": foreign_key.get("referred_table"),
+                            "from_column": from_column,
+                            "to_column": referred[sequence] if sequence < len(referred) else None,
+                            "on_update": foreign_key.get("options", {}).get("onupdate"),
+                            "on_delete": foreign_key.get("options", {}).get("ondelete"),
+                        })
+                indexes = [
+                    {
+                        "name": str(index.get("name") or ""),
+                        "unique": bool(index.get("unique", False)),
+                        "origin": "database",
+                        "partial": False,
+                        "columns": [str(column) for column in index.get("column_names") or [] if column],
+                    }
+                    for index in (inspector.get_indexes(table_name, schema=schema) or [])
+                ]
+                indexes.sort(key=lambda item: item["name"])
+                tables.append({
+                    "name": table_name,
+                    "ddl": "",
+                    "columns": columns,
+                    "primary_key": pk_columns,
+                    "foreign_keys": foreign_keys,
+                    "indexes": indexes,
+                })
+    finally:
+        engine.dispose()
+
+    payload: dict[str, Any] = {
+        "dialect": "postgres" if dialect == "postgresql" else dialect,
+        "tables": tables,
+        "table_count": len(tables),
+        "column_count": sum(len(table["columns"]) for table in tables),
+        "index_count": sum(len(table["indexes"]) for table in tables),
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     payload["fingerprint"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return payload
 

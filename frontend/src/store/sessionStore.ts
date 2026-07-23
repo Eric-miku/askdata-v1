@@ -37,6 +37,7 @@ export const useSessionStore = create<SessionState>((set) => ({
       useQueryStore.setState({
         sessionId: detail.session_id,
         database: detail.database_id || "",
+        databaseSelectionSource: "user",
         turns: [],
         loading: false,
       });

@@ -104,6 +104,13 @@ def test_react_sql_agent_prompt_includes_bird_specific_intern_agent_rules():
     assert "do not concatenate address fields" in system_prompt
 
 
+def test_react_sql_agent_clean_sql_preserves_mysql_backtick_identifiers():
+    agent = ReActSqlAgent(llm_client=ScriptedToolCallingLLM([{"content": "done"}]))
+
+    assert agent._CleanSql("SELECT COUNT(*) AS row_count FROM `orders`") == "SELECT COUNT(*) AS row_count FROM `orders`"
+    assert agent._CleanSql("```sql\nSELECT id FROM `orders`;\n```") == "SELECT id FROM `orders`"
+
+
 def test_react_sql_agent_keeps_count_sql_when_later_detail_query_is_exploratory(tmp_path):
     database_path = tmp_path / "demo.sqlite"
     connection = sqlite3.connect(database_path)

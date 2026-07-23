@@ -1,6 +1,26 @@
 """Prompt builder — classifies SQL task type (EASY/NON_NESTED/NESTED), builds structured SQL generation and repair prompts with schema linking checklist and task-specific guidance."""
 
 import json
+import re
+
+
+def CleanSqlText(text: str) -> str:
+    cleaned = (text or "").strip()
+    fence = re.match(r"^```(?:sql)?\s*([\s\S]*?)\s*```$", cleaned, re.I)
+    if fence:
+        cleaned = fence.group(1).strip()
+    elif cleaned.startswith("`") and cleaned.endswith("`") and cleaned.count("`") == 2:
+        cleaned = cleaned[1:-1].strip()
+    if cleaned[:3].lower() == "sql" and (len(cleaned) == 3 or cleaned[3].isspace() or cleaned[3] in ":\n"):
+        cleaned = cleaned[3:].strip()
+    return cleaned.rstrip(";").strip()
+
+
+def SchemaDialect(schema_prompt: str) -> str:
+    for line in (schema_prompt or "").splitlines():
+        if line.lower().startswith("dialect:"):
+            return line.split(":", 1)[1].strip() or "SQLite"
+    return "SQLite"
 
 def ClassifySqlTask(question: str, schema_prompt: str) -> str:
     lowered = f" {(question or '').lower()} "
@@ -55,9 +75,10 @@ def BuildSqlPrompt(
     if session_context and session_context.get("understanding"):
         understanding = "\nStructured intent: " + json.dumps(session_context["understanding"], ensure_ascii=False)
     task_type = ClassifySqlTask(question, schema_prompt)
-    return f"""You are an AI assistant that converts BIRD natural language questions into one SQLite SELECT SQL query.
+    dialect = SchemaDialect(schema_prompt)
+    return f"""You are an AI assistant that converts natural language questions into one {dialect} SELECT SQL query.
 Return SQL only. Do not use markdown. Do not wrap the answer in tags. Do not use SELECT *.
-Target execution engine is SQLite. Use only the tables and columns in the schema.
+Target execution engine is {dialect}. Use only the tables and columns in the schema.
 
 SQL generation rules:
 - SELECT list must include every attribute explicitly requested by the question.
@@ -94,7 +115,8 @@ Before writing SQL, internally identify:
 
 
 def BuildRepairPrompt(question: str, sql: str, error_message: str, schema_prompt: str) -> str:
-    return f"""Repair this SQLite SELECT SQL query.
+    dialect = SchemaDialect(schema_prompt)
+    return f"""Repair this {dialect} SELECT SQL query.
 Return SQL only. Do not use markdown.
 
 Question: {question}
@@ -106,9 +128,14 @@ Schema:
 """
 
 
-def BuildReActSystemPrompt() -> str:
+def BuildReActSystemPrompt(dialect: str = "SQLite") -> str:
     """Build the system prompt that guides the ReAct SQL agent loop."""
-    return """You are a SQLite data analyst. Given a question and a database schema, write and execute SQL queries to answer the question.
+    date_rule = (
+        "Normalize date-like text with SQLite date functions before comparing it when stored values include timestamps or non-ISO formatting."
+        if dialect.strip().lower() == "sqlite"
+        else "Normalize date-like text with functions supported by the target dialect before comparing it when stored values include timestamps or non-ISO formatting."
+    )
+    return f"""You are a {dialect} data analyst. Given a question and a database schema, write and execute SQL queries to answer the question.
 
 HOW TO WORK (follow this sequence for every question):
 1. Read the question. Identify exactly what columns the answer requires.
@@ -148,7 +175,7 @@ COMPUTATION (push everything into SQL):
 - Comparisons (most/least/highest/lowest): use ORDER BY + LIMIT 1. Never fetch multiple rows and pick yourself.
 - Ratios, percentages, averages, differences: compute in the SELECT expressions. Never fetch two numbers and divide in your head.
 - Conditional counts: use SUM(CASE WHEN ... THEN 1 ELSE 0 END). Never count rows manually.
-- Normalize date-like text with SQLite date functions before comparing it when stored values include timestamps or non-ISO formatting.
+- {date_rule}
 - Do not paginate with OFFSET to collect full result sets. The tool returns samples; the final SQL should answer the question, not fetch every page.
 
 ANSWER (final output rules):

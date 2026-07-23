@@ -40,6 +40,51 @@ describe("query store", () => {
     expect(store.getState().databaseError).toBeNull();
   });
 
+  it("prefers a connected company database over local BIRD databases", async () => {
+    const store = createQueryStore(createApi({
+      listDatabases: vi.fn().mockResolvedValue([
+        { id: "demo", name: "Demo", kind: "sqlite", tables_count: 2 },
+        { id: "intern_db", name: "Company MySQL intern_db", kind: "mysql", tables_count: 12 },
+      ]),
+    }));
+
+    await store.getState().loadDatabases();
+
+    expect(store.getState().database).toBe("intern_db");
+  });
+
+  it("switches from the automatic local default when a company database becomes available", async () => {
+    const listDatabases = vi
+      .fn()
+      .mockResolvedValueOnce([{ id: "demo", name: "Demo", kind: "sqlite", tables_count: 2 }])
+      .mockResolvedValueOnce([
+        { id: "demo", name: "Demo", kind: "sqlite", tables_count: 2 },
+        { id: "intern_db", name: "Company MySQL intern_db", kind: "mysql", tables_count: 12 },
+      ]);
+    const store = createQueryStore(createApi({ listDatabases }));
+
+    await store.getState().loadDatabases();
+    await store.getState().loadDatabases();
+
+    expect(store.getState().database).toBe("intern_db");
+  });
+
+  it("keeps a user-selected local database when the list refreshes", async () => {
+    const api = createApi({
+      listDatabases: vi.fn().mockResolvedValue([
+        { id: "demo", name: "Demo", kind: "sqlite", tables_count: 2 },
+        { id: "intern_db", name: "Company MySQL intern_db", kind: "mysql", tables_count: 12 },
+      ]),
+    });
+    const store = createQueryStore(api);
+
+    await store.getState().loadDatabases();
+    await store.getState().selectDatabase("demo");
+    await store.getState().loadDatabases();
+
+    expect(store.getState().database).toBe("demo");
+  });
+
   it("creates one session and reuses it for consecutive messages", async () => {
     const api = createApi();
     const store = createQueryStore(api);

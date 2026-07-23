@@ -1,6 +1,6 @@
 """AgentGraph — minimal NL2SQL orchestration chain. Delegates to ReActSqlAgent or falls back to a one-shot SQL pipeline with repair."""
 
-from askdata.agent.prompts import BuildRepairPrompt, BuildSqlPrompt
+from askdata.agent.prompts import BuildRepairPrompt, BuildSqlPrompt, CleanSqlText
 from askdata.agent.react_sql_agent import ReActSqlAgent
 from askdata.core.llm import LLMClient
 from askdata.tools.analyzer import ResultAnalyzer
@@ -101,10 +101,7 @@ class AgentGraph:
         return RunQuery(sql, database_path)
 
     def _CleanSql(self, text: str) -> str:
-        cleaned = (text or "").strip().strip("`").strip()
-        if cleaned.lower().startswith("sql"):
-            cleaned = cleaned[3:].strip()
-        return cleaned.rstrip(";")
+        return CleanSqlText(text)
 
     def _TraceStep(self, step: str, status: str, message: str) -> dict:
         return {"step": step, "status": status, "message": message}

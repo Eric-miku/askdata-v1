@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
-from askdata.tools.retriever import BirdSchemaIndex, SemanticRetriever
+from askdata.tools.retriever import BirdSchemaIndex, SemanticRetriever, _CatalogToRetrieverDatabase
 
 
 def sample_database(table_count=2):
@@ -192,3 +192,27 @@ def test_semantic_retriever_loads_native_contract_and_evidence(tmp_path):
 
     assert "Evidence: Count every item row." in prompt
     assert "Table items(id integer)" in prompt
+
+
+def test_managed_catalog_database_uses_hidden_source_execution_target():
+    catalog = {
+        "dialect": "mysql",
+        "tables": [{
+            "name": "customers",
+            "columns": [
+                {"name": "id", "type": "INT", "primary_key_position": 1},
+                {"name": "name", "type": "VARCHAR(255)", "primary_key_position": 0},
+            ],
+            "primary_key": ["id"],
+            "foreign_keys": [],
+        }],
+    }
+    database = _CatalogToRetrieverDatabase("company", catalog)
+
+    result = BirdSchemaIndex().Build([database]).Retrieve("company", "list customers")
+
+    assert result["database_path"] == "source:company"
+    assert "Dialect: mysql" in result["schema_prompt"]
+    assert "Connection: configured data source company; credentials are hidden." in result["schema_prompt"]
+    assert "mysql://" not in result["schema_prompt"]
+    assert "Table customers(id INT, name VARCHAR(255))" in result["schema_prompt"]

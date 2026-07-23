@@ -62,7 +62,7 @@ from askdata.tools.analysis import StructuredAnalyzer
 from askdata.tools.exporter import BuildCsv, BuildXlsx
 from askdata.tools.visualization import ChartRecommender
 from askdata.knowledge.store import knowledge_store
-from askdata.data.source_store import data_source_store
+from askdata.data.source_store import IsEnvConnectionRef, NormalizeKind, RedactConnectionText, data_source_store
 from askdata.security.permissions import ResetSqlAuthorizer, SetSqlAuthorizer, permission_store
 
 # 创建 APIRouter 实例
@@ -159,39 +159,49 @@ def _scan_databases() -> list[dict]:
     databases_dir = _get_bird_databases_dir()
     databases = []
 
-    # 如果目录不存在，返回空列表
-    if not databases_dir.exists():
-        return databases
-
-    # 查找所有 .db 和 .sqlite 文件
-    db_files = list(databases_dir.rglob("*.db")) + list(databases_dir.rglob("*.sqlite"))
-
     managed = {item["id"]: item for item in data_source_store.list()}
-    managed_by_path = {str(Path(item["path"]).resolve()): item for item in managed.values()}
-    disabled_paths = {str(Path(item["path"]).resolve()) for item in managed.values() if not item["enabled"]}
+    sqlite_managed = {key: item for key, item in managed.items() if item["kind"] == "sqlite"}
+    managed_by_path = {str(Path(item["path"]).resolve()): item for item in sqlite_managed.values()}
+    disabled_paths = {str(Path(item["path"]).resolve()) for item in sqlite_managed.values() if not item["enabled"]}
     seen = set()
-    for db_path in db_files:
-        if str(db_path.resolve()) in disabled_paths:
-            continue
-        managed_item = managed_by_path.get(str(db_path.resolve()))
-        db_id = managed_item["id"] if managed_item else db_path.stem
-        if db_id not in seen:
-            seen.add(db_id)
-            databases.append({
-                "id": db_id,
-                "name": managed_item["name"] if managed_item else db_id.replace("_", " ").title(),
-                "path": str(db_path),           # 转为 str，保持类型一致
-                "tables_count": _CountTables(str(db_path)),  # 使用高效 COUNT 查询
-            })
+    if databases_dir.exists():
+        # 查找所有 .db 和 .sqlite 文件
+        db_files = list(databases_dir.rglob("*.db")) + list(databases_dir.rglob("*.sqlite"))
+        for db_path in db_files:
+            if str(db_path.resolve()) in disabled_paths:
+                continue
+            managed_item = managed_by_path.get(str(db_path.resolve()))
+            db_id = managed_item["id"] if managed_item else db_path.stem
+            if db_id not in seen:
+                seen.add(db_id)
+                databases.append({
+                    "id": db_id,
+                    "name": managed_item["name"] if managed_item else db_id.replace("_", " ").title(),
+                    "kind": "sqlite",
+                    "path": str(db_path),           # 转为 str，保持类型一致
+                    "tables_count": _CountTables(str(db_path)),  # 使用高效 COUNT 查询
+                })
 
     for item in managed.values():
-        resolved = Path(item["path"])
-        if item["enabled"] and item["id"] not in seen and resolved.is_file():
+        if not item["enabled"] or item["id"] in seen:
+            continue
+        if item["kind"] == "sqlite":
+            resolved = Path(item["path"])
+            if not resolved.is_file():
+                continue
             databases.append({
-                "id": item["id"], "name": item["name"], "path": str(resolved),
+                "id": item["id"], "name": item["name"], "kind": "sqlite", "path": str(resolved),
                 "tables_count": item["table_count"] or _CountTables(str(resolved)),
             })
+        else:
+            if data_source_store.catalog(item["id"]) is None:
+                continue
+            databases.append({
+                "id": item["id"], "name": item["name"], "kind": item["kind"], "path": f"source:{item['id']}",
+                "tables_count": item["table_count"],
+            })
 
+    databases.sort(key=lambda database: 0 if database.get("kind") in {"mysql", "postgres"} else 1)
     return databases
 
 
@@ -217,6 +227,42 @@ def _read_sqlite_tables(db_path: str) -> list[dict]:
         return tables
     finally:
         connection.close()
+
+
+def _read_catalog_tables(source_id: str) -> list[dict]:
+    snapshot = data_source_store.catalog(source_id)
+    if snapshot is None:
+        raise HTTPException(status_code=409, detail="数据源尚未同步 Schema")
+    tables = []
+    for table in snapshot["catalog"].get("tables", []):
+        tables.append({
+            "table_name": table["name"],
+            "columns": [
+                {
+                    "name": column["name"],
+                    "type": column.get("type") or "TEXT",
+                    "primary_key": bool(column.get("primary_key_position")),
+                    "nullable": bool(column.get("nullable", True)),
+                }
+                for column in table.get("columns", [])
+            ],
+        })
+    return tables
+
+
+def _read_database_tables(db_info: dict) -> list[dict]:
+    if db_info.get("kind", "sqlite") == "sqlite":
+        return _read_sqlite_tables(db_info["path"])
+    return _read_catalog_tables(db_info["id"])
+
+
+def _public_data_source(source: dict) -> dict:
+    safe = dict(source)
+    if safe.get("kind") != "sqlite":
+        safe["path"] = RedactConnectionText(str(safe.get("path", "")))
+        if safe.get("last_error"):
+            safe["last_error"] = RedactConnectionText(str(safe["last_error"]))
+    return safe
 
 
 # ============================================================
@@ -296,7 +342,7 @@ async def get_tables(database_id: str, x_user_id: str = Header("local-user")):
 
     try:
         tables = []
-        for table in _read_sqlite_tables(db_info["path"]):
+        for table in _read_database_tables(db_info):
             table_name = table["table_name"]
             if not permission_store.table_allowed(x_user_id, database_id, table_name):
                 continue
@@ -305,7 +351,9 @@ async def get_tables(database_id: str, x_user_id: str = Header("local-user")):
                 if permission_store.field_allowed(x_user_id, database_id, table_name, column["name"])
             ]
             tables.append(table)
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, HTTPException) as exc:
+        if isinstance(exc, HTTPException):
+            raise
         trace.log("读取表结构失败", str(exc))
         raise HTTPException(status_code=500, detail=f"读取数据库结构失败: {exc}") from exc
 
@@ -801,6 +849,8 @@ async def explain_query(request: ExecuteSqlRequest, x_user_id: str = Header("loc
     database = next((item for item in _scan_databases() if item["id"] == request.database_id), None)
     if database is None or not permission_store.database_allowed(x_user_id, request.database_id):
         raise HTTPException(status_code=404, detail=f"数据库 '{request.database_id}' 未找到")
+    if database.get("kind", "sqlite") != "sqlite":
+        raise HTTPException(status_code=422, detail="当前执行计划分析仅支持 SQLite 数据源")
     allowed, reason, executable_sql = permission_store.prepare_sql(
         x_user_id, request.database_id, request.sql, "query"
     )
@@ -998,7 +1048,7 @@ async def publish_knowledge_entry(entry_id: str, _admin: None = Depends(_require
         if not database_id or not table_name or not field_name:
             continue
         database = next((item for item in _scan_databases() if item["id"] == database_id), None)
-        if database is None or not any(table["table_name"] == table_name and any(column["name"] == field_name for column in table["columns"]) for table in _read_sqlite_tables(database["path"])):
+        if database is None or not any(table["table_name"] == table_name and any(column["name"] == field_name for column in table["columns"]) for table in _read_database_tables(database)):
             raise HTTPException(status_code=400, detail=f"映射字段不存在: {database_id}.{table_name}.{field_name}")
     payload = {**entry, "status": "published", "changelog": "发布"}
     published = knowledge_store.save(payload, entry_id=entry_id, updated_by="api-user")
@@ -1026,27 +1076,37 @@ def _resolve_managed_sqlite_path(value: str) -> Path:
     return resolved
 
 
+def _resolve_data_source_location(body: DataSourceRequest) -> tuple[str, str]:
+    kind = NormalizeKind(body.kind)
+    if kind == "sqlite":
+        return kind, str(_resolve_managed_sqlite_path(body.path))
+    location = body.path.strip()
+    if "://" not in location and not IsEnvConnectionRef(location):
+        raise HTTPException(status_code=400, detail="外部数据源需要 SQLAlchemy 连接串或 env:变量名，例如 env:COMPANY_MYSQL_URL")
+    return kind, location
+
+
 @router.get("/data-sources")
 async def list_managed_data_sources(_admin: None = Depends(_require_admin)):
-    return {"data_sources": data_source_store.list()}
+    return {"data_sources": [_public_data_source(source) for source in data_source_store.list()]}
 
 
 @router.post("/data-sources")
 async def create_managed_data_source(body: DataSourceRequest, _admin: None = Depends(_require_admin)):
-    path = _resolve_managed_sqlite_path(body.path)
+    kind, path = _resolve_data_source_location(body)
     if data_source_store.get(body.id):
         raise HTTPException(status_code=409, detail="数据源 ID 已存在")
-    source = data_source_store.save(body.id, body.name, str(path), body.enabled)
-    _audit("data_source_created", source_id=body.id, kind="sqlite")
-    return source
+    source = data_source_store.save(body.id, body.name, path, body.enabled, kind=kind)
+    _audit("data_source_created", source_id=body.id, kind=kind)
+    return _public_data_source(source)
 
 
 @router.put("/data-sources/{source_id}")
 async def update_managed_data_source(source_id: str, body: DataSourceRequest, _admin: None = Depends(_require_admin)):
     if data_source_store.get(source_id) is None:
         raise HTTPException(status_code=404, detail="数据源不存在")
-    path = _resolve_managed_sqlite_path(body.path)
-    return data_source_store.save(source_id, body.name, str(path), body.enabled)
+    kind, path = _resolve_data_source_location(body)
+    return _public_data_source(data_source_store.save(source_id, body.name, path, body.enabled, kind=kind))
 
 
 @router.patch("/data-sources/{source_id}/status")
@@ -1055,7 +1115,7 @@ async def set_managed_data_source_status(source_id: str, body: DataSourceStatusR
     if source is None:
         raise HTTPException(status_code=404, detail="数据源不存在")
     _audit("data_source_status_changed", source_id=source_id, enabled=body.enabled)
-    return source
+    return _public_data_source(source)
 
 
 @router.post("/data-sources/{source_id}/test")
@@ -1063,7 +1123,7 @@ async def test_managed_data_source(source_id: str, _admin: None = Depends(_requi
     source = data_source_store.check(source_id)
     if source is None:
         raise HTTPException(status_code=404, detail="数据源不存在")
-    return source
+    return _public_data_source(source)
 
 
 @router.post("/data-sources/{source_id}/sync")
@@ -1074,7 +1134,7 @@ async def sync_managed_data_source(source_id: str, _admin: None = Depends(_requi
     if source["health"] != "healthy":
         raise HTTPException(status_code=400, detail=source["last_error"] or "数据源连接失败")
     _audit("data_source_schema_synced", source_id=source_id, table_count=source["table_count"])
-    return source
+    return _public_data_source(source)
 
 
 @router.get("/data-sources/{source_id}/schema")

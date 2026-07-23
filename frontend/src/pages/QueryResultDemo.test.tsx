@@ -64,6 +64,7 @@ describe("QueryResultDemo", () => {
     apiMocks.listManagedDataSources.mockReset().mockResolvedValue([]);
     useQueryStore.setState({
       database: "",
+      databaseSelectionSource: "auto",
       databases: [],
       databasesLoading: false,
       databaseError: null,
