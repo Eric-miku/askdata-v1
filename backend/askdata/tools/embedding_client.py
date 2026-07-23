@@ -17,6 +17,7 @@ class EmbeddingClient:
         api_key: str = "",
         model: str = "BAAI/bge-m3",
         dimension: int = 1024,
+        timeout: float = 2.0,
         *,
         client: Any = None,
         api: Any = None,
@@ -27,7 +28,7 @@ class EmbeddingClient:
             if client is None:
                 from openai import OpenAI
 
-                client = OpenAI(base_url=base_url, api_key=api_key)
+                client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
             api = client.embeddings
         self.api = api
         self.model = model

@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     EMBEDDING_API_KEY: str = ""
     EMBEDDING_MODEL: str = "BAAI/bge-m3"
     EMBEDDING_DIMENSION: int = 1024
+    EMBEDDING_TIMEOUT_SECONDS: float = 2.0
     MILVUS_URI: str = ""
     MILVUS_HOST: str = ""
     MILVUS_PORT: int = 19530

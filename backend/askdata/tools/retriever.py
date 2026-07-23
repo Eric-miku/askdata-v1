@@ -471,6 +471,7 @@ class SemanticRetriever:
                         api_key=settings.EMBEDDING_API_KEY,
                         model=settings.EMBEDDING_MODEL,
                         dimension=settings.EMBEDDING_DIMENSION,
+                        timeout=settings.EMBEDDING_TIMEOUT_SECONDS,
                     )
                     probe = embedding.Validate()
                     vector = MilvusVectorStore(milvus_uri, settings.MILVUS_COLLECTION)
