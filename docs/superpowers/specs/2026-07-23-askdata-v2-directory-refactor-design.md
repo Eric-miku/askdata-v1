@@ -29,7 +29,7 @@ Implement a moderate, mechanical directory refactor:
 backend/askdata/
   retrieval/
     __init__.py
-    semantic_retriever.py      # from tools/retriever.py
+    retriever.py               # from tools/retriever.py
     hybrid_retriever.py        # from tools/hybrid_retriever.py
     embedding_client.py        # from tools/embedding_client.py
     vector_store.py            # from tools/vector_store.py
@@ -40,12 +40,13 @@ backend/askdata/
     result_analyzer.py         # from tools/analyzer.py
     chart_builder.py           # from tools/chart_builder.py
 
-  tools/
-    __init__.py
-    skill_loader.py            # remains here
+  agent/
+    skill_loader.py            # from tools/skill_loader.py
 ```
 
-`backend/askdata/tools/skill_loader.py` stays in `tools/` because it is a prompt utility rather than retrieval or result analysis.
+`backend/askdata/tools/skill_loader.py` moves into `agent/` because it only exists to build prompt skill context for `ReActSqlAgent`. After this move, `backend/askdata/tools/` should be deleted if no files remain.
+
+`retriever.py` keeps its current filename. It contains both lexical indexing (`BirdSchemaIndex`) and the runtime retrieval builder (`SemanticRetriever`), so renaming it to `semantic_retriever.py` would be less accurate and would create unnecessary import churn.
 
 ## Explicit Non-Goals
 
@@ -68,21 +69,29 @@ askdata.tools.vector_store
 askdata.tools.value_linker
 askdata.tools.analyzer
 askdata.tools.chart_builder
+askdata.tools.skill_loader
 ```
 
 to:
 
 ```python
-askdata.retrieval.semantic_retriever
+askdata.retrieval.retriever
 askdata.retrieval.hybrid_retriever
 askdata.retrieval.embedding_client
 askdata.retrieval.vector_store
 askdata.retrieval.value_linker
 askdata.analysis.result_analyzer
 askdata.analysis.chart_builder
+askdata.agent.skill_loader
 ```
 
-Test imports should be updated to the new locations.
+Backend, test, CLI, and data-processing imports should be updated to the new locations. The implementation must search at least these roots:
+
+```text
+backend/
+tests/
+data-processing/
+```
 
 ## Architecture Documentation
 
@@ -121,14 +130,16 @@ This refactor must be mechanical and verified in small steps:
 2. Update imports with `rg`.
 3. Run Python import/syntax checks.
 4. Run backend tests.
-5. Run frontend tests if import/type paths changed on frontend-facing contracts.
-6. Run `git diff --check`.
+5. Run targeted `rg "askdata\\.tools"` over `backend/`, `tests/`, and `data-processing/`.
+6. Run frontend tests if import/type paths changed on frontend-facing contracts.
+7. Run `git diff --check`.
 
 If tests show behavior regressions, revert the specific import/move and keep the architecture doc. Do not mix behavior fixes into the refactor unless required to restore existing behavior.
 
 ## Acceptance Criteria
 
 - No unresolved old imports to moved modules remain.
+- `backend/askdata/tools/` is removed if `skill_loader.py` was its last file.
 - `uv run pytest -q` passes, or any failure is documented as unrelated to this refactor.
 - `git diff --check` passes.
 - `docs/architecture-v2.md` clearly identifies the canonical V2 path and legacy boundaries.
