@@ -6,6 +6,12 @@ The current runnable product flow also includes deterministic chart recommendati
 
 **Stack**: Python 3.13 / FastAPI / LangGraph / SQLAlchemy / React + Ant Design + ECharts / OpenAI-compatible LLM
 
+## Current Status
+
+The repository is ready for prototype acceptance against the project plan's core AskData flow: BIRD/managed SQLite data sources, NL2SQL, multi-turn context, SQL safety, result tables, charts, exports, structured analysis, terminology management, data-source management, permissions, operations probes, and documentation are implemented and covered by automated tests.
+
+Production enterprise rollout still requires deployment-side integration and sign-off for company MySQL/PostgreSQL sources, credential management, SSO or trusted identity headers, dynamic role policies, confirmed business metric definitions, final Docker build verification on a Docker-enabled machine, and business accuracy evaluation on the company's fixed question set. See [Acceptance matrix](docs/acceptance-matrix.md) and [Acceptance report](docs/acceptance-report.md) for the detailed completion boundary.
+
 ## Quick Start
 
 ```bash
@@ -57,8 +63,8 @@ askdata-v1/
   frontend/            # React + TypeScript + Vite
     src/
       api/query.ts     #   Backend API client
-      components/      #   DatabaseSelector, ResultTable
-      pages/           #   QueryResultDemo
+      components/      #   Chat, SQL, table, chart, terminology, and data-source UI
+      pages/           #   QueryResultDemo — main AskData workspace
       store/           #   Zustand state
       types/query.ts   #   TypeScript types
   tests/               # Backend unit and integration tests
@@ -90,6 +96,8 @@ POST /api/query
 
 ## Configuration (.env)
 
+Start by copying `.env.example` to `.env`, then configure an OpenAI-compatible model endpoint and the BIRD data directory. Do not commit real API keys or company connection details.
+
 ```env
 LLM_API_BASE=https://api.deepseek.com
 LLM_API_KEY=your-key
@@ -98,6 +106,8 @@ LLM_THINKING_ENABLED=true
 LLM_REASONING_EFFORT=high
 BIRD_DATA_DIR=data/bird
 BIRD_INSTRUCTIONS_DIR=data/bird/instructions
+ASKDATA_STATE_DIR=.checkpoints
+ADMIN_API_TOKEN=
 ```
 
 ## Data Setup
@@ -141,9 +151,16 @@ On macOS the script keeps uv's `.venv` path as a local symlink to the gitignored
 ## Testing
 
 ```bash
+# Backend
 uv run pytest -q
-cd frontend && npm run build
+
+# Frontend
+cd frontend
+npm test -- --run
+npm run build
 ```
+
+If the default uv cache directory is not writable in a sandboxed environment, run backend commands with `UV_CACHE_DIR=/tmp/uv-cache`.
 
 ## Management and Operations
 
@@ -163,7 +180,7 @@ For the containerized acceptance environment:
 docker compose up --build
 ```
 
-The frontend is then available at `http://localhost:5173` and the backend API at `http://localhost:8000/docs`. Override `LLM_API_BASE` when the model service is not reachable through `host.docker.internal:9001`.
+The frontend is then available at `http://localhost:5173` and the backend API at `http://localhost:8000/docs`. Override `LLM_API_BASE` when the model service is not reachable through `host.docker.internal:9001`. Docker configuration is present in this repository, but the final image build must be verified on a machine with Docker CLI installed.
 
 ## More Documentation
 
