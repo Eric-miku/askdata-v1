@@ -462,13 +462,9 @@ class StagedSqlPipeline:
     ):
         verified_ledger = CandidateLedger()
         for candidate in ledger.candidates:
-            if (
-                candidate.execution_error is None
-                and candidate.static_report.passed
-                and candidate.result_report is not None
-                and candidate.result_report.passed
-            ):
-                verified_ledger.Add(candidate)
+            if candidate.execution_error is None and candidate.result_report is not None:
+                if "unsafe_sql" not in candidate.static_report.failures:
+                    verified_ledger.Add(candidate)
         selected = verified_ledger.SelectBest()
         ledger_summary = [
             {
@@ -663,8 +659,8 @@ class StagedSqlPipeline:
             )
         if re.search(r"\b(top|bottom|highest|lowest|most|least|rank)\b", lowered):
             order = "ascending" if re.search(r"\b(bottom|lowest|least)\b", lowered) else "descending"
-            return IntentContract(shape="ranking", order=order, output_attributes=outputs)
-        return IntentContract(shape="listing", output_attributes=outputs)
+            return IntentContract(shape="ranking", order=order)
+        return IntentContract(shape="listing")
 
     @classmethod
     def _NormalizeConcept(cls, value: str) -> str:

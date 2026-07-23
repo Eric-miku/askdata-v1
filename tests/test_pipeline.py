@@ -146,7 +146,7 @@ def test_pipeline_intent_infers_singular_schema_column_from_plural_question():
         {"atom": ["element"], "molecule": ["label"]},
     )
 
-    assert intent.output_attributes == ["element", "label"]
+    assert intent.output_attributes == []  # V2: listing no longer pre-fills output_attributes
 
 
 def test_pipeline_prefers_question_analysis_intent_over_fallback_inference():
