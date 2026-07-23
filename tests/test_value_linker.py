@@ -5,7 +5,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from askdata.agent.question_analyzer import QuestionAnalyzer
-from askdata.tools.value_linker import ValueLinker
+from askdata.retrieval.value_linker import ValueLinker
 
 
 def build_db(tmp_path: Path) -> str:

@@ -7,7 +7,7 @@ import re
 import unicodedata
 from typing import Callable, Iterable
 
-from askdata.tools.vector_store import RankedChunk, SchemaChunk
+from askdata.retrieval.vector_store import RankedChunk, SchemaChunk
 
 
 @dataclass(frozen=True)
@@ -153,7 +153,7 @@ class HybridRetriever:
             return ranking
         database = self.lexical.GetDatabase(database_id)
         neighbors = set(selected_tables)
-        from askdata.tools.retriever import GetValue
+        from askdata.retrieval.retriever import GetValue
 
         for key in GetValue(database, "foreignKeys", "foreign_keys", default=[]):
             left = GetValue(key, "leftTable", "left_table", "source_table")

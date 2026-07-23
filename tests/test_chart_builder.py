@@ -6,7 +6,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 from askdata.agent.intent import IntentContract
-from askdata.tools.chart_builder import ChartBuilder
+from askdata.analysis.chart_builder import ChartBuilder
 
 
 def test_time_series_has_priority_over_ranking():

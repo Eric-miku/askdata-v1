@@ -14,9 +14,9 @@ from askdata.data.bird_io import (
     ResolveProcessedDir,
 )
 from askdata.eval import DemoSuite, EvalRunner
-from askdata.tools.embedding_client import EmbeddingClient, EmbeddingConfigurationError
-from askdata.tools.retriever import BirdSchemaIndex, GetValue
-from askdata.tools.vector_store import MilvusVectorStore, SOURCE_VERSION
+from askdata.retrieval.embedding_client import EmbeddingClient, EmbeddingConfigurationError
+from askdata.retrieval.retriever import BirdSchemaIndex, GetValue
+from askdata.retrieval.vector_store import MilvusVectorStore, SOURCE_VERSION
 
 
 app = typer.Typer(help="AskData — NL2SQL development CLI")

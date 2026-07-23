@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT / "backend"))
 
 from askdata.data.bird_io import LoadProcessedDatabases, LoadProcessedQuestions  # noqa: E402
 from askdata.eval.runner import EvalRunner  # noqa: E402
-from askdata.tools.retriever import SemanticRetriever  # noqa: E402
+from askdata.retrieval.retriever import SemanticRetriever  # noqa: E402
 
 
 class ContractAgent:

@@ -8,10 +8,10 @@ from askdata.agent.pipeline import StagedSqlPipeline
 from askdata.agent.question_analyzer import QuestionAnalysis, QuestionAnalyzer
 from askdata.agent.react_sql_agent import ReActSqlAgent
 from askdata.core.llm import LLMClient
-from askdata.tools.analyzer import ResultAnalyzer
-from askdata.tools.retriever import SemanticRetriever
-from askdata.tools.skill_loader import SkillLoader
-from askdata.tools.value_linker import ValueLinker
+from askdata.analysis.result_analyzer import ResultAnalyzer
+from askdata.retrieval.retriever import SemanticRetriever
+from askdata.agent.skill_loader import SkillLoader
+from askdata.retrieval.value_linker import ValueLinker
 
 
 _VECTOR_FALLBACK_MESSAGE = "Semantic retrieval unavailable; lexical schema matched."
