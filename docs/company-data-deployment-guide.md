@@ -49,7 +49,11 @@ FastAPI Backend
   |     |-- knowledge.sqlite
   |
   |-- SessionManager
-  |     |-- sessions / checkpoints
+  |     |-- sessions.sqlite
+  |     |-- session_history
+  |
+  |-- LangGraph checkpoint store
+  |     |-- langgraph_checkpoints.sqlite
   |
   |-- SemanticRetriever
   |     |-- BIRD processed schema
@@ -92,10 +96,32 @@ FastAPI Backend
 | LLM 服务 | OpenAI-compatible Chat Completions | 是 |
 | 公司数据库 | MySQL 或 PostgreSQL，只读账号 | 是 |
 | BIRD 数据 | 本地 SQLite/processed schema，用于内置样例 | 可选但建议保留 |
-| 状态目录 | `.checkpoints` 或 `ASKDATA_STATE_DIR` | 是 |
+| 状态目录 | `ASKDATA_STATE_DIR`，默认 `.checkpoints` | 是 |
 | 可信网关/SSO | 生产身份注入和 TLS 终止 | 生产必需 |
 
-## 4. 大模型要求
+## 4. 容量规划
+
+AskData 不保存公司业务数据行，因此容量压力主要来自代码依赖、前端构建产物、本地测试数据和控制面状态。
+
+| 项目 | 估算 | 说明 |
+| --- | --- | --- |
+| 源码 | 小于 200 MB | 不含虚拟环境、node_modules、数据集 |
+| Python 虚拟环境 | 500 MB 到 2 GB | 取决于 Python 版本和依赖缓存 |
+| 前端依赖与构建 | 500 MB 到 2 GB | `node_modules` 最大；`dist` 较小 |
+| BIRD 测试数据 | 取决于放入的 SQLite 数据库 | 仅用于内置样例和测试，不是公司数据必需项 |
+| `ASKDATA_STATE_DIR` | 通常小于 1 GB | 保存 sessions、checkpoints、datasources、schema catalogs、permissions、knowledge |
+| Docker image/cache | 2 GB 到 8 GB | 取决于本机 Docker 缓存和重建次数 |
+| 公司数据库结果 | 不持久化 | 请求响应返回后由前端展示；不作为本地数据集保存 |
+
+生产建议：
+
+- 将 `ASKDATA_STATE_DIR` 放在持久化磁盘或持久卷。
+- 对 `ASKDATA_STATE_DIR` 做周期备份。
+- 不要把公司数据库 dump 放进项目仓库。
+- 如果保留 BIRD 数据，只挂载需要的数据库子集。
+- Docker 部署至少预留 10 GB 可用空间；如果本机已有大量镜像，应额外预留。
+
+## 5. 大模型要求
 
 AskData acceptance 分支的核心链路使用 ReAct tool-calling Agent。模型必须支持：
 
@@ -128,9 +154,9 @@ LLM_REASONING_EFFORT=high
 LLM_THINKING_ENABLED=false
 ```
 
-## 5. 数据库要求
+## 6. 数据库要求
 
-### 5.1 MySQL
+### 6.1 MySQL
 
 建议使用 MySQL 作为公司数据首选部署路径，因为当前依赖中已包含 `pymysql`。
 
@@ -147,7 +173,7 @@ COMPANY_MYSQL_URL=mysql+pymysql://readonly_user:password@host:13306/database?cha
 - 禁止写入和 DDL。
 - 建议数据库侧设置查询超时。
 
-### 5.2 PostgreSQL
+### 6.2 PostgreSQL
 
 连接串格式：
 
@@ -157,7 +183,7 @@ COMPANY_POSTGRES_URL=postgresql+psycopg://readonly_user:password@host:5432/datab
 
 注意：如果部署 PostgreSQL，需要确认 Python 环境已安装对应驱动，例如 `psycopg` 或 `psycopg2-binary`。如果当前分支依赖未包含该驱动，需要先补依赖并重新构建。
 
-### 5.3 SQLite
+### 6.3 SQLite
 
 SQLite 分两类处理：
 
@@ -172,11 +198,11 @@ company/company.sqlite
 
 这不是 SQLite 数据源本身的部署要求，而是当前实现的安全边界。正式生产如果要接入公司 SQLite 文件，建议把“受控 SQLite 根目录”独立配置出来，例如 `SQLITE_DATA_SOURCE_ROOT=/data/askdata/sqlite-sources`，并把代码中的 SQLite 路径白名单从 BIRD 目录改为该专用目录。MySQL/PostgreSQL 公司数据源不受这个本地文件目录限制。
 
-## 6. 配置项
+## 7. 配置项
 
 在部署环境中配置以下变量。
 
-### 6.1 后端配置
+### 7.1 后端配置
 
 ```env
 LLM_API_BASE=https://api.deepseek.com
@@ -204,7 +230,7 @@ COMPANY_MYSQL_URL=mysql+pymysql://readonly_user:password@host:13306/database?cha
 COMPANY_POSTGRES_URL=postgresql+psycopg://readonly_user:password@host:5432/database
 ```
 
-### 6.2 前端配置
+### 7.2 前端配置
 
 ```env
 VITE_USER_ID=local-user
@@ -214,9 +240,9 @@ VITE_API_BASE_URL=/api
 
 生产环境不应信任浏览器自报的 `VITE_USER_ID`。应由可信网关或 SSO 覆盖 `X-User-ID`。
 
-## 7. 多平台部署
+## 8. 多平台部署
 
-### 7.1 macOS 本地部署
+### 8.1 macOS 本地部署
 
 适用场景：开发、验收、单机内部部署。
 
@@ -265,7 +291,7 @@ macOS 注意事项：
 - 项目位于 iCloud/同步目录时，`.venv` 可能被系统隐藏或损坏。`scripts/setup-dev-env.sh` 已处理该问题，会使用 `venv.nosync`。
 - 如果公司数据库在 VPN 内，先确认终端进程能访问 VPN 网络。
 
-### 7.2 Linux 服务器部署
+### 8.2 Linux 服务器部署
 
 适用场景：测试服务器、内网服务器、长期运行服务。
 
@@ -320,10 +346,10 @@ Linux 生产建议：
 - 反向代理 `/api` 到后端 `127.0.0.1:8000`。
 - 由网关注入可信 `X-User-ID`。
 - 限制 `/api/data-sources`、`/api/permissions`、`/api/knowledge` 管理入口。
-- 将 `.checkpoints` 放在持久化磁盘。
+- 将 `ASKDATA_STATE_DIR` 放在持久化磁盘。
 - 配置日志采集和进程自动重启。
 
-### 7.3 Windows 部署
+### 8.3 Windows 部署
 
 适用场景：Windows 开发机、本地验收、内网 Windows 主机。
 
@@ -369,7 +395,7 @@ npm install
 npm run dev -- --host 0.0.0.0 --port 5173
 ```
 
-### 7.4 Docker Compose 部署
+### 8.4 Docker Compose 部署
 
 适用场景：可重复部署、服务器部署、隔离运行。
 
@@ -389,7 +415,7 @@ Docker 注意事项：
 
 1. backend 容器默认从环境变量读取 LLM 配置。
 2. `data/` 以只读卷挂载到 `/app/data`。
-3. `.checkpoints` 使用 named volume：`askdata-checkpoints`。
+3. 容器内 `ASKDATA_STATE_DIR=/app/.checkpoints`，并使用 named volume `askdata-checkpoints` 持久化。
 4. backend 根文件系统只读。
 5. 临时目录使用 tmpfs。
 
@@ -413,9 +439,9 @@ extra_hosts:
   - "host.docker.internal:host-gateway"
 ```
 
-## 8. 公司数据源接入
+## 9. 公司数据源接入
 
-### 8.1 新增数据源
+### 9.1 新增数据源
 
 前端路径：
 
@@ -440,7 +466,7 @@ PostgreSQL 示例：
 - 连接配置：`env:COMPANY_POSTGRES_URL`
 - 启用：是
 
-### 8.2 测试连接
+### 9.2 测试连接
 
 点击“测试连接”。
 
@@ -459,7 +485,7 @@ PostgreSQL 示例：
 - 只读账号是否有元数据权限。
 - 密码中的特殊字符是否已 URL 编码。
 
-### 8.3 同步 Schema
+### 9.3 同步 Schema
 
 点击“同步 Schema”。
 
@@ -476,7 +502,7 @@ PostgreSQL 示例：
 
 同步不会读取或保存业务数据行。
 
-### 8.4 选择数据源查询
+### 9.4 选择数据源查询
 
 同步成功后，公司数据源会出现在数据库列表。用户选择该数据源后即可提问。
 
@@ -487,7 +513,7 @@ PostgreSQL 示例：
 - 同步失败。
 - 当前用户没有权限。
 
-## 9. 权限配置
+## 10. 权限配置
 
 系统有两种权限状态：
 
@@ -527,7 +553,7 @@ region = '华东'
 
 行过滤会在后端 AST 层注入，适用于自然语言查询、SQL 回放和导出。展示给用户的 SQL 不包含内部行过滤文本。
 
-## 10. 业务术语配置
+## 11. 业务术语配置
 
 公司数据通常存在口语和字段名不一致的问题。正式部署前应配置高频业务术语。
 
@@ -542,9 +568,9 @@ region = '华东'
 
 发布后的术语会参与查询前的知识解析。如果同一个术语存在多个已发布且冲突的口径，系统会返回澄清问题，不直接生成 SQL。
 
-## 11. 验证流程
+## 12. 验证、运维与回滚
 
-### 11.1 后端测试
+### 12.1 自动化测试
 
 ```bash
 uv run pytest -q
@@ -556,15 +582,13 @@ uv run pytest -q
 uv run pytest tests/test_data_source_store.py tests/test_query_runner.py tests/test_schema_catalog_routes.py tests/test_permissions.py -q
 ```
 
-### 11.2 前端测试
-
 ```bash
 cd frontend
 npm test -- --run
 npm run build
 ```
 
-### 11.3 健康检查
+### 12.2 健康和数据源验证
 
 ```bash
 curl http://localhost:8000/health
@@ -578,8 +602,6 @@ curl http://localhost:8000/metrics
 - `/ready` 返回数据目录就绪。
 - `/metrics` 返回 Prometheus 文本指标。
 
-### 11.4 公司数据源验证
-
 检查项：
 
 - 数据源创建成功。
@@ -589,7 +611,7 @@ curl http://localhost:8000/metrics
 - 数据源出现在数据库列表。
 - 当前用户有权限。
 
-### 11.5 查询验证
+### 12.3 查询验收
 
 准备固定验收题集，至少覆盖：
 
@@ -613,9 +635,7 @@ curl http://localhost:8000/metrics
 - 是否符合业务预期。
 - 失败原因。
 
-## 12. 运维
-
-### 12.1 日志
+### 12.4 日志与监控
 
 每个 HTTP 响应都包含 `X-Request-ID`。排障时应记录：
 
@@ -635,8 +655,6 @@ curl http://localhost:8000/metrics
 - 大量业务结果明文。
 - 用户敏感字段。
 
-### 12.2 监控
-
 基础接口：
 
 - `GET /health`
@@ -654,12 +672,13 @@ curl http://localhost:8000/metrics
 - LLM 调用失败次数。
 - 数据源健康状态。
 
-### 12.3 备份
+### 12.5 备份和回滚
 
-备份状态目录：
+备份状态目录。统一以 `ASKDATA_STATE_DIR` 表示，默认值为 `.checkpoints`：
 
 ```bash
-cp -R .checkpoints ".checkpoints.backup.$(date +%Y%m%d-%H%M%S)"
+STATE_DIR="${ASKDATA_STATE_DIR:-.checkpoints}"
+cp -R "$STATE_DIR" "$STATE_DIR.backup.$(date +%Y%m%d-%H%M%S)"
 ```
 
 状态目录包含：
@@ -672,9 +691,7 @@ cp -R .checkpoints ".checkpoints.backup.$(date +%Y%m%d-%H%M%S)"
 
 公司数据库本身不由 AskData 备份。
 
-## 13. 回滚
-
-### 13.1 代码回滚
+代码回滚：
 
 ```bash
 git switch feat/askdata-v1-acceptance
@@ -692,13 +709,12 @@ git checkout <last-known-good-commit>
 docker compose up --build
 ```
 
-### 13.2 状态回滚
-
-停止服务后恢复 `.checkpoints`：
+状态回滚。停止服务后恢复 `ASKDATA_STATE_DIR`：
 
 ```bash
-rm -rf .checkpoints
-cp -R .checkpoints.backup.YYYYMMDD-HHMMSS .checkpoints
+STATE_DIR="${ASKDATA_STATE_DIR:-.checkpoints}"
+rm -rf "$STATE_DIR"
+cp -R "$STATE_DIR.backup.YYYYMMDD-HHMMSS" "$STATE_DIR"
 ```
 
 恢复后检查：
@@ -709,9 +725,9 @@ cp -R .checkpoints.backup.YYYYMMDD-HHMMSS .checkpoints
 - Schema Catalog
 - 权限策略
 
-## 14. 常见问题
+## 13. 常见问题
 
-### 14.1 模型没有执行 SQL
+### 13.1 模型没有执行 SQL
 
 原因：
 
@@ -725,7 +741,7 @@ cp -R .checkpoints.backup.YYYYMMDD-HHMMSS .checkpoints
 - 设置 `LLM_THINKING_ENABLED=false`。
 - 查看 Trace 是否有 `run_query`。
 
-### 14.2 公司数据源不显示
+### 13.2 公司数据源不显示
 
 原因：
 
@@ -740,7 +756,7 @@ cp -R .checkpoints.backup.YYYYMMDD-HHMMSS .checkpoints
 - 同步 Schema。
 - 检查权限策略。
 
-### 14.3 查询 SQL 不准
+### 13.3 查询 SQL 不准
 
 原因：
 
@@ -756,7 +772,7 @@ cp -R .checkpoints.backup.YYYYMMDD-HHMMSS .checkpoints
 - 使用更明确的问题。
 - 准备固定验收题集。
 
-### 14.4 权限突然全部拒绝
+### 13.4 权限突然全部拒绝
 
 原因：创建第一条权限策略后系统进入白名单模式。
 
@@ -765,11 +781,11 @@ cp -R .checkpoints.backup.YYYYMMDD-HHMMSS .checkpoints
 - 给当前 `X-User-ID` 添加数据源级授权。
 - 或删除全部权限策略，回到本地兼容模式。
 
-### 14.5 Explain 不支持公司数据库
+### 13.5 Explain 不支持公司数据库
 
 当前 `/api/query/explain` 只支持 SQLite。MySQL/PostgreSQL 可以执行自然语言查询，但执行计划接口会返回 422。
 
-## 15. 演示准备
+## 14. 演示准备
 
 演示不是部署流程的一部分，但可以用部署后的系统完成。
 
@@ -794,7 +810,7 @@ cp -R .checkpoints.backup.YYYYMMDD-HHMMSS .checkpoints
 5. 展示生成 SQL、表格、图表和 Trace。
 6. 展示业务术语或权限能力。
 
-## 16. 生产化检查清单
+## 15. 生产化检查清单
 
 正式生产前必须确认：
 
@@ -803,7 +819,7 @@ cp -R .checkpoints.backup.YYYYMMDD-HHMMSS .checkpoints
 - `ADMIN_API_TOKEN` 已设置。
 - 生产身份由可信网关或 SSO 注入。
 - 前端不能伪造生产用户身份。
-- `.checkpoints` 有持久化和备份策略。
+- `ASKDATA_STATE_DIR` 有持久化和备份策略。
 - 日志不会泄露密码或大量业务数据。
 - LLM 模型支持 tool calling。
 - 固定业务题集通过验收。
