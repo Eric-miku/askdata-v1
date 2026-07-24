@@ -159,19 +159,18 @@ COMPANY_POSTGRES_URL=postgresql+psycopg://readonly_user:password@host:5432/datab
 
 ### 5.3 SQLite
 
-SQLite 数据源必须位于受控目录：
+SQLite 分两类处理：
 
-```text
-data/bird/databases/
-```
+- BIRD 内置测试数据：默认位于 `data/bird/databases/`。
+- 公司 SQLite 数据：不天然属于 BIRD 目录；是否放在该目录取决于当前代码的安全白名单策略。
 
-管理端新增 SQLite 数据源时，路径应使用相对路径，例如：
+当前 acceptance 分支的管理接口为了避免任意文件读取，对“手动注册 SQLite 文件”做了路径限制：注册路径必须解析到 `BIRD_DATA_DIR/databases` 下。因此，如果直接使用现有管理页面注册公司 SQLite 文件，需要把文件挂载或复制到该受控目录下，并使用相对路径，例如：
 
 ```text
 company/company.sqlite
 ```
 
-后端会拒绝读取受控目录外的 SQLite 文件。
+这不是 SQLite 数据源本身的部署要求，而是当前实现的安全边界。正式生产如果要接入公司 SQLite 文件，建议把“受控 SQLite 根目录”独立配置出来，例如 `SQLITE_DATA_SOURCE_ROOT=/data/askdata/sqlite-sources`，并把代码中的 SQLite 路径白名单从 BIRD 目录改为该专用目录。MySQL/PostgreSQL 公司数据源不受这个本地文件目录限制。
 
 ## 6. 配置项
 
@@ -810,4 +809,3 @@ cp -R .checkpoints.backup.YYYYMMDD-HHMMSS .checkpoints
 - 固定业务题集通过验收。
 - Docker 或服务器部署方式已验证。
 - 回滚流程已验证。
-
